@@ -1,0 +1,77 @@
+{
+  // Extraction config for:
+  // - microservice-pipeline call-graph
+  // - microservice-pipeline data-access
+  // - microservice-pipeline infer-shared-containers
+  //
+  // This file is JSONC: normal JSON plus // comments, /* block comments */,
+  // and trailing commas. `init-config` rewrites project_root so it points from
+  // the generated config directory back to the analyzed project.
+
+  // All source and artifact paths below resolve from this project root.
+  "project_root": ".",
+
+  "source": {
+    // Scan one or more source trees. Use module_prefix when the source root is
+    // already inside a package, for example path "src/shop" and prefix "shop".
+    "roots": [
+      {
+        "path": "src",
+        "module_prefix": null,
+      }
+    ],
+
+    // Keep only calls within these package namespaces. Leave empty to avoid
+    // package-prefix filtering.
+    "package_prefixes": [],
+
+    // Additional Python files outside the scanned roots, such as scripts that
+    // assemble and run the application.
+    "entrypoints": [],
+
+    // Include and exclude globs can match source-root-relative or
+    // project-root-relative paths.
+    "include_globs": ["**/*.py"],
+    "exclude_globs": [
+      "**/__pycache__/**",
+      "**/.venv/**",
+      "**/venv/**",
+    ],
+  },
+
+  "call_graph": {
+    // Keep unresolved and external calls as graph edges when true.
+    "include_external": false,
+
+    // Raw call graph artifacts: call_graph.json, nodes.csv, and edges.csv.
+    "outdir": "artifacts/call_graph",
+  },
+
+  "data_access": {
+    // Raw data-access artifacts. Run extraction once without a shared mapping,
+    // review inferred containers, then write accepted results to a separate
+    // directory such as artifacts/data_access_inferred.
+    "outdir": "artifacts/data_access",
+
+    "pyright": {
+      // Pyright improves container-family inference. Disable it when Pyright
+      // is unavailable or when a dependency-light extraction is preferred.
+      "enabled": true,
+
+      // Executable or command name used to invoke Pyright.
+      "bin": "pyright",
+
+      // Options: fallback_unknown, error.
+      "fail_policy": "fallback_unknown",
+    },
+
+    // Optional reviewed mapping, typically
+    // configs/microservice_pipeline/shared_containers.jsonc. Keep null for
+    // the initial raw extraction and pass an accepted mapping on the rerun.
+    "shared_containers_config": null,
+
+    // Draft mapping and review report written by infer-shared-containers.
+    "inferred_shared_containers_config": "artifacts/inferred_shared_containers.json",
+    "inferred_shared_containers_report": "artifacts/inferred_shared_containers.md",
+  },
+}

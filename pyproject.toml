@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "microservice-pipeline"
+version = "0.1.0"
+description = "Static-analysis pipeline for identifying microservice candidates in Python projects."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+clustering = [
+  "igraph",
+  "leidenalg",
+  "infomap",
+  "scikit-learn",
+]
+test = [
+  "pytest",
+]
+
+[project.scripts]
+microservice-pipeline = "microservice_pipeline.cli.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+microservice_pipeline = [
+  "configs/templates/*.csv",
+  "configs/templates/*.json",
+  "configs/templates/*.jsonc",
+  "configs/weight_profiles/*.json",
+]

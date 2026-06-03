@@ -1,0 +1,180 @@
+{
+  // Structural clustering config for microservice-pipeline structural-cluster.
+  //
+  // This file is JSONC: normal JSON plus // comments, /* block comments */,
+  // and trailing commas. Relative paths resolve from --project-root or the
+  // current working directory when --project-root is omitted.
+
+  "paths": {
+    // Structural graph inputs produced by microservice-pipeline
+    // structural-graph.
+    "nodes": "artifacts/structural_dependency_graph/nodes.csv",
+    "edges": "artifacts/structural_dependency_graph/edges.csv",
+
+    // Hub-node diagnostics produced by structural-graph. Leave these paths
+    // unchanged when using the standard structural graph output directory.
+    "callable_hub_nodes": "artifacts/structural_dependency_graph/callable_hub_nodes.csv",
+    "data_hub_nodes": "artifacts/structural_dependency_graph/data_hub_nodes.csv",
+
+    // Base clustering output. This is written even when a sweep is enabled.
+    "outdir": "artifacts/structural_microservice_candidates",
+
+    // Optional parameter-sweep output.
+    "sweep_outdir": "artifacts/structural_microservice_candidates_sweep",
+
+    // Optional manually adjudicated mapping CSV used only for sweep
+    // evaluation metrics. Leave null until the generated manual_mapping.csv
+    // worksheet has been filled and its path is configured here.
+    "manual_mapping": null,
+  },
+
+  "algorithm": {
+    // Options: label_propagation, leiden, leiden_reweighted,
+    // leiden_multiplex, infomap, hac_callable_projection.
+    //
+    // label_propagation is the dependency-light starter choice. The other
+    // modes require packages from the optional clustering dependency group.
+    "algorithm": "label_propagation",
+
+    // Leiden quality function. rb_configuration is the modularity-family
+    // default; cpm often needs smaller resolution values.
+    "leiden_quality": "rb_configuration",
+
+    // For leiden_multiplex only. edge_type separates call, data_access, and
+    // data_lineage edges; call_data combines data edges into one layer.
+    "multiplex_layer_mode": "edge_type",
+
+    // Base-run parameters. Algorithms ignore settings that do not apply.
+    "resolution": 1.0,
+    "markov_time": 1.0,
+    "hac_n_clusters": 13,
+
+    // Optional layer-specific leiden_multiplex resolutions. Null falls back
+    // to the scalar resolution value.
+    "call_resolution": null,
+    "data_access_resolution": null,
+    "data_lineage_resolution": null,
+
+    // Reproducibility and label-propagation iteration limit.
+    "seed": 42,
+    "max_iter": 100,
+  },
+
+  "sweep": {
+    // Run an algorithm-specific parameter sweep after the base run.
+    "run_sweep": false,
+
+    // Compact START:END:STEP range. It controls Leiden resolution, Infomap
+    // Markov time, or HAC cluster count according to the selected algorithm.
+    "range": null,
+
+    // Explicit lists or comma-separated values can replace range. Keep null
+    // to use range or the algorithm defaults.
+    "resolutions": null,
+    "markov_times": null,
+    "hac_n_clusters": null,
+
+    // For leiden_multiplex only. Supplying any layer list changes the sweep
+    // axis to layer-resolution combinations.
+    "call_resolutions": null,
+    "data_access_resolutions": null,
+    "data_lineage_resolutions": null,
+
+    // Evaluate sweep rows against paths.manual_mapping when enabled and when
+    // that CSV exists.
+    "evaluation_enabled": false,
+    "manual_label_column": null,
+
+    // Manual-row matching and evaluation scope.
+    // node_mode options: auto, exact, callable.
+    "node_mode": "auto",
+    "na_labels": [],
+    "evaluation_node_types": "callable,data",
+    "evaluation_kind_tokens": "function,method,class_attr_state,module_attr_state,local_exposed",
+    "all_evaluation_nodes": false,
+  },
+
+  "sweep_best": {
+    // Materialize one selected sweep row as complete clustering artifacts.
+    "enabled": false,
+    "outdir": "artifacts/structural_microservice_candidates_sweep/best",
+
+    // Automatic ranking metric and direction. Evaluation metric names accept
+    // the optional evaluation_ prefix.
+    "metric": "predicted_match_f1",
+    "metric_direction": "max",
+
+    // Optional filters applied before ranking. Set values to select or
+    // constrain one sweep row.
+    "resolution": null,
+    "markov_time": null,
+    "hac_n_clusters": null,
+    "call_resolution": null,
+    "data_access_resolution": null,
+    "data_lineage_resolution": null,
+
+    // Options: auto, drop_data_hubs, keep_data_hubs.
+    "data_hub_policy": "auto",
+
+    // Optional quality floor on an additional metric.
+    "min_metric": null,
+    "min_value": null,
+  },
+
+  "hub_policy": {
+    // Callable hubs are broad fan-out callables. Null plus
+    // drop_callable_hubs=false reports candidates without dropping them.
+    // callable_hub_policy options: null, keep, drop-all, drop-configured.
+    "callable_hub_policy": null,
+
+    // Legacy shortcut for dropping every callable hub when no explicit policy
+    // is set.
+    "drop_callable_hubs": false,
+
+    // Optional JSON file with {"drop": [...], "keep": [...]} decisions.
+    "callable_hub_decisions": null,
+
+    // Inline node IDs used by drop-configured. Explicit keeps win.
+    "drop_callable_hub": [],
+    "keep_callable_hub": [],
+
+    // Data hubs are shared objects touched broadly across the graph. Sweeps
+    // compare both keep and drop policies automatically.
+    "drop_data_hubs": false,
+
+    // Module-level callable nodes model synthetic import/module execution.
+    "exclude_module_callables": true,
+
+    // Callable hub detection thresholds. Tune these only after reviewing the
+    // structural graph hub diagnostics.
+    "hub_callable_degree_percentile": 95.0,
+    "hub_callable_min_degree": 25,
+    "hub_callable_min_in_degree": 2,
+    "hub_callable_min_out_degree": 2,
+    "hub_entrypoint_min_out_degree": 12,
+    "hub_orchestrator_max_in_degree": 1,
+    "hub_orchestrator_min_out_degree": 12,
+    "hub_orchestrator_min_out_call_degree": 4,
+    "hub_orchestrator_min_target_modules": 3,
+    "hub_orchestrator_min_target_callables": 4,
+    "hub_orchestrator_min_target_data": 4,
+    "hub_orchestrator_min_data_to_call_ratio": 1.0,
+
+    // Data hub detection thresholds.
+    "hub_data_min_degree": 20,
+    "hub_data_min_callable_count": 10,
+    "hub_data_min_access_count": 100,
+  },
+
+  "weighting": {
+    // Options: builtin:default, builtin:ownership_biased, or a custom JSON
+    // profile path. Custom profiles are merged over builtin:default.
+    "weight_config": "builtin:default",
+
+    // Optional clustering-only edge scale overrides. Null reads each value
+    // from the selected weight profile.
+    "call_weight_scale": null,
+    "data_access_weight_scale": null,
+    "data_lineage_weight_scale": null,
+  },
+}

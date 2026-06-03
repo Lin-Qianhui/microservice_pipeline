@@ -1,0 +1,42 @@
+{
+  "schema": "structural_weight_profile.v1",
+  "name": "ownership_biased",
+  "generation": {
+    "data_access": {
+      "weights": {
+        "read": 1.0,
+        "create": 3.5,
+        "write": 4.0,
+        "read_write": 4.0
+      }
+    },
+    "data_lineage": {
+      "weights": {
+        "state_assign": 2.0,
+        "return_value": 0.75,
+        "return_slot": 0.75,
+        "local_assign": 1.0,
+        "tuple_unpack": 1.0,
+        "arg_to_param": 0.25
+      }
+    }
+  },
+  "clustering": {
+    "edge_type_scales": {
+      "call": 2.0,
+      "data_access": 1.0,
+      "data_lineage": 1.0
+    },
+    "reweighted": {
+      "subtype_ratio_min": 0.5,
+      "subtype_ratio_max": 1.5,
+      "single_writer_boost": 1.5,
+      "single_writer_max_weight": 8.0,
+      "must_link_relations": [
+        "state_assign",
+        "local_assign",
+        "tuple_unpack"
+      ]
+    }
+  }
+}

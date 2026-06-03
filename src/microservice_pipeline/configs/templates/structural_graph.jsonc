@@ -1,0 +1,53 @@
+{
+  // Structural graph config for microservice-pipeline structural-graph.
+  //
+  // This file is JSONC: normal JSON plus // comments, /* block comments */,
+  // and trailing commas. Relative paths resolve from --project-root or the
+  // current working directory when --project-root is omitted.
+
+  "paths": {
+    // Inputs produced by the call-graph and reviewed data-access workflow.
+    "call_graph": "artifacts/call_graph/call_graph.json",
+    "data_access": "artifacts/data_access_inferred/data_access.json",
+
+    // Heterogeneous graph artifacts, including nodes, edges, hub diagnostics,
+    // and the complete structural_graph.json payload.
+    "outdir": "artifacts/structural_dependency_graph",
+  },
+
+  "weighting": {
+    // Options: builtin:default, builtin:ownership_biased, or a custom JSON
+    // profile path. Custom profiles are merged over builtin:default.
+    "weight_config": "builtin:default",
+  },
+
+  "hub_detection": {
+    // Callable hubs are broad fan-out callables. A callable can be reported
+    // because of high degree, entrypoint fan-out, or orchestrator fan-out.
+    "hub_callable_degree_percentile": 95.0,
+    "hub_callable_min_degree": 25,
+    "hub_callable_min_in_degree": 2,
+    "hub_callable_min_out_degree": 2,
+
+    // Zero-incoming callables at or above this out-degree are entrypoint hub
+    // candidates.
+    "hub_entrypoint_min_out_degree": 12,
+
+    // Low-incoming callables that fan out across enough callables, modules,
+    // and data objects are orchestrator hub candidates.
+    "hub_orchestrator_max_in_degree": 1,
+    "hub_orchestrator_min_out_degree": 12,
+    "hub_orchestrator_min_out_call_degree": 4,
+    "hub_orchestrator_min_target_modules": 3,
+    "hub_orchestrator_min_target_callables": 4,
+    "hub_orchestrator_min_target_data": 4,
+    "hub_orchestrator_min_data_to_call_ratio": 1.0,
+
+    // Data hubs are shared objects with high structural degree, callable
+    // count, and access count. Detection reports candidates; clustering policy
+    // decides whether to keep or drop them.
+    "hub_data_min_degree": 20,
+    "hub_data_min_callable_count": 10,
+    "hub_data_min_access_count": 100,
+  },
+}

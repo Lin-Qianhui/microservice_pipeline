@@ -1,0 +1,105 @@
+{
+  // Optional notebook task analysis config for:
+  // microservice-pipeline notebook-tasks.
+  //
+  // Use this stage when project notebooks represent user workflows that
+  // should inform microservice-candidate review. This file is JSONC: normal
+  // JSON plus // comments, /* block comments */, and trailing commas.
+  // Relative paths resolve from --project-root or the current working
+  // directory when --project-root is omitted.
+
+  "paths": {
+    // Existing artifacts used to validate extraction and compute overlays.
+    "call_graph": "artifacts/call_graph/call_graph.json",
+    "structural_nodes": "artifacts/structural_dependency_graph/nodes.csv",
+    "structural_edges": "artifacts/structural_dependency_graph/edges.csv",
+
+    // Structural cluster assignments to refine with notebook-task evidence.
+    "clusters": "artifacts/structural_microservice_candidates/cluster_assignments.csv",
+
+    // Notebook/source-derived outputs that can be reused across clustering
+    // runs because they do not depend on one selected cluster assignment.
+    "reusable_outdir": "artifacts/notebook_task_analysis",
+
+    // Run-specific overlays, diagnostics, recommendations, refined
+    // assignments, pruning exclusions, report, and metadata JSON.
+    "outdir": "artifacts/notebook_task_analysis",
+  },
+
+  "source": {
+    // Python source tree indexed by the notebook call resolver.
+    "source_root": "src",
+
+    // Prefixes used to resolve notebook calls to project callables. Set these
+    // to the package name when the source root is already inside that package.
+    "module_prefix": null,
+    "package": null,
+  },
+
+  "notebooks": {
+    // Explicit notebook paths to include.
+    "include": [],
+
+    // Project-root-relative globs for broader matching.
+    "include_globs": [
+      "docs/**/*.ipynb",
+      "notebooks/**/*.ipynb",
+    ],
+
+    // Notebook paths or globs to remove from the included set.
+    "exclude": [],
+  },
+
+  "tasks": {
+    // Options: leaf-heading, major-heading, notebook.
+    "granularity": "leaf-heading",
+
+    // Roll deeper domain headings up to this level for overlays and
+    // refinement. Use 0 to disable roll-up.
+    "refinement_heading_level": 4,
+
+    // Outgoing call depth used to expand compact notebook task candidates.
+    "task_extract_call_depth": 2,
+  },
+
+  "refinement": {
+    // Which recommendations to apply to refined_cluster_assignments.csv.
+    // Options: all, none, selected.
+    "mode": "none",
+
+    // refined_group IDs from refinement_recommendations.csv to apply when
+    // mode is selected.
+    "accepted_refinements": [],
+  },
+
+  "pruning": {
+    // Remove zero-in-degree callables that are not observed from notebooks,
+    // plus data rows orphaned only by those removals.
+    "notebook_unobserved": true,
+  },
+
+  "heading_classification": {
+    // Matching headings are excluded from notebook task analysis.
+    "ignored_patterns": [
+      "\\bimports?\\b",
+      "\\binstall(?:ation)?\\b",
+      "\\bsetup environment\\b",
+      "\\benvironment setup\\b",
+    ],
+
+    // Matching headings remain visible as support tasks instead of domain
+    // tasks. Adjust these patterns for the analyzed project's notebook style.
+    "support_patterns": [
+      "\\bload(?:ing)?\\b",
+      "\\bconfig(?:uration)?\\b",
+      "\\bdata files?\\b",
+      "\\boutputs?\\b",
+      "\\bresults?\\b",
+      "\\bplots?\\b",
+      "\\bvisual(?:ize|ization)?\\b",
+      "\\bsav(?:e|ing)\\b",
+      "\\bexport\\b",
+      "\\bdisplay\\b",
+    ],
+  },
+}

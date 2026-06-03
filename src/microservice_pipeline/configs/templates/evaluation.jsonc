@@ -1,0 +1,68 @@
+{
+  // Standalone evaluation config for microservice-pipeline evaluate.
+  //
+  // This file is JSONC: normal JSON plus // comments, /* block comments */,
+  // and trailing commas. Relative paths resolve from --project-root or the
+  // current working directory when --project-root is omitted.
+  //
+  // CLI flags override values in this file for one run. For example, the same
+  // config can evaluate a base cluster assignment and then a refined notebook
+  // assignment by overriding --clusters and --outdir.
+
+  "paths": {
+    // Manual labels to compare against cluster assignments.
+    "manual": "configs/microservice_pipeline/manual_mapping.csv",
+
+    // Cluster assignment CSV to evaluate.
+    "clusters": "artifacts/structural_microservice_candidates/cluster_assignments.csv",
+
+    // Standalone evaluation output directory.
+    "outdir": "artifacts/microservice_clustering_evaluation",
+  },
+
+  "mapping": {
+    // Manual label column. Null auto-detects microservice_id,
+    // manual_microservice_id, manual_label, or service_id.
+    "manual_label_column": null,
+
+    // Labels treated as unknown/unadjudicated. Leave empty to use the default
+    // set: empty value, NA, N/A, nan, and None.
+    "na_labels": [],
+  },
+
+  "matching": {
+    // Options: auto, exact, callable.
+    // Use exact for the generated manual_mapping.csv worksheet. Auto keeps
+    // compatibility with older callable-only mappings.
+    "node_mode": "auto",
+  },
+
+  "scope": {
+    // Standalone evaluation defaults match the evaluate CLI defaults.
+    //
+    // evaluation_node_types is a comma-separated list of node_type values to
+    // include. Common values are:
+    // - "callable": functions, methods, and module-level callable nodes
+    // - "data": data-object nodes
+    // Use "callable,data" to evaluate both callable and data rows.
+    "evaluation_node_types": "callable",
+
+    // evaluation_kind_tokens is a comma-separated list matched against the
+    // semicolon-tokenized kind column. It can include callable kinds such as
+    // "function" and "method", and data kinds such as "class_attr_state",
+    // "module_attr_state", and "local_exposed". Rows are included when either
+    // node_type or kind matches the configured scope.
+    "evaluation_kind_tokens": "class_attr_state",
+
+    // false: evaluate only rows matching evaluation_node_types or
+    // evaluation_kind_tokens.
+    // true: ignore the scope filters and evaluate every joined manual/cluster
+    // row, including any node_type or kind.
+    "all_evaluation_nodes": false,
+  },
+
+  "outputs": {
+    // Also write metrics that treat NA labels as a normal class.
+    "write_sensitivity": true,
+  },
+}

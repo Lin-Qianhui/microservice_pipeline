@@ -1,0 +1,34 @@
+{
+  // Optional manual overrides for field containers that should be treated as
+  // one shared data object across callables. Start with the inferred mapping
+  // from `microservice-pipeline infer-shared-containers`, review its Markdown
+  // report, and keep only mappings that are valid for the analyzed project.
+  //
+  // Each object maps an observed container name to its canonical shared name.
+  // Multiple observed names can point to the same canonical name, which is how
+  // reviewed aliases are merged. Observed-name matching is case-insensitive.
+  // The preferred form is {"observed_name": "canonical_name"}. A list such as
+  // ["Results"] is also accepted as shorthand for {"Results": "Results"}.
+  "df_col": {
+    // Example group for dataframe columns that should be shared:
+    // "Results": "simulation_results",
+    // "results_df": "simulation_results",
+    // "output_table": "simulation_results",
+    //
+    // A second independent shared dataframe container can use a different
+    // canonical name:
+    // "emissions": "emissions_table",
+    // "emissions_df": "emissions_table"
+  },
+  "dict_key": {
+    // Example group for dictionary keys that should be shared:
+    // "configuration": "run_config",
+    // "config": "run_config",
+    // "settings": "run_config",
+    //
+    // A second independent shared dictionary container can use a different
+    // canonical name:
+    // "rates": "rate_parameters",
+    // "rate_params": "rate_parameters"
+  }
+}
