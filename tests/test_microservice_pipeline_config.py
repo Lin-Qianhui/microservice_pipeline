@@ -158,7 +158,7 @@ def test_data_access_config_missing_pyright_falls_back_to_unknown(tmp_path: Path
 def test_packaged_templates_are_generic():
     template_dir = (
         Path(__file__).resolve().parents[1]
-        / "microservice_pipeline/src/microservice_pipeline/configs/templates"
+        / "src/microservice_pipeline/configs/templates"
     )
     template_paths = sorted(template_dir.iterdir())
     templates = {
@@ -209,7 +209,7 @@ def test_packaged_templates_are_generic():
 
 
 def test_package_readme_is_standalone():
-    readme_path = Path(__file__).resolve().parents[1] / "microservice_pipeline/README.md"
+    readme_path = Path(__file__).resolve().parents[1] / "README.md"
     text = readme_path.read_text(encoding="utf-8").lower()
 
     assert "utopia" not in text
@@ -222,7 +222,7 @@ def test_package_readme_is_standalone():
 
 
 def test_packaged_cli_help():
-    package_src = Path(__file__).resolve().parents[1] / "microservice_pipeline" / "src"
+    package_src = Path(__file__).resolve().parents[1] / "src"
     env = {**os.environ, "PYTHONPATH": str(package_src)}
 
     cli = subprocess.run(
