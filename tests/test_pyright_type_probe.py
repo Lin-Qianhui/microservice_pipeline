@@ -18,9 +18,23 @@ def test_pyright_family_from_type_text_reduces_known_types():
     assert pyright_family_from_type_text("list[ParticulatesSPM]") == "list"
     assert pyright_family_from_type_text("Path") == "path"
     assert pyright_family_from_type_text("IO[str]") == "file"
+    assert pyright_family_from_type_text("Field") == "field"
+    assert pyright_family_from_type_text("climlab.domain.field.Field") == "field"
+    assert pyright_family_from_type_text("numpy.ndarray") == "field"
+    assert pyright_family_from_type_text("numpy.typing.NDArray[Any]") == "field"
+    assert pyright_family_from_type_text("xarray.Dataset") == "xarray"
+    assert pyright_family_from_type_text("xarray.DataArray") == "xarray"
+    assert pyright_family_from_type_text("AttrDict") == "dict"
     assert pyright_family_from_type_text("Any") == "unknown"
     assert pyright_family_from_type_text("Unknown") == "unknown"
     assert pyright_family_from_type_text("ParticulatesSPM") == "object"
+
+
+def test_pyright_field_family_does_not_match_schema_field_types():
+    assert pyright_family_from_type_text("pydantic.fields.FieldInfo") == "object"
+    assert pyright_family_from_type_text("dataclasses.Field[Any]") == "object"
+    assert pyright_family_from_type_text("django.db.models.fields.CharField") == "object"
+    assert pyright_family_from_type_text("ModelField") == "object"
 
 
 def test_parse_pyright_probe_output_maps_probe_ids():

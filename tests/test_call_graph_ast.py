@@ -242,6 +242,38 @@ def run():
     )
 
 
+def test_add_subprocess_synthesizes_compute_edge(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        """
+class Child:
+    def _compute(self):
+        pass
+
+
+class Parent:
+    def __init__(self):
+        child = Child()
+        self.add_subprocess("child", child)
+
+    def _compute(self):
+        pass
+
+    def add_subprocess(self, name, proc):
+        pass
+""",
+        encoding="utf-8",
+    )
+
+    _nodes, edges = _build_call_graph(tmp_path)
+
+    assert _edge_exists(
+        edges,
+        "sample.Parent._compute",
+        "sample.Child._compute",
+        "subprocess_compute",
+    )
+
+
 def test_inherited_methods_from_returned_list_items_are_resolved(tmp_path):
     (tmp_path / "producer.py").write_text(
         """

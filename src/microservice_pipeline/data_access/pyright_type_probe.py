@@ -25,12 +25,15 @@ except ImportError:  # pragma: no cover - supports direct script execution
 
 PROBE_NAME_PREFIX = "__msp_probe_"
 PROBE_RE = re.compile(r'Type of "(__msp_probe_\d+)" is "([^"]+)"')
+TYPE_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 FAMILY_DATAFRAME = "dataframe"
 FAMILY_DICT = "dict"
 FAMILY_LIST = "list"
 FAMILY_SET = "set"
 FAMILY_FILE = "file"
 FAMILY_PATH = "path"
+FAMILY_FIELD = "field"
+FAMILY_XARRAY = "xarray"
 FAMILY_OBJECT = "object"
 FAMILY_UNKNOWN = "unknown"
 PYRIGHT_FAMILIES = {
@@ -40,8 +43,18 @@ PYRIGHT_FAMILIES = {
     FAMILY_SET,
     FAMILY_FILE,
     FAMILY_PATH,
+    FAMILY_FIELD,
+    FAMILY_XARRAY,
     FAMILY_OBJECT,
     FAMILY_UNKNOWN,
+}
+
+NON_CONTAINER_FIELD_QUALIFIERS = {
+    "dataclasses",
+    "django.",
+    "pydantic",
+    "sqlalchemy",
+    "marshmallow",
 }
 
 
@@ -70,6 +83,8 @@ def pyright_family_from_type_text(type_text: str) -> str:
     if not text:
         return FAMILY_UNKNOWN
     lowered = text.lower()
+    type_tokens = set(TYPE_NAME_RE.findall(text))
+    lowered_tokens = {token.lower() for token in type_tokens}
 
     unknown_markers = {"unknown", "any", "typing.any", "none", "nonetype", "never"}
     if lowered in unknown_markers:
@@ -81,6 +96,8 @@ def pyright_family_from_type_text(type_text: str) -> str:
     if "dataframe" in lowered or "pandas.core.frame" in lowered:
         families.add(FAMILY_DATAFRAME)
     if any(token in lowered for token in {"dict[", "mapping[", "mutablemapping[", "collections.abc.mapping"}):
+        families.add(FAMILY_DICT)
+    if "attrdict" in lowered or "mutableattr" in lowered:
         families.add(FAMILY_DICT)
     if any(token in lowered for token in {"list[", "sequence[", "mutablesequence[", "collections.abc.sequence"}):
         families.add(FAMILY_LIST)
@@ -104,6 +121,40 @@ def pyright_family_from_type_text(type_text: str) -> str:
         }
     ):
         families.add(FAMILY_FILE)
+    if any(
+        token in lowered
+        for token in {
+            "numpy.ndarray",
+            "np.ndarray",
+            "numpy.typing.ndarray",
+            "npt.ndarray",
+        }
+    ) or "ndarray" in lowered_tokens:
+        families.add(FAMILY_FIELD)
+    if (
+        "field" in lowered_tokens
+        and not any(token in lowered for token in NON_CONTAINER_FIELD_QUALIFIERS)
+        and (
+            lowered == "field"
+            or lowered.startswith("field[")
+            or lowered.endswith(".field")
+            or ".field[" in lowered
+            or "climlab" in lowered
+        )
+    ):
+        families.add(FAMILY_FIELD)
+    if any(
+        token in lowered
+        for token in {
+            "xarray.dataset",
+            "xarray.core.dataset",
+            "xarray.dataarray",
+            "xarray.core.dataarray",
+            "xr.dataset",
+            "xr.dataarray",
+        }
+    ):
+        families.add(FAMILY_XARRAY)
 
     if has_unknown:
         return FAMILY_UNKNOWN
@@ -296,12 +347,14 @@ def probe_pyright_targets(
 __all__ = [
     "FAMILY_DATAFRAME",
     "FAMILY_DICT",
+    "FAMILY_FIELD",
     "FAMILY_FILE",
     "FAMILY_LIST",
     "FAMILY_OBJECT",
     "FAMILY_PATH",
     "FAMILY_SET",
     "FAMILY_UNKNOWN",
+    "FAMILY_XARRAY",
     "PROBE_RE",
     "PYRIGHT_FAMILIES",
     "PyrightProbeTarget",

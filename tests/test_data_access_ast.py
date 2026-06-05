@@ -984,6 +984,302 @@ def load_csv_column(path, column_name):
     assert not _edge_exists(edges, object_id)
 
 
+def test_attrdict_attribute_load_becomes_dict_key_read():
+    objects, edges = _collect(
+        """
+class AttrDict(dict):
+    def __getattr__(self, key):
+        return self[key]
+
+
+class Model:
+    def __init__(self):
+        self.state = AttrDict()
+
+    def run(self):
+        return self.state.Ts
+"""
+    )
+
+    object_id = "dict_key:class_state:sample.Model:self.state:Ts"
+    assert object_id in objects
+    assert objects[object_id].kind == "dict_key"
+    assert objects[object_id].confidence == "medium"
+    assert _edge_exists(edges, object_id, access="read", operation="attribute_load")
+
+
+def test_pyright_dict_class_attr_attribute_load_becomes_dict_key_read():
+    objects, edges = _collect(
+        """
+class Model:
+    def run(self):
+        return self.state.Ts
+""",
+        pyright_families={"class_attr:sample.Model:state": "dict"},
+    )
+
+    object_id = "dict_key:class_state:sample.Model:self.state:Ts"
+    assert object_id in objects
+    assert _edge_exists(edges, object_id, access="read", operation="attribute_load")
+
+
+def test_pyright_dict_param_attribute_load_becomes_dict_key_read():
+    objects, edges = _collect(
+        """
+def read_state(state):
+    return state.Ts
+""",
+        pyright_families={"param:sample.read_state:state": "dict"},
+    )
+
+    object_id = "dict_key:sample.read_state:state:Ts"
+    assert object_id in objects
+    assert objects[object_id].confidence == "medium"
+    assert _matching_edges(edges, object_id, access="read")
+
+
+def test_returned_attrdict_preserves_access_path_for_attribute_key_read():
+    objects, edges = _collect(
+        """
+class AttrDict(dict):
+    def __getattr__(self, name):
+        return self[name]
+
+def build():
+    state = AttrDict()
+    return state
+
+def read():
+    return build().Ts
+"""
+    )
+
+    matches = [obj for obj in objects.values() if obj.kind == "dict_key" and obj.field == "Ts"]
+    assert matches
+    assert any(obj.access_path == "state['Ts']" for obj in matches)
+    assert any(_matching_edges(edges, obj.id, access="read") for obj in matches)
+
+
+def test_xarray_open_and_labeled_access_are_recorded():
+    objects, edges = _collect(
+        """
+import xarray as xr
+
+def load(path):
+    ds = xr.open_dataset(path)
+    by_lat = ds.sel(lat=45.0)
+    by_lev = ds.isel(lev=0)
+    by_time = ds.loc[{"time": "jan"}]
+    return by_lat, by_lev, by_time
+"""
+    )
+
+    assert _edge_exists(edges, "file:path", access="read", operation="xr.open_dataset")
+    expected = {
+        "dict_key:sample.load:ds:lat": "method:sel:labeled_access",
+        "dict_key:sample.load:ds:lev": "method:isel:labeled_access",
+        "dict_key:sample.load:ds:time": "subscript_load",
+    }
+    for object_id, operation in expected.items():
+        assert object_id in objects
+        assert any(edge.operation == operation for edge in _matching_edges(edges, object_id, access="read"))
+
+
+def test_xarray_labeled_call_with_unknown_receiver_records_receiver_read():
+    objects, edges = _collect(
+        """
+def load(ds):
+    return ds.sel(lat=45.0)
+"""
+    )
+
+    receiver_id = "param:sample.load:ds"
+    assert receiver_id in objects
+    assert any(
+        edge.object_id == receiver_id
+        and edge.access == "read"
+        and edge.operation == "method:sel:receiver"
+        for edge in edges
+    )
+    assert not any(obj.kind == "dict_key" and obj.field == "lat" for obj in objects.values())
+
+
+def test_xarray_open_dataarray_and_pooch_retrieve_are_recorded():
+    objects, edges = _collect(
+        """
+import pooch
+import xarray as xr
+
+def load(path):
+    fetched = pooch.retrieve(url="https://example.com/data.nc", known_hash=None)
+    da = xr.open_dataarray(path)
+    return da.isel(lev=0), fetched
+"""
+    )
+
+    assert _edge_exists(edges, "https://example.com/data.nc", access="read", operation="pooch.retrieve")
+    assert _edge_exists(edges, "file:path", access="read", operation="xr.open_dataarray")
+    assert any(obj.kind == "dict_key" and obj.field == "lev" for obj in objects.values())
+
+
+def test_add_subprocess_records_state_assign_lineage(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        """
+class Child:
+    def _compute(self):
+        pass
+
+
+class Parent:
+    def __init__(self):
+        child = Child()
+        self.add_subprocess("child", child)
+
+    def _compute(self):
+        pass
+
+    def add_subprocess(self, name, proc):
+        pass
+""",
+        encoding="utf-8",
+    )
+
+    callable_map, _module_map, _known_classes = build_indices(tmp_path)
+    objects, _edges, lineage = collect_data_access(
+        tmp_path,
+        callable_map=callable_map,
+        pyright_families={},
+    )
+
+    assert "class_state:sample.Child" in objects
+    assert "class_state:sample.Parent" in objects
+    assert any(
+        edge.src_object_id == "class_state:sample.Child"
+        and edge.dst_object_id == "class_state:sample.Parent"
+        and edge.relation == "state_assign"
+        and edge.slot == "child"
+        for edge in lineage
+    )
+
+
+def test_add_subprocess_resolves_loop_and_with_bound_child_types(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        """
+class Child:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        pass
+
+    def _compute(self):
+        pass
+
+
+class LoopParent:
+    def __init__(self):
+        children = [Child()]
+        for child in children:
+            self.add_subprocess("loop_child", child)
+
+    def _compute(self):
+        pass
+
+    def add_subprocess(self, name, proc):
+        pass
+
+
+class WithParent:
+    def __init__(self):
+        with Child() as child:
+            self.add_subprocess("with_child", child)
+
+    def _compute(self):
+        pass
+
+    def add_subprocess(self, name, proc):
+        pass
+""",
+        encoding="utf-8",
+    )
+
+    callable_map, _module_map, _known_classes = build_indices(tmp_path)
+    _objects, _edges, lineage = collect_data_access(
+        tmp_path,
+        callable_map=callable_map,
+        pyright_families={},
+    )
+
+    lineage_tuples = {
+        (edge.src_object_id, edge.dst_object_id, edge.relation, edge.slot)
+        for edge in lineage
+    }
+    assert (
+        "class_state:sample.Child",
+        "class_state:sample.LoopParent",
+        "state_assign",
+        "loop_child",
+    ) in lineage_tuples
+    assert (
+        "class_state:sample.Child",
+        "class_state:sample.WithParent",
+        "state_assign",
+        "with_child",
+    ) in lineage_tuples
+
+
+def test_add_subprocess_state_lineage_uses_split_class_state_namespace(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        """
+class Child:
+    def _compute(self):
+        pass
+
+
+class Parent:
+    def __init__(self):
+        self.state = {}
+        self.config = {}
+        self.results = {}
+        self.lookup = {}
+        child = Child()
+        self.add_subprocess("child", child)
+
+    def load(self):
+        self.results["mass_g"] = self.state["mass_g"]
+
+    def summarize(self):
+        return self.config["solver"], self.results["mass_g"]
+
+    def index(self):
+        return self.lookup["Air"]
+
+    def _compute(self):
+        pass
+
+    def add_subprocess(self, name, proc):
+        pass
+""",
+        encoding="utf-8",
+    )
+
+    callable_map, _module_map, _known_classes = build_indices(tmp_path)
+    objects, _edges, lineage = collect_data_access(
+        tmp_path,
+        callable_map=callable_map,
+        pyright_families={},
+    )
+
+    assert "class_attr_state:sample.Parent:state" in objects
+    assert any(
+        edge.src_object_id == "class_state:sample.Child"
+        and edge.dst_object_id == "class_attr_state:sample.Parent:state"
+        and edge.relation == "state_assign"
+        and edge.slot == "child"
+        for edge in lineage
+    )
+
+
 def test_unique_passed_object_lineage_rolls_param_state_up_to_producer_for_clustering():
     objects, edges = _collect(
         """

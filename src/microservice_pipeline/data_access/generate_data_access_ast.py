@@ -17,7 +17,6 @@ from __future__ import annotations
 import argparse
 import ast
 import sys
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
@@ -25,7 +24,10 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 try:
-    from microservice_pipeline.artifact_io import ensure_dir, write_csv_rows, write_json, write_markdown
+    from microservice_pipeline.data_access.attrdict import (
+        collect_attrdict_classes,
+        collect_attrdict_classes_from_analysis_files,
+    )
     from microservice_pipeline.config import (
         DataAccessExtractionConfig,
         ExtractionConfig,
@@ -38,8 +40,60 @@ try:
         resolve_import_from_target,
     )
     from microservice_pipeline.jsonc_config import load_jsonc
+    from microservice_pipeline.data_access.models import (
+        CONFIDENCE_RANK,
+        AccessEdge,
+        DataObject,
+        ExprRef,
+        LineageEdge,
+        LocalBinding,
+        Scope,
+        confidence_max,
+        confidence_weight,
+    )
+    from microservice_pipeline.data_access.outputs import _edges_payload, _objects_payload, write_outputs
+    from microservice_pipeline.data_access.rules import (
+        CONTAINER_FIELD_KIND,
+        CONTAINER_TYPES,
+        COORDINATOR_ATTR_THRESHOLD,
+        COORDINATOR_CONTAINER_THRESHOLD,
+        COORDINATOR_METHOD_THRESHOLD,
+        FILE_READ_FUNCS,
+        FILE_WRITE_METHODS,
+        MAX_RETURN_SUMMARY_PASSES,
+        MUTATING_METHODS,
+        PANDAS_INDEXER_ATTRS,
+        PANDAS_INPLACE_METHODS,
+        POOCH_READ_FUNCS,
+        XARRAY_INDEXER_ATTRS,
+        XARRAY_LABEL_METHODS,
+        XARRAY_OPEN_FUNCS,
+        _attr_expr_family_key,
+        _attribute_path,
+        _call_name_matches,
+        _class_attr_family_key,
+        _field_inferred_type,
+        _indexer_fields,
+        _is_containerish_family,
+        _keyword_truthy,
+        _literal_container_family,
+        _name_from_expr,
+        _slice_selects_multiple_fields,
+        _slice_value,
+        _top_level_attr_name,
+        _xarray_call_fields,
+        _xarray_indexer_fields,
+    )
+    from microservice_pipeline.subprocess_coupling import (
+        add_subprocess_child_expr,
+        add_subprocess_name,
+        is_add_subprocess_call,
+    )
 except ImportError:  # pragma: no cover - supports direct script execution
-    from artifact_io import ensure_dir, write_csv_rows, write_json, write_markdown  # type: ignore
+    from microservice_pipeline.data_access.attrdict import (  # type: ignore
+        collect_attrdict_classes,
+        collect_attrdict_classes_from_analysis_files,
+    )
     from microservice_pipeline.config import (  # type: ignore
         DataAccessExtractionConfig,
         ExtractionConfig,
@@ -52,6 +106,55 @@ except ImportError:  # pragma: no cover - supports direct script execution
         resolve_import_from_target,
     )
     from jsonc_config import load_jsonc  # type: ignore
+    from microservice_pipeline.data_access.models import (  # type: ignore
+        CONFIDENCE_RANK,
+        AccessEdge,
+        DataObject,
+        ExprRef,
+        LineageEdge,
+        LocalBinding,
+        Scope,
+        confidence_max,
+        confidence_weight,
+    )
+    from microservice_pipeline.data_access.outputs import _edges_payload, _objects_payload, write_outputs  # type: ignore
+    from microservice_pipeline.data_access.rules import (  # type: ignore
+        CONTAINER_FIELD_KIND,
+        CONTAINER_TYPES,
+        COORDINATOR_ATTR_THRESHOLD,
+        COORDINATOR_CONTAINER_THRESHOLD,
+        COORDINATOR_METHOD_THRESHOLD,
+        FILE_READ_FUNCS,
+        FILE_WRITE_METHODS,
+        MAX_RETURN_SUMMARY_PASSES,
+        MUTATING_METHODS,
+        PANDAS_INDEXER_ATTRS,
+        PANDAS_INPLACE_METHODS,
+        POOCH_READ_FUNCS,
+        XARRAY_INDEXER_ATTRS,
+        XARRAY_LABEL_METHODS,
+        XARRAY_OPEN_FUNCS,
+        _attr_expr_family_key,
+        _attribute_path,
+        _call_name_matches,
+        _class_attr_family_key,
+        _field_inferred_type,
+        _indexer_fields,
+        _is_containerish_family,
+        _keyword_truthy,
+        _literal_container_family,
+        _name_from_expr,
+        _slice_selects_multiple_fields,
+        _slice_value,
+        _top_level_attr_name,
+        _xarray_call_fields,
+        _xarray_indexer_fields,
+    )
+    from microservice_pipeline.subprocess_coupling import (  # type: ignore
+        add_subprocess_child_expr,
+        add_subprocess_name,
+        is_add_subprocess_call,
+    )
 
 try:
     from microservice_pipeline.call_graph.generate_call_graph_ast import (
@@ -69,12 +172,14 @@ try:
     from microservice_pipeline.data_access.pyright_type_probe import (
         FAMILY_DATAFRAME,
         FAMILY_DICT,
+        FAMILY_FIELD,
         FAMILY_FILE,
         FAMILY_LIST,
         FAMILY_OBJECT,
         FAMILY_PATH,
         FAMILY_SET,
         FAMILY_UNKNOWN,
+        FAMILY_XARRAY,
         PyrightProbeTarget,
         discover_project_root,
         probe_pyright_targets,
@@ -95,134 +200,23 @@ except ImportError:  # pragma: no cover - supports direct script execution
     from microservice_pipeline.data_access.pyright_type_probe import (  # type: ignore
         FAMILY_DATAFRAME,
         FAMILY_DICT,
+        FAMILY_FIELD,
         FAMILY_FILE,
         FAMILY_LIST,
         FAMILY_OBJECT,
         FAMILY_PATH,
         FAMILY_SET,
         FAMILY_UNKNOWN,
+        FAMILY_XARRAY,
         PyrightProbeTarget,
         discover_project_root,
         probe_pyright_targets,
     )
 
-
-CONFIDENCE_RANK = {"low": 0, "medium": 1, "high": 2}
-CONFIDENCE_WEIGHT = {"low": 0.25, "medium": 0.6, "high": 1.0}
-CONTAINER_TYPES = {FAMILY_DATAFRAME, FAMILY_DICT, FAMILY_LIST, FAMILY_SET, FAMILY_FILE}
-COORDINATOR_ATTR_THRESHOLD = 4
-COORDINATOR_METHOD_THRESHOLD = 3
-COORDINATOR_CONTAINER_THRESHOLD = 2
 SHARED_FIELD_CONTAINERS = {
     "df_col": {},
     "dict_key": {},
 }
-MUTATING_METHODS = {
-    "append",
-    "extend",
-    "insert",
-    "update",
-    "setdefault",
-    "pop",
-    "remove",
-    "clear",
-    "add",
-    "discard",
-    "sort",
-}
-PANDAS_INPLACE_METHODS = {
-    "drop",
-    "fillna",
-    "replace",
-    "rename",
-    "reset_index",
-    "set_index",
-    "sort_values",
-}
-FILE_READ_FUNCS = {"read_csv", "read_json", "read_excel", "read_table", "read_parquet"}
-FILE_WRITE_METHODS = {
-    "to_csv",
-    "to_json",
-    "to_excel",
-    "to_parquet",
-    "to_pickle",
-}
-PANDAS_INDEXER_ATTRS = {"loc", "iloc", "at", "iat"}
-MAX_RETURN_SUMMARY_PASSES = 8
-CONTAINER_FIELD_KIND = "container_field"
-
-
-@dataclass
-class DataObject:
-    id: str
-    kind: str
-    display_name: str
-    scope: str
-    owner: str
-    container: str
-    field: str
-    file: str
-    lineno: int
-    inferred_type: str
-    confidence: str
-    alias_of: str = ""
-    access_path: str = ""
-    structural_role: str = "primary"
-
-
-@dataclass
-class AccessEdge:
-    callable: str
-    object_id: str
-    access: str
-    operation: str
-    file: str
-    lineno: int
-    confidence: str
-    evidence: str
-
-
-@dataclass
-class LineageEdge:
-    src_object_id: str
-    dst_object_id: str
-    relation: str
-    file: str
-    lineno: int
-    caller: str = ""
-    callee: str = ""
-    slot: str = ""
-
-
-@dataclass
-class LocalBinding:
-    object_id: str
-    inferred_type: str = ""
-    confidence: str = "medium"
-    alias_of: str = ""
-    display_name: str = ""
-    access_path: str = ""
-    exposed: bool = True
-    node: Optional[ast.AST] = None
-
-
-@dataclass
-class Scope:
-    callable_id: str
-    params: Set[str]
-    locals: Dict[str, LocalBinding] = field(default_factory=dict)
-    attr_bindings: Dict[str, LocalBinding] = field(default_factory=dict)
-    shadowed: Set[str] = field(default_factory=set)
-
-
-@dataclass
-class ExprRef:
-    object_id: str
-    inferred_type: str
-    confidence: str
-    display_name: str
-    access_path: str = ""
-    coarse_object_id: str = ""
 
 
 def _is_state_object_id(object_id: str) -> bool:
@@ -247,11 +241,11 @@ def _class_attr_state_display(owner: str, attr_name: str) -> str:
 
 
 def _confidence_max(a: str, b: str) -> str:
-    return a if CONFIDENCE_RANK.get(a, 0) >= CONFIDENCE_RANK.get(b, 0) else b
+    return confidence_max(a, b)
 
 
 def _confidence_weight(confidence: str) -> float:
-    return CONFIDENCE_WEIGHT.get(confidence, CONFIDENCE_WEIGHT["low"])
+    return confidence_weight(confidence)
 
 
 def _is_unknown_family(family: str) -> bool:
@@ -268,32 +262,6 @@ def _prefer_inferred_type(current: str, incoming: str) -> str:
 
 def _specific_family(ref: ExprRef) -> bool:
     return not _is_unknown_family(ref.inferred_type)
-
-
-def _field_inferred_type(kind: str) -> str:
-    if kind == "df_col":
-        return FAMILY_DATAFRAME
-    if kind == "dict_key":
-        return FAMILY_DICT
-    return FAMILY_UNKNOWN
-
-
-def _is_containerish_family(family: str) -> bool:
-    return family in {FAMILY_DATAFRAME, FAMILY_DICT, FAMILY_LIST, FAMILY_SET, FAMILY_OBJECT}
-
-
-def _literal_container_family(node: ast.AST) -> str:
-    if isinstance(node, (ast.Dict, ast.DictComp)):
-        return FAMILY_DICT
-    if isinstance(node, (ast.List, ast.ListComp)):
-        return FAMILY_LIST
-    if isinstance(node, (ast.Set, ast.SetComp)):
-        return FAMILY_SET
-    if isinstance(node, ast.Call):
-        func_name = _name_from_expr(node.func)
-        if func_name in {"dict", "list", "set"}:
-            return {"dict": FAMILY_DICT, "list": FAMILY_LIST, "set": FAMILY_SET}[func_name]
-    return FAMILY_UNKNOWN
 
 
 def _return_summary_score(ref: ExprRef) -> Tuple[int, int, int, int]:
@@ -313,13 +281,14 @@ def _merge_return_summary(existing: Optional[ExprRef], candidate: ExprRef) -> Ex
     return existing
 
 
-def _return_summary_snapshot(return_summaries: Dict[str, ExprRef]) -> Dict[str, Tuple[str, str, str, str]]:
+def _return_summary_snapshot(return_summaries: Dict[str, ExprRef]) -> Dict[str, Tuple[str, str, str, str, str]]:
     return {
         callable_id: (
             ref.object_id,
             ref.inferred_type,
             ref.confidence,
             ref.display_name,
+            ref.access_path,
         )
         for callable_id, ref in sorted(return_summaries.items())
     }
@@ -546,91 +515,6 @@ def _apply_lineage_aliases(
             # Do not keep the one-summary alias when reaching definitions are
             # ambiguous.
             obj.alias_of = ""
-
-
-def _attribute_path(node: ast.AST) -> Optional[str]:
-    if isinstance(node, ast.Name):
-        return node.id
-    if isinstance(node, ast.Attribute):
-        parent = _attribute_path(node.value)
-        if parent:
-            return f"{parent}.{node.attr}"
-        return node.attr
-    return None
-
-
-def _name_from_expr(node: ast.AST) -> str:
-    if isinstance(node, ast.Name):
-        return node.id
-    if isinstance(node, ast.Attribute):
-        return node.attr
-    return _unparse(node)
-
-
-def _keyword_truthy(call: ast.Call, keyword_name: str) -> bool:
-    for keyword in call.keywords:
-        if keyword.arg == keyword_name:
-            return isinstance(keyword.value, ast.Constant) and keyword.value.value is True
-    return False
-
-
-def _literal_strings(node: ast.AST) -> List[str]:
-    if isinstance(node, ast.Constant) and isinstance(node.value, str):
-        return [node.value]
-    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
-        values: List[str] = []
-        for element in node.elts:
-            if isinstance(element, ast.Constant) and isinstance(element.value, str):
-                values.append(element.value)
-        return values
-    return []
-
-
-def _slice_value(node: ast.AST) -> ast.AST:
-    # Python 3.9+ stores slices directly, but keep the helper for clarity.
-    return node.slice if isinstance(node, ast.Subscript) else node
-
-
-def _indexer_fields(slice_node: ast.AST) -> Tuple[List[str], str]:
-    """Return literal dataframe/indexer fields and a confidence label."""
-    if isinstance(slice_node, ast.Tuple) and slice_node.elts:
-        candidates = list(slice_node.elts)
-        # DataFrame indexers use the last tuple component as the column selector.
-        for candidate in reversed(candidates):
-            fields = _literal_strings(candidate)
-            if fields:
-                return fields, "high"
-        return [], "low"
-
-    fields = _literal_strings(slice_node)
-    if fields:
-        return fields, "high"
-    return [], "low"
-
-
-def _slice_selects_multiple_fields(slice_node: ast.AST) -> bool:
-    if isinstance(slice_node, (ast.List, ast.Set)):
-        return True
-    if isinstance(slice_node, ast.Tuple):
-        if any(isinstance(element, (ast.List, ast.Set)) for element in slice_node.elts):
-            return True
-        if len(slice_node.elts) > 1 and any(
-            not isinstance(element, (ast.Slice, ast.Constant)) for element in slice_node.elts
-        ):
-            return True
-    return False
-
-
-def _top_level_attr_name(attr_path: str) -> str:
-    return attr_path.split(".", 1)[0].strip()
-
-
-def _class_attr_family_key(owner: str, attr_name: str) -> str:
-    return f"class_attr:{owner}:{attr_name}"
-
-
-def _attr_expr_family_key(callable_id: str, attr_path: str) -> str:
-    return f"attr_expr:{callable_id}:{attr_path}"
 
 
 def infer_split_class_owners(
@@ -988,6 +872,7 @@ class DataAccessCollector(ast.NodeVisitor):
         lineage_edges: Optional[List[LineageEdge]] = None,
         split_class_owners: Optional[Set[str]] = None,
         pyright_families: Optional[Dict[str, str]] = None,
+        attrdict_classes: Optional[Set[str]] = None,
     ):
         self.module = module
         self.file = file
@@ -1005,6 +890,13 @@ class DataAccessCollector(ast.NodeVisitor):
         self.lineage_edges = lineage_edges if lineage_edges is not None else []
         self.split_class_owners = split_class_owners if split_class_owners is not None else set()
         self.pyright_families = pyright_families if pyright_families is not None else {}
+        self.attrdict_classes = attrdict_classes if attrdict_classes is not None else set()
+        self.attrdict_access_paths: Set[str] = set()
+        self.known_classes = {
+            f"{callable_def.module}.{callable_def.class_name}"
+            for callable_def in callable_map.values()
+            if getattr(callable_def, "class_name", None)
+        }
         self.objects: Dict[str, DataObject] = {}
         self.edges: List[AccessEdge] = []
         self.created_object_ids: Set[str] = set()
@@ -1023,6 +915,76 @@ class DataAccessCollector(ast.NodeVisitor):
         if self.current_class:
             return f"{self.module}.{self.current_class}"
         return self.module
+
+    def _known_class_ids(self) -> Set[str]:
+        return set(self.known_classes) | set(self.attrdict_classes)
+
+    def _resolve_class_reference_name(self, name: str) -> Set[str]:
+        if not name:
+            return set()
+        known_classes = self._known_class_ids()
+        matches: Set[str] = set()
+        if "." not in name:
+            local = f"{self.module}.{name}"
+            if local in known_classes:
+                matches.add(local)
+            imported = self.module_imports.get(name)
+            if imported and imported in known_classes:
+                matches.add(imported)
+            return matches
+
+        base, _sep, _rest = name.partition(".")
+        imported_base = self.module_imports.get(base)
+        if imported_base:
+            candidate = f"{imported_base}.{_rest}"
+            if candidate in known_classes:
+                matches.add(candidate)
+        if name in known_classes:
+            matches.add(name)
+        return matches
+
+    def _class_types_from_call(self, value: ast.Call) -> Set[str]:
+        call_name = _attribute_path(value.func) or ""
+        return self._resolve_class_reference_name(call_name)
+
+    def _class_types_from_value(self, value: object) -> Set[str]:
+        if isinstance(value, ast.Call):
+            return self._class_types_from_call(value)
+        if isinstance(value, ast.Name) and self.scope:
+            return set(self.scope.local_class_types.get(value.id, set()))
+        if isinstance(value, ast.Attribute) and self.scope:
+            path = _attribute_path(value)
+            if path:
+                return set(self.scope.attr_class_types.get(path, set()))
+        return set()
+
+    def _element_class_types_from_value(self, value: object) -> Set[str]:
+        if isinstance(value, (ast.List, ast.Tuple, ast.Set)):
+            element_types: Set[str] = set()
+            for element in value.elts:
+                element_types.update(self._class_types_from_value(element))
+            return element_types
+        if isinstance(value, ast.Name) and self.scope:
+            return set(self.scope.local_element_class_types.get(value.id, set()))
+        return set()
+
+    def _class_types_from_expr(self, node: ast.AST) -> Set[str]:
+        if (
+            isinstance(node, ast.Name)
+            and node.id in {"self", "cls"}
+            and self.current_class
+        ):
+            return {f"{self.module}.{self.current_class}"}
+        return self._class_types_from_value(node)
+
+    def _value_is_attrdict_constructor(self, value: object) -> bool:
+        return isinstance(value, ast.Call) and bool(
+            self._class_types_from_call(value) & self.attrdict_classes
+        )
+
+    def _mark_attrdict_access_path(self, path: str) -> None:
+        if path:
+            self.attrdict_access_paths.add(path)
 
     def _family_for_object_id(self, object_id: str) -> str:
         family = self.pyright_families.get(object_id, "")
@@ -1196,6 +1158,8 @@ class DataAccessCollector(ast.NodeVisitor):
             access_path=f"self.{top_attr or attr_path}",
         )
         access_path = f"self.{top_attr or attr_path}"
+        if inferred == FAMILY_DICT:
+            self._mark_attrdict_access_path(access_path)
         return ExprRef(object_id, inferred, confidence, access_path, access_path)
 
     def _param_ref(self, name: str, node: ast.AST) -> ExprRef:
@@ -1242,6 +1206,7 @@ class DataAccessCollector(ast.NodeVisitor):
         alias_of: str = "",
         alias_display_name: str = "",
         expose: bool = True,
+        class_types: Optional[Set[str]] = None,
     ) -> ExprRef:
         callable_id = self.current_callable or ""
         object_id = f"local_exposed:{callable_id}:{name}"
@@ -1272,6 +1237,7 @@ class DataAccessCollector(ast.NodeVisitor):
                 access_path=alias_display_name or name,
                 exposed=expose,
                 node=node,
+                class_types=set(class_types or set()),
             )
         return ExprRef(object_id, inferred, confidence, name, name)
 
@@ -1418,6 +1384,8 @@ class DataAccessCollector(ast.NodeVisitor):
             return ExprRef(base.object_id, inferred, confidence, display, access_path)
 
         base_path = base.access_path or base.display_name
+        if base_path in self.attrdict_access_paths or base.inferred_type == FAMILY_DICT:
+            return self._field_ref(base, attr, node, kind="dict_key", confidence="medium")
         access_path = _path_with_attr(base_path, attr)
         display = access_path
         inferred = self._family_for_attr_expr(attr_path) if attr_path else FAMILY_UNKNOWN
@@ -1468,6 +1436,8 @@ class DataAccessCollector(ast.NodeVisitor):
             return "df_col"
         if base.inferred_type == FAMILY_DICT:
             return "dict_key"
+        if base.inferred_type == FAMILY_XARRAY:
+            return "dict_key"
         return CONTAINER_FIELD_KIND
 
     def _infer_type_from_value(self, value: object) -> Tuple[str, str, str]:
@@ -1494,6 +1464,8 @@ class DataAccessCollector(ast.NodeVisitor):
             returned = self._return_ref_from_call(value)
             if returned:
                 return returned.inferred_type, returned.object_id, returned.confidence
+            if self._value_is_attrdict_constructor(value):
+                return FAMILY_DICT, "", "medium"
             if call_name in {"dict", "builtins.dict"} or call_name.endswith(".dict"):
                 return FAMILY_DICT, "", "high"
             if call_name in {"list", "builtins.list"} or call_name.endswith(".list"):
@@ -1504,6 +1476,10 @@ class DataAccessCollector(ast.NodeVisitor):
                 return FAMILY_DATAFRAME, "", "high"
             if call_name.endswith(tuple(FILE_READ_FUNCS)):
                 return FAMILY_DATAFRAME, "", "high"
+            if _call_name_matches(call_name, XARRAY_OPEN_FUNCS):
+                return FAMILY_XARRAY, "", "high"
+            if _call_name_matches(call_name, POOCH_READ_FUNCS):
+                return FAMILY_PATH, "", "medium"
             if isinstance(value.func, ast.Attribute) and value.func.attr == "copy":
                 base = self._resolve_expr(value.func.value)
                 if base:
@@ -1730,6 +1706,7 @@ class DataAccessCollector(ast.NodeVisitor):
                     summary.inferred_type,
                     confidence,
                     summary.display_name,
+                    summary.access_path,
                 )
         return None
 
@@ -1864,6 +1841,7 @@ class DataAccessCollector(ast.NodeVisitor):
                         returned.inferred_type,
                         returned.confidence,
                         returned.display_name,
+                        returned.access_path,
                     ),
                 )
             tuple_summary = self._resolve_unpack_value_refs(node.value)
@@ -1911,6 +1889,7 @@ class DataAccessCollector(ast.NodeVisitor):
 
     def visit_For(self, node: ast.For | ast.AsyncFor) -> None:
         iter_ref = self._resolve_expr(node.iter)
+        element_class_types = self._element_class_types_from_value(node.iter)
         self.visit(node.iter)
         if iter_ref:
             iter_binding: Optional[LocalBinding] = None
@@ -1940,7 +1919,15 @@ class DataAccessCollector(ast.NodeVisitor):
                         display_name=element_path,
                         access_path=element_path,
                         exposed=exposed,
+                        class_types=set(element_class_types),
                     )
+                    if element_class_types:
+                        self.scope.local_class_types[name] = set(element_class_types)
+                    else:
+                        self.scope.local_class_types.pop(name, None)
+        elif element_class_types and self.scope is not None:
+            for name in self._target_names(node.target):
+                self.scope.local_class_types[name] = set(element_class_types)
         for stmt in node.body:
             self.visit(stmt)
         for stmt in node.orelse:
@@ -1974,6 +1961,12 @@ class DataAccessCollector(ast.NodeVisitor):
                         )
             else:
                 self.visit(context)
+                if isinstance(item.optional_vars, ast.Name) and self.scope:
+                    class_types = self._class_types_from_value(context)
+                    if class_types:
+                        self.scope.local_class_types[item.optional_vars.id] = set(class_types)
+                    else:
+                        self.scope.local_class_types.pop(item.optional_vars.id, None)
             if item.optional_vars is not None and not isinstance(item.optional_vars, ast.Name):
                 self._handle_store_target(item.optional_vars, item.context_expr, "create")
         for stmt in node.body:
@@ -2038,9 +2031,11 @@ class DataAccessCollector(ast.NodeVisitor):
 
     def visit_Call(self, node: ast.Call) -> None:
         self._handle_file_call(node)
+        labeled_access_recorded = self._handle_xarray_labeled_call(node)
         self._handle_mutating_call(node)
-        self._handle_method_receiver_read(node)
+        self._handle_method_receiver_read(node, suppress_receiver_read=labeled_access_recorded)
         self._record_confirmed_param_lineage(node)
+        self._record_subprocess_state_lineage(node)
         known_callees = [
             callable_id
             for callable_id in self._candidate_callable_ids_for_call(node)
@@ -2095,10 +2090,12 @@ class DataAccessCollector(ast.NodeVisitor):
     def visit_DictComp(self, node: ast.DictComp) -> None:
         self._visit_comprehension(node, [node.key, node.value])
 
-    def _handle_method_receiver_read(self, node: ast.Call) -> None:
+    def _handle_method_receiver_read(self, node: ast.Call, *, suppress_receiver_read: bool = False) -> None:
         if not isinstance(node.func, ast.Attribute):
             return
         method = node.func.attr
+        if suppress_receiver_read and method in XARRAY_LABEL_METHODS:
+            return
         if method in MUTATING_METHODS:
             return
         if method in PANDAS_INPLACE_METHODS and _keyword_truthy(node, "inplace"):
@@ -2114,6 +2111,65 @@ class DataAccessCollector(ast.NodeVisitor):
                 node,
                 receiver.confidence,
             )
+
+    def _handle_xarray_labeled_call(self, node: ast.Call) -> bool:
+        if not isinstance(node.func, ast.Attribute):
+            return False
+        if node.func.attr not in XARRAY_LABEL_METHODS:
+            return False
+        receiver = self._resolve_expr(node.func.value)
+        if not receiver or receiver.inferred_type != FAMILY_XARRAY:
+            return False
+        fields, confidence = _xarray_call_fields(node)
+        recorded = False
+        for field in fields:
+            ref = self._field_ref(receiver, field, node, kind="dict_key", confidence=confidence)
+            self._record_access(
+                ref.object_id,
+                "read",
+                f"method:{node.func.attr}:labeled_access",
+                node,
+                ref.confidence,
+            )
+            recorded = True
+        return recorded
+
+    def _class_state_object_id_for_owner(self, owner: str, node: ast.AST) -> str:
+        split_class_state = owner in self.split_class_owners
+        object_id = f"class_attr_state:{owner}:state" if split_class_state else f"class_state:{owner}"
+        self._register_object(
+            object_id=object_id,
+            kind="class_attr_state" if split_class_state else "class_state",
+            display_name=_class_attr_state_display(owner, "state") if split_class_state else _class_state_display(owner),
+            scope="class",
+            owner=owner,
+            field="state" if split_class_state else "",
+            node=node,
+            inferred_type=FAMILY_OBJECT,
+            confidence="medium",
+            access_path="self.state" if split_class_state else f"{owner.rsplit('.', 1)[-1]} state",
+        )
+        return object_id
+
+    def _record_subprocess_state_lineage(self, node: ast.Call) -> None:
+        if not is_add_subprocess_call(node) or not isinstance(node.func, ast.Attribute):
+            return
+        child_expr = add_subprocess_child_expr(node)
+        if child_expr is None:
+            return
+        parent_types = sorted(self._class_types_from_expr(node.func.value))
+        child_types = sorted(self._class_types_from_expr(child_expr))
+        if len(parent_types) != 1 or len(child_types) != 1:
+            return
+        parent_state = self._class_state_object_id_for_owner(parent_types[0], node)
+        child_state = self._class_state_object_id_for_owner(child_types[0], node)
+        self._record_lineage(
+            child_state,
+            parent_state,
+            "state_assign",
+            node,
+            slot=add_subprocess_name(node),
+        )
 
     def _resolve_expr(self, node: ast.AST) -> Optional[ExprRef]:
         if isinstance(node, ast.Name):
@@ -2205,7 +2261,10 @@ class DataAccessCollector(ast.NodeVisitor):
                 return self._class_attr_ref(attr_path, node)
             base = self._resolve_expr(node.value)
             if base:
-                if base.object_id.startswith("class_state:"):
+                if (
+                    base.object_id.startswith("class_state:")
+                    and (base.access_path or base.display_name) not in self.attrdict_access_paths
+                ):
                     return base
                 return self._object_attr_ref(base, node.attr, node, attr_path=path)
             return None
@@ -2224,6 +2283,12 @@ class DataAccessCollector(ast.NodeVisitor):
             base = self._resolve_expr(node.value.value)
             if not base:
                 return []
+            if base.inferred_type == FAMILY_XARRAY and node.value.attr in XARRAY_INDEXER_ATTRS:
+                fields, confidence = _xarray_indexer_fields(_slice_value(node))
+                return [
+                    self._field_ref(base, field, node, kind="dict_key", confidence=confidence)
+                    for field in fields
+                ]
             fields, confidence = _indexer_fields(_slice_value(node))
             confidence = "low" if node.value.attr in {"iloc", "iat"} and confidence != "high" else confidence
             return [
@@ -2257,7 +2322,18 @@ class DataAccessCollector(ast.NodeVisitor):
         access: str,
         operation: str = "assign",
     ) -> None:
+        class_types = self._class_types_from_value(value)
+        element_class_types = self._element_class_types_from_value(value)
         if isinstance(target, ast.Name):
+            if self.scope is not None:
+                if class_types:
+                    self.scope.local_class_types[target.id] = set(class_types)
+                else:
+                    self.scope.local_class_types.pop(target.id, None)
+                if element_class_types:
+                    self.scope.local_element_class_types[target.id] = set(element_class_types)
+                else:
+                    self.scope.local_element_class_types.pop(target.id, None)
             inferred_type, alias_of, confidence = self._infer_type_from_value(value)
             if inferred_type in CONTAINER_TYPES or alias_of:
                 expose = bool(alias_of)
@@ -2269,7 +2345,10 @@ class DataAccessCollector(ast.NodeVisitor):
                     alias_of=alias_of,
                     alias_display_name=self._alias_display_from_value(value, alias_of),
                     expose=expose,
+                    class_types=class_types,
                 )
+                if self._value_is_attrdict_constructor(value):
+                    self._mark_attrdict_access_path(ref.access_path)
                 if expose:
                     if alias_of:
                         self._record_lineage(alias_of, ref.object_id, "local_assign", target)
@@ -2288,12 +2367,17 @@ class DataAccessCollector(ast.NodeVisitor):
             return
 
         if isinstance(target, ast.Attribute):
+            attr_path = _attribute_path(target)
+            if self.scope is not None and attr_path:
+                if class_types:
+                    self.scope.attr_class_types[attr_path] = set(class_types)
+                else:
+                    self.scope.attr_class_types.pop(attr_path, None)
             if self._target_causes_escape(target):
                 self._expose_escaping_locals_in_value(value, target, operation="escape_assign")
             ref = self._resolve_attribute(target)
             if ref:
                 inferred_type, alias_of, confidence = self._infer_type_from_value(value)
-                attr_path = _attribute_path(target)
                 if (
                     attr_path
                     and self.scope
@@ -2307,7 +2391,10 @@ class DataAccessCollector(ast.NodeVisitor):
                         alias_of=alias_of,
                         display_name=self._alias_display_from_value(value, alias_of) or target.attr,
                         access_path=self._alias_display_from_value(value, alias_of) or attr_path,
+                        class_types=set(class_types),
                     )
+                if self._value_is_attrdict_constructor(value):
+                    self._mark_attrdict_access_path(ref.access_path or attr_path or "")
                 if (
                     inferred_type
                     and ref.object_id in self.objects
@@ -2416,6 +2503,20 @@ class DataAccessCollector(ast.NodeVisitor):
             self._record_access(file_ref.object_id, "read", call_name, node, file_ref.confidence)
             return
 
+        if _call_name_matches(call_name, XARRAY_OPEN_FUNCS):
+            file_expr = self._file_arg_from_call(node, ("filename_or_obj", "path", "path_or_file"))
+            if file_expr is not None:
+                file_ref = self._file_ref(file_expr, node)
+                self._record_access(file_ref.object_id, "read", call_name, node, file_ref.confidence)
+            return
+
+        if _call_name_matches(call_name, POOCH_READ_FUNCS):
+            file_expr = self._file_arg_from_call(node, ("url", "fname", "path"))
+            if file_expr is not None:
+                file_ref = self._file_ref(file_expr, node)
+                self._record_access(file_ref.object_id, "read", call_name, node, file_ref.confidence)
+            return
+
         if call_name.endswith("json.load") and node.args:
             file_ref = self._resolve_expr(node.args[0])
             if file_ref and file_ref.inferred_type == "file":
@@ -2426,6 +2527,14 @@ class DataAccessCollector(ast.NodeVisitor):
             file_ref = self._resolve_expr(node.args[1])
             if file_ref and file_ref.inferred_type == "file":
                 self._record_access(file_ref.object_id, "write", "json.dump", node, file_ref.confidence)
+
+    def _file_arg_from_call(self, node: ast.Call, keyword_names: Sequence[str]) -> Optional[ast.AST]:
+        if node.args:
+            return node.args[0]
+        for keyword in node.keywords:
+            if keyword.arg in keyword_names:
+                return keyword.value
+        return None
 
     def _is_open_call(self, node: ast.Call) -> bool:
         call_name = _attribute_path(node.func) or ""
@@ -2495,6 +2604,7 @@ def collect_data_access_from_tree(
     param_access_paths: Optional[Dict[str, Set[str]]] = None,
     lineage_edges: Optional[List[LineageEdge]] = None,
     pyright_families: Optional[Dict[str, str]] = None,
+    attrdict_classes: Optional[Set[str]] = None,
 ) -> Tuple[Dict[str, DataObject], List[AccessEdge], List[LineageEdge]]:
     attach_parents(tree)
     if callable_map is None:
@@ -2505,6 +2615,11 @@ def collect_data_access_from_tree(
         current_is_package=is_package_file(file),
     )
     split_class_owners = infer_split_class_owners(tree, module, pyright_families)
+    resolved_attrdict_classes = (
+        attrdict_classes
+        if attrdict_classes is not None
+        else collect_attrdict_classes(tree, module, file)
+    )
     collector = DataAccessCollector(
         module=module,
         file=file,
@@ -2520,6 +2635,7 @@ def collect_data_access_from_tree(
         lineage_edges=lineage_edges,
         split_class_owners=split_class_owners,
         pyright_families=pyright_families,
+        attrdict_classes=resolved_attrdict_classes,
     )
     collector.visit(tree)
     return collector.objects, collector.edges, collector.lineage_edges
@@ -2538,6 +2654,7 @@ def collect_data_access_from_source(
     return_tuple_summaries: Dict[str, Tuple[Optional[ExprRef], ...]] = {}
     callable_params: Dict[str, Tuple[str, ...]] = {}
     file = Path(filename)
+    attrdict_classes = collect_attrdict_classes(ast.parse(source, filename=filename), module, file)
     # Iterate to a small fixpoint so transitive return aliases like A -> B -> C
     # can stabilize without relying on source-order.
     for _ in range(MAX_RETURN_SUMMARY_PASSES):
@@ -2552,6 +2669,7 @@ def collect_data_access_from_source(
             return_tuple_summaries=return_tuple_summaries,
             callable_params=callable_params,
             pyright_families=pyright_families,
+            attrdict_classes=attrdict_classes,
         )
         if (
             _return_summary_snapshot(return_summaries) == before
@@ -2563,7 +2681,8 @@ def collect_data_access_from_source(
     param_bindings: Dict[str, Set[str]] = {}
     param_access_paths: Dict[str, Set[str]] = {}
     lineage_edges: List[LineageEdge] = []
-    objects, edges, lineage_edges = collect_data_access_from_tree(
+    module_lineage_edges: List[LineageEdge] = []
+    objects, edges, module_lineage_edges = collect_data_access_from_tree(
         tree,
         module=module,
         file=file,
@@ -2572,9 +2691,11 @@ def collect_data_access_from_source(
         callable_params=callable_params,
         param_bindings=param_bindings,
         param_access_paths=param_access_paths,
-        lineage_edges=lineage_edges,
+        lineage_edges=module_lineage_edges,
         pyright_families=pyright_families,
+        attrdict_classes=attrdict_classes,
     )
+    lineage_edges.extend(module_lineage_edges)
     _apply_confirmed_param_aliases(objects, param_bindings)
     _apply_confirmed_param_access_paths(objects, param_access_paths)
     _apply_lineage_aliases(objects, lineage_edges)
@@ -2607,6 +2728,7 @@ def collect_data_access_from_analysis_files(
     return_summaries: Dict[str, ExprRef] = {}
     return_tuple_summaries: Dict[str, Tuple[Optional[ExprRef], ...]] = {}
     callable_params: Dict[str, Tuple[str, ...]] = {}
+    attrdict_classes = collect_attrdict_classes_from_analysis_files(analysis_files)
 
     # Iterate to a small fixpoint so return summaries can propagate through
     # shallow call chains even when files are not processed in dependency order.
@@ -2626,6 +2748,7 @@ def collect_data_access_from_analysis_files(
                 return_tuple_summaries=return_tuple_summaries,
                 callable_params=callable_params,
                 pyright_families=resolved_pyright_families,
+                attrdict_classes=attrdict_classes,
             )
         if (
             _return_summary_snapshot(return_summaries) == before
@@ -2639,7 +2762,8 @@ def collect_data_access_from_analysis_files(
         py_file = analysis_file.path
         module = analysis_file.module
         tree = ast.parse(py_file.read_text(encoding="utf-8"), filename=str(py_file))
-        module_objects, module_edges, lineage_edges = collect_data_access_from_tree(
+        module_lineage_edges: List[LineageEdge] = []
+        module_objects, module_edges, module_lineage_edges = collect_data_access_from_tree(
             tree=tree,
             module=module,
             file=py_file,
@@ -2649,8 +2773,9 @@ def collect_data_access_from_analysis_files(
             callable_params=callable_params,
             param_bindings=param_bindings,
             param_access_paths=param_access_paths,
-            lineage_edges=lineage_edges,
+            lineage_edges=module_lineage_edges,
             pyright_families=resolved_pyright_families,
+            attrdict_classes=attrdict_classes,
         )
         for object_id, data_object in module_objects.items():
             if object_id not in objects:
@@ -2661,6 +2786,7 @@ def collect_data_access_from_analysis_files(
                     data_object.confidence,
                 )
         edges.extend(module_edges)
+        lineage_edges.extend(module_lineage_edges)
 
     _apply_confirmed_param_aliases(objects, param_bindings)
     _apply_confirmed_param_access_paths(objects, param_access_paths)
@@ -2696,383 +2822,6 @@ def collect_data_access(
         pyright_bin=pyright_bin,
         pyright_families=pyright_families,
     )
-
-
-def _callables_payload(callable_map: Dict[str, CallableDef]) -> List[dict]:
-    return [c.__dict__ for c in sorted(callable_map.values(), key=lambda x: x.id)]
-
-
-def _objects_payload(objects: Dict[str, DataObject]) -> List[dict]:
-    payload: List[dict] = []
-    for data_object in sorted(objects.values(), key=lambda x: x.id):
-        row = data_object.__dict__.copy()
-        payload.append(row)
-    return payload
-
-
-def _edges_payload(edges: Sequence[AccessEdge], objects: Dict[str, DataObject]) -> List[dict]:
-    return [
-        {
-            **e.__dict__,
-            "confidence_weight": _confidence_weight(e.confidence),
-        }
-        for e in sorted(
-            edges,
-            key=lambda x: (x.callable, x.object_id, x.access, x.lineno, x.operation),
-        )
-    ]
-
-
-def _lineage_payload(lineage_edges: Sequence[LineageEdge]) -> List[dict]:
-    return [
-        edge.__dict__.copy()
-        for edge in sorted(
-            lineage_edges,
-            key=lambda x: (x.src_object_id, x.dst_object_id, x.relation, x.lineno, x.slot),
-        )
-    ]
-
-
-def write_outputs(
-    outdir: Path,
-    callable_map: Dict[str, CallableDef],
-    objects: Dict[str, DataObject],
-    edges: List[AccessEdge],
-    lineage_edges: List[LineageEdge],
-) -> None:
-    ensure_dir(outdir)
-
-    write_csv_rows(
-        outdir / "data_objects.csv",
-        [
-            "id",
-            "kind",
-            "display_name",
-            "scope",
-            "owner",
-            "container",
-            "field",
-            "file",
-            "lineno",
-            "inferred_type",
-            "confidence",
-            "alias_of",
-            "access_path",
-            "structural_role",
-        ],
-        _objects_payload(objects),
-    )
-    write_csv_rows(
-        outdir / "access_edges.csv",
-        [
-            "callable",
-            "object_id",
-            "access",
-            "operation",
-            "file",
-            "lineno",
-            "confidence",
-            "confidence_weight",
-            "evidence",
-        ],
-        _edges_payload(edges, objects),
-    )
-
-    denormalized_rows = []
-    for edge in sorted(edges, key=lambda x: (x.callable, x.object_id, x.lineno, x.operation)):
-        obj = objects.get(edge.object_id)
-        denormalized_rows.append(
-            {
-                "callable": edge.callable,
-                "access": edge.access,
-                "operation": edge.operation,
-                "object_id": edge.object_id,
-                "object_kind": obj.kind if obj else "",
-                "display_name": obj.display_name if obj else edge.object_id,
-                "scope": obj.scope if obj else "",
-                "owner": obj.owner if obj else "",
-                "field": obj.field if obj else "",
-                "inferred_type": obj.inferred_type if obj else "",
-                "access_path": obj.access_path if obj else "",
-                "structural_role": obj.structural_role if obj else "",
-                "confidence": edge.confidence,
-                "confidence_weight": _confidence_weight(edge.confidence),
-                "file": edge.file,
-                "lineno": edge.lineno,
-                "evidence": edge.evidence,
-            }
-        )
-    write_csv_rows(
-        outdir / "callable_data_access.csv",
-        [
-            "callable",
-            "access",
-            "operation",
-            "object_id",
-            "object_kind",
-            "display_name",
-            "scope",
-            "owner",
-            "field",
-            "inferred_type",
-            "access_path",
-            "structural_role",
-            "confidence",
-            "confidence_weight",
-            "file",
-            "lineno",
-            "evidence",
-        ],
-        denormalized_rows,
-    )
-
-    payload = {
-        "callables": _callables_payload(callable_map),
-        "objects": _objects_payload(objects),
-        "edges": _edges_payload(edges, objects),
-        "lineage_edges": _lineage_payload(lineage_edges),
-    }
-    write_json(outdir / "data_access.json", payload)
-    write_artifact_guide(outdir / "README.md")
-    write_report(outdir / "data_access_report.md", callable_map, objects, edges)
-
-
-def _edge_summary(edges: Iterable[AccessEdge]) -> Dict[Tuple[str, str], int]:
-    summary: Dict[Tuple[str, str], int] = {}
-    for edge in edges:
-        key = (edge.access, edge.object_id)
-        summary[key] = summary.get(key, 0) + 1
-    return summary
-
-
-def write_artifact_guide(doc_path: Path) -> None:
-    lines = [
-        "# Data Access Artifacts",
-        "",
-        "This folder contains the static data-access view generated by",
-        "`microservice-pipeline data-access`.",
-        "",
-        "The extractor records which callable reads, writes, creates, or mutates",
-        "service-relevant data objects such as parameters, object state, globals,",
-        "DataFrame columns, dictionary keys, unknown-family container fields,",
-        "files, and exposed local containers.",
-        "",
-        "## Files",
-        "",
-        "- `data_objects.csv`: one row per data object discovered by the extractor.",
-        "- `access_edges.csv`: one row per callable-to-object access edge.",
-        "- `callable_data_access.csv`: denormalized join of edge rows with object metadata.",
-        "- `data_access.json`: JSON payload containing callables, objects, access edges, and lineage edges.",
-        "- `data_access_report.md`: human-readable summaries by callable and data object.",
-        "- `README.md`: this schema and interpretation guide.",
-        "",
-        "## Data Object Identity",
-        "",
-        "The extractor exposes one data-object identity:",
-        "",
-        "- `object_id`: the data object touched by source evidence.",
-        "  Example: `df_col:sample.summarize:Results_extended:Compartment`.",
-        "",
-        "Nested non-class object paths are kept precise when a callable touches",
-        "a specific attribute/key chain. For example, a whole `model` parameter",
-        "can coexist with precise paths such as `model.R['mass_g']` and",
-        "`model.system_particle_object_list[].RateConstants['k_fragmentation']`.",
-        "",
-        "There is no separate clustering identity. Downstream graph construction uses",
-        "`object_id` directly. Alias and flow relationships are preserved separately",
-        "in `alias_of` and `lineage_edges` instead of being hidden behind an ID roll-up.",
-        "",
-        "By default, extraction is raw: same-name containers are not globalized across",
-        "callables unless you provide `--shared-containers-config`.",
-        "",
-        "## Access Semantics",
-        "",
-        "- `read`: the callable uses the object in an expression.",
-        "- `write`: the callable assigns into the object or overwrites part of it.",
-        "- `create`: the callable creates the object in the current scope.",
-        "- `read_write`: the callable mutates the object or both reads and writes it.",
-        "",
-        "## Confidence",
-        "",
-        "Confidence describes how directly the object was identified from the AST:",
-        "",
-        "- `high`: direct evidence such as `self.data['key']` or `df['col']`.",
-        "- `medium`: propagated alias or obvious container inference.",
-        "- `low`: dynamic or weakly resolved identity.",
-        "",
-        "`confidence_weight` is the numeric form used by downstream clustering:",
-        "",
-        "- `high = 1.0`",
-        "- `medium = 0.6`",
-        "- `low = 0.25`",
-        "",
-        "## Object Kinds",
-        "",
-        "- `param`: callable parameter.",
-        "- `module_global`: module-level global or constant.",
-        "- `class_state`: object state on `self` / `cls`, rolled up to the class level.",
-        "- `class_attr_state`: top-level class attribute state for coordinator-style classes that are split selectively.",
-        "- `object_state`: non-class object state reached through a parameter/local.",
-        "- `df_col`: DataFrame field or column access.",
-        "- `dict_key`: dictionary key access.",
-        "- `container_field`: keyed or column-like access where the base container family remained unknown.",
-        "- `file`: file path or file handle target.",
-        "- `local_exposed`: local container that escaped by being returned, passed, or assigned into externally reachable state.",
-        "- `unknown`: fallback object created when an edge exists but the object metadata was not materialized earlier.",
-        "",
-        "## Column Guide",
-        "",
-        "### `data_objects.csv`",
-        "",
-        "- `id`: data object ID used by access edges and downstream structural graph nodes.",
-        "- `kind`: object category.",
-        "- `display_name`: human-readable form, usually close to source syntax.",
-        "- `scope`: where the object lives, such as `callable`, `field`, `class`, `module`, `external`, or `object`.",
-        "- `owner`: owning callable/object/container context for the raw object.",
-        "- `container`: parent container ID when this is a field-level object.",
-        "- `field`: field/key/parameter/local name when applicable.",
-        "- `file`: source file where the object was first registered.",
-        "- `lineno`: source line where the object was first registered.",
-        "- `inferred_type`: coarse family from Pyright or syntax-certain inference, such as `dataframe`, `dict`, `list`, `set`, `file`, `path`, `object`, or `unknown`.",
-        "- `confidence`: categorical confidence label.",
-        "- `alias_of`: underlying object ID if this object aliases another object.",
-        "- `access_path`: source-like attribute/key path represented by this object, when available.",
-        "- `structural_role`: `primary`, `precise`, or `coarse`; structural graph generation can exclude `coarse` audit objects when precise descendants exist.",
-        "",
-        "### `access_edges.csv`",
-        "",
-        "- `callable`: callable ID using the object.",
-        "- `object_id`: data object ID used by the callable.",
-        "- `access`: one of `read`, `write`, `create`, or `read_write`.",
-        "- `operation`: AST-level operation label such as `load`, `subscript_load`, `assign`, `open`, or `method:append`.",
-        "- `file`: source file where the access occurs.",
-        "- `lineno`: source line where the access occurs.",
-        "- `confidence`: categorical confidence for this edge.",
-        "- `confidence_weight`: numeric form of the confidence label.",
-        "- `evidence`: short source-like snippet showing why the edge exists.",
-        "",
-        "### `callable_data_access.csv`",
-        "",
-        "This is `access_edges.csv` enriched with object metadata so you can filter or",
-        "group without joining manually.",
-        "",
-        "- `callable`, `access`, `operation`, `object_id`: same meaning as above.",
-        "- `object_kind`: copied from the object.",
-        "- `display_name`: copied from the object.",
-        "- `scope`, `owner`, `field`, `inferred_type`, `access_path`, `structural_role`: copied from the object.",
-        "- `confidence`, `confidence_weight`, `file`, `lineno`, `evidence`: copied from the edge.",
-        "",
-        "### `data_access.json`",
-        "",
-        "Top-level keys:",
-        "",
-        "- `callables`: callable metadata using the same callable IDs as the call graph extractor.",
-        "- `objects`: same information as `data_objects.csv`.",
-        "- `edges`: same information as `access_edges.csv`.",
-        "- `lineage_edges`: object-to-object flow edges used to solve interprocedural aliases and to support shared-container inference.",
-        "",
-        "### `data_access_report.md`",
-        "",
-        "Report sections:",
-        "",
-        "- `By Callable`: what each callable touches.",
-        "- `By Data Object`: object-level view for audit/debugging.",
-        "",
-        "## Reading the Output",
-        "",
-        "A useful workflow is:",
-        "",
-        "1. Start with the raw extractor output with no shared-container config.",
-        "2. Use `lineage_edges` and `callable_data_access.csv` to understand which containers are genuinely connected.",
-        "3. Generate a draft config with `microservice-pipeline infer-shared-containers` and review the report.",
-        "4. Re-run the extractor with `microservice-pipeline data-access --shared-containers-config` once the mappings look safe.",
-        "5. Use `object_id` as the data-node identity for clustering input.",
-        "6. For evaluation sets focused on ownership, filter to objects with at least one `create`, `write`, or `read_write` edge.",
-        "7. Fall back to `evidence` and `display_name` when a row looks surprising.",
-        "",
-    ]
-    write_markdown(doc_path, lines)
-
-
-def write_report(
-    report_path: Path,
-    callable_map: Dict[str, CallableDef],
-    objects: Dict[str, DataObject],
-    edges: List[AccessEdge],
-) -> None:
-    edges_by_callable: Dict[str, List[AccessEdge]] = {}
-    edges_by_object: Dict[str, List[AccessEdge]] = {}
-    for edge in edges:
-        edges_by_callable.setdefault(edge.callable, []).append(edge)
-        edges_by_object.setdefault(edge.object_id, []).append(edge)
-
-    lines = [
-        "# Data Access View",
-        "",
-        f"- Callables with access: `{len(edges_by_callable)}`",
-        f"- Data objects: `{len(objects)}`",
-        f"- Access edges: `{len(edges)}`",
-        "- Confidence weights: `high=1.0`, `medium=0.6`, `low=0.25`",
-        "",
-        "## By Callable",
-        "",
-    ]
-
-    for callable_id in sorted(edges_by_callable):
-        meta = callable_map.get(callable_id)
-        title = meta.qualname if meta else callable_id
-        lines.extend([f"### {callable_id}", ""])
-        if meta:
-            lines.append(f"- Location: `{meta.file}:{meta.lineno}`")
-            lines.append(f"- Qualname: `{title}`")
-        lines.extend(
-            [
-                "",
-                "| Access | Object | Kind | Count | Confidence | Weight |",
-                "| --- | --- | --- | ---: | --- | ---: |",
-            ]
-        )
-        summary = _edge_summary(edges_by_callable[callable_id])
-        for (access, object_id), count in sorted(summary.items(), key=lambda item: (item[0][1], item[0][0])):
-            obj = objects.get(object_id)
-            obj_name = obj.display_name if obj else object_id
-            kind = obj.kind if obj else ""
-            confidence = obj.confidence if obj else ""
-            weight = _confidence_weight(confidence) if confidence else ""
-            lines.append(
-                f"| {access} | `{obj_name}` | {kind} | {count} | {confidence} | {weight} |"
-            )
-        lines.append("")
-
-    lines.extend(["## By Data Object", ""])
-    for object_id in sorted(edges_by_object):
-        obj = objects.get(object_id)
-        if not obj:
-            continue
-        access_counts: Dict[str, int] = {}
-        callable_ids: Set[str] = set()
-        for edge in edges_by_object[object_id]:
-            access_counts[edge.access] = access_counts.get(edge.access, 0) + 1
-            callable_ids.add(edge.callable)
-        count_text = ", ".join(f"{access}={count}" for access, count in sorted(access_counts.items()))
-        callable_preview = "; ".join(sorted(callable_ids)[:8])
-        if len(callable_ids) > 8:
-            callable_preview += f"; ... ({len(callable_ids)} total)"
-        lines.extend(
-            [
-                f"### {object_id}",
-                "",
-                f"- Display: `{obj.display_name}`",
-                f"- Kind: `{obj.kind}`",
-                f"- Access path: `{obj.access_path}`",
-                f"- Structural role: `{obj.structural_role}`",
-                f"- Access counts: {count_text}",
-                f"- Callables: {callable_preview}",
-                "",
-            ]
-        )
-
-    write_markdown(report_path, lines)
 
 
 def _pyright_families_for_config(

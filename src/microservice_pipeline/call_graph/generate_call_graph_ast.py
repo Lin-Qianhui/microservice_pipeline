@@ -39,6 +39,10 @@ try:
         resolve_import_from_module,
         resolve_import_from_target,
     )
+    from microservice_pipeline.subprocess_coupling import (
+        add_subprocess_child_expr,
+        is_add_subprocess_call,
+    )
 except ImportError:  # pragma: no cover - supports direct script execution
     from microservice_pipeline.call_graph.call_graph_outputs import write_outputs  # type: ignore
     from microservice_pipeline.config import (  # type: ignore
@@ -50,6 +54,10 @@ except ImportError:  # pragma: no cover - supports direct script execution
         is_package_file,
         resolve_import_from_module,
         resolve_import_from_target,
+    )
+    from microservice_pipeline.subprocess_coupling import (  # type: ignore
+        add_subprocess_child_expr,
+        is_add_subprocess_call,
     )
 
 MODULE_CALLABLE_QUALNAME = "<module>"
@@ -480,10 +488,10 @@ class DefinitionCollector(ast.NodeVisitor):
                 return imported
             return f"{self.module}.{name}"
 
-        base, _rest = name.split(".", 1)
+        base, rest = name.split(".", 1)
         imported_base = self.module_index.imports.get(base)
         if imported_base:
-            return name.replace(base, imported_base, 1)
+            return f"{imported_base}.{rest}"
         return name
 
     def _add_callable(
@@ -892,10 +900,10 @@ class CallCollector(ast.NodeVisitor):
 
             return sorted(matches)
 
-        base, _rest = name.split(".", 1)
+        base, rest = name.split(".", 1)
         imported_base = self.module_index.imports.get(base)
         if imported_base:
-            candidate = name.replace(base, imported_base, 1)
+            candidate = f"{imported_base}.{rest}"
             if self._is_known_class(candidate):
                 matches.add(self._known_class_id(candidate))
 
@@ -1041,6 +1049,53 @@ class CallCollector(ast.NodeVisitor):
 
         for callee, relation, is_resolved in self._unique_callee_results(targets):
             self._add_edge(callee, relation, is_resolved, lineno)
+
+    def _subprocess_parent_types(self, receiver: ast.AST) -> Set[str]:
+        if (
+            isinstance(receiver, ast.Name)
+            and receiver.id in {"self", "cls"}
+            and self.current_class
+        ):
+            class_id = self.current_class_id()
+            return {class_id} if class_id else set()
+        return self._receiver_types_for_expr(receiver)
+
+    def _subprocess_child_types(self, child_expr: ast.AST) -> Set[str]:
+        if isinstance(child_expr, ast.Call):
+            return self._infer_class_types_from_call(child_expr)
+        if isinstance(child_expr, (ast.Name, ast.Attribute)):
+            return self.get_expr_types(child_expr)
+        return set()
+
+    def _add_subprocess_compute_edge(self, node: ast.Call) -> None:
+        if not is_add_subprocess_call(node):
+            return
+        child_expr = add_subprocess_child_expr(node)
+        if child_expr is None or not isinstance(node.func, ast.Attribute):
+            return
+
+        parent_types = sorted(self._subprocess_parent_types(node.func.value))
+        child_types = sorted(self._subprocess_child_types(child_expr))
+        if len(parent_types) != 1 or len(child_types) != 1:
+            return
+
+        parent_compute = self._resolve_method_targets(parent_types[0], "_compute")
+        child_compute = self._resolve_method_targets(child_types[0], "_compute")
+        if len(parent_compute) != 1 or len(child_compute) != 1:
+            return
+
+        if not self._is_internal_callee(parent_compute[0]) or not self._is_internal_callee(child_compute[0]):
+            return
+        self.edges.append(
+            Edge(
+                caller=parent_compute[0],
+                callee=child_compute[0],
+                file=str(self.file),
+                lineno=node.lineno,
+                resolved=True,
+                relation="subprocess_compute",
+            )
+        )
 
     def _visit_call_children(self, node: ast.Call) -> None:
         if isinstance(node.func, ast.Attribute):
@@ -1387,6 +1442,7 @@ class CallCollector(ast.NodeVisitor):
         resolved_callees = dynamic_resolved or self._resolve_callees(node.func)
         for callee, relation, is_resolved in resolved_callees:
             self._add_edge(callee, relation, is_resolved, node.lineno)
+        self._add_subprocess_compute_edge(node)
 
         self.generic_visit(node)
 
@@ -1682,10 +1738,10 @@ class CallCollector(ast.NodeVisitor):
 
             # nested imported alias: alias.sub.fn()
             if "." in full:
-                base, _attr = full.split(".", 1)
+                base, attr = full.split(".", 1)
                 imported_base = self.module_index.imports.get(base)
                 if imported_base:
-                    target = full.replace(base, imported_base, 1)
+                    target = f"{imported_base}.{attr}"
                     if self._is_known_class(target):
                         class_id = self._known_class_id(target)
                         init_targets = self._resolve_constructor_targets(class_id)
