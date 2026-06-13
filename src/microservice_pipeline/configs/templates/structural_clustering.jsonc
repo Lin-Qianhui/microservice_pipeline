@@ -16,11 +16,12 @@
     "callable_hub_nodes": "artifacts/structural_dependency_graph/callable_hub_nodes.csv",
     "data_hub_nodes": "artifacts/structural_dependency_graph/data_hub_nodes.csv",
 
-    // Base clustering output. This is written even when a sweep is enabled.
-    "outdir": "artifacts/structural_microservice_candidates",
+    // Base clustering output. {algorithm} expands to the selected algorithm
+    // after CLI overrides are applied.
+    "outdir": "artifacts/structural_microservice_candidates_{algorithm}",
 
     // Optional parameter-sweep output.
-    "sweep_outdir": "artifacts/structural_microservice_candidates_sweep",
+    "sweep_outdir": "artifacts/structural_microservice_candidates_{algorithm}_sweep",
 
     // Optional manually adjudicated mapping CSV used only for sweep
     // evaluation metrics. Leave null until the generated manual_mapping.csv
@@ -97,7 +98,7 @@
   "sweep_best": {
     // Materialize one selected sweep row as complete clustering artifacts.
     "enabled": false,
-    "outdir": "artifacts/structural_microservice_candidates_sweep/best",
+    "outdir": "artifacts/structural_microservice_candidates_{algorithm}_sweep/best",
 
     // Automatic ranking metric and direction. Evaluation metric names accept
     // the optional evaluation_ prefix.

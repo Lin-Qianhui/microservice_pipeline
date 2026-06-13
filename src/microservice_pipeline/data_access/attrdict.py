@@ -11,6 +11,7 @@ from microservice_pipeline.import_resolution import (
     resolve_import_from_module,
     resolve_import_from_target,
 )
+from microservice_pipeline.call_graph.generate_call_graph_ast import parse_python_file
 from microservice_pipeline.data_access.rules import _attribute_path, _slice_value
 
 
@@ -116,6 +117,6 @@ def collect_attrdict_classes_from_analysis_files(analysis_files: Sequence[object
     attrdict_classes: Set[str] = set()
     for analysis_file in analysis_files:
         path = analysis_file.path
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        tree = parse_python_file(path)
         attrdict_classes.update(collect_attrdict_classes(tree, analysis_file.module, path))
     return attrdict_classes

@@ -330,6 +330,10 @@ def test_parse_args_uses_structural_config_and_cli_overrides(monkeypatch, tmp_pa
             str(config_path),
             "--resolution",
             "0.8",
+            "--evaluation-node-mode",
+            "callable",
+            "--evaluation-na-label",
+            "unknown",
             "--no-select-sweep-best",
         ],
     )
@@ -345,6 +349,46 @@ def test_parse_args_uses_structural_config_and_cli_overrides(monkeypatch, tmp_pa
     assert args.callable_hub_decisions is None
     assert args.resolution == 0.8
     assert args.select_sweep_best is False
+
+
+def test_parse_args_expands_algorithm_placeholder_in_output_paths(monkeypatch, tmp_path):
+    config_path = tmp_path / "structural.jsonc"
+    config_path.write_text(
+        """
+        {
+          "paths": {
+            "outdir": "clusters_{algorithm}",
+            "sweep_outdir": "sweep_${algorithm}",
+          },
+          "algorithm": {
+            "algorithm": "leiden",
+          },
+          "sweep_best": {
+            "outdir": "best_{algorithm}",
+          },
+        }
+        """,
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "cluster_structural_graph.py",
+            "--project-root",
+            str(tmp_path),
+            "--config",
+            str(config_path),
+            "--algorithm",
+            "infomap",
+        ],
+    )
+
+    args = parse_args()
+
+    assert args.outdir == str((tmp_path / "clusters_infomap").resolve())
+    assert args.sweep_outdir == str((tmp_path / "sweep_infomap").resolve())
+    assert args.sweep_best_outdir == str((tmp_path / "best_infomap").resolve())
+
 
 
 def test_structural_algorithm_registry_exposes_cli_choices_and_errors(monkeypatch):

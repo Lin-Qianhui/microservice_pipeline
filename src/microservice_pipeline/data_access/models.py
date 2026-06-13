@@ -74,7 +74,10 @@ class Scope:
     attr_bindings: Dict[str, LocalBinding] = field(default_factory=dict)
     local_class_types: Dict[str, Set[str]] = field(default_factory=dict)
     local_element_class_types: Dict[str, Set[str]] = field(default_factory=dict)
+    local_shared_state_owner_types: Dict[str, Set[str]] = field(default_factory=dict)
+    local_element_shared_state_owner_types: Dict[str, Set[str]] = field(default_factory=dict)
     attr_class_types: Dict[str, Set[str]] = field(default_factory=dict)
+    attr_shared_state_owner_types: Dict[str, Set[str]] = field(default_factory=dict)
     shadowed: Set[str] = field(default_factory=set)
 
 

@@ -188,6 +188,11 @@ def test_packaged_templates_are_generic():
     assert structural_graph["paths"]["data_access"] == "artifacts/data_access_inferred/data_access.json"
     assert structural_graph["weighting"]["weight_config"] == "builtin:default"
     assert structural_clustering["weighting"]["weight_config"] == "builtin:default"
+    assert structural_clustering["paths"]["outdir"] == "artifacts/structural_microservice_candidates_{algorithm}"
+    assert structural_clustering["paths"]["sweep_outdir"] == "artifacts/structural_microservice_candidates_{algorithm}_sweep"
+    assert structural_clustering["sweep_best"]["outdir"] == (
+        "artifacts/structural_microservice_candidates_{algorithm}_sweep/best"
+    )
     assert evaluation["paths"]["manual"] == "configs/microservice_pipeline/manual_mapping.csv"
     assert set(structural_clustering["hub_policy"]) >= {
         "hub_callable_degree_percentile",

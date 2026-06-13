@@ -1,13 +1,19 @@
 import ast
+import warnings
 from pathlib import Path
 
 from microservice_pipeline.data_access.generate_data_access_ast import (
     collect_module_imports,
     collect_data_access,
+    collect_data_access_from_analysis_files,
     collect_data_access_from_source,
     collect_data_access_from_tree,
 )
-from microservice_pipeline.call_graph.generate_call_graph_ast import build_indices
+from microservice_pipeline.call_graph.generate_call_graph_ast import (
+    AnalysisFile,
+    build_indices,
+    build_indices_from_analysis_files,
+)
 
 
 def _collect(source, shared_config=None, pyright_families=None):
@@ -38,6 +44,28 @@ def _matching_edges(edges, object_id, access=None):
         for edge in edges
         if edge.object_id == object_id and (access is None or edge.access == access)
     ]
+
+
+def test_file_based_data_access_suppresses_target_syntax_warnings(tmp_path: Path):
+    source_file = tmp_path / "sample.py"
+    source_file.write_text(
+        "def load_pattern():\n"
+        "    sep = '\\s+'\n"
+        "    return sep\n",
+        encoding="utf-8",
+    )
+    analysis_files = [AnalysisFile(path=source_file, module="sample")]
+    callable_map, _module_map, _known_classes = build_indices_from_analysis_files(analysis_files)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", SyntaxWarning)
+        collect_data_access_from_analysis_files(
+            analysis_files,
+            callable_map,
+            pyright_families={},
+        )
+
+    assert not [warning for warning in caught if issubclass(warning.category, SyntaxWarning)]
 
 
 def test_data_access_import_collection_resolves_relative_imports():
@@ -1122,7 +1150,7 @@ def load(path):
     assert any(obj.kind == "dict_key" and obj.field == "lev" for obj in objects.values())
 
 
-def test_add_subprocess_records_state_assign_lineage(tmp_path):
+def test_add_subprocess_without_shared_state_does_not_record_state_assign_lineage(tmp_path):
     (tmp_path / "sample.py").write_text(
         """
 class Child:
@@ -1133,6 +1161,42 @@ class Child:
 class Parent:
     def __init__(self):
         child = Child()
+        self.add_subprocess("child", child)
+
+    def _compute(self):
+        pass
+
+    def add_subprocess(self, name, proc):
+        pass
+""",
+        encoding="utf-8",
+    )
+
+    callable_map, _module_map, _known_classes = build_indices(tmp_path)
+    _objects, _edges, lineage = collect_data_access(
+        tmp_path,
+        callable_map=callable_map,
+        pyright_families={},
+    )
+
+    assert not any(edge.relation == "state_assign" for edge in lineage)
+
+
+def test_add_subprocess_with_shared_state_constructor_records_state_assign_lineage(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        """
+class Child:
+    def __init__(self, state):
+        self.state = state
+
+    def _compute(self):
+        pass
+
+
+class Parent:
+    def __init__(self):
+        self.state = {}
+        child = Child(state=self.state)
         self.add_subprocess("child", child)
 
     def _compute(self):
@@ -1166,6 +1230,9 @@ def test_add_subprocess_resolves_loop_and_with_bound_child_types(tmp_path):
     (tmp_path / "sample.py").write_text(
         """
 class Child:
+    def __init__(self, state):
+        self.state = state
+
     def __enter__(self):
         return self
 
@@ -1178,7 +1245,8 @@ class Child:
 
 class LoopParent:
     def __init__(self):
-        children = [Child()]
+        self.state = {}
+        children = [Child(state=self.state)]
         for child in children:
             self.add_subprocess("loop_child", child)
 
@@ -1191,7 +1259,8 @@ class LoopParent:
 
 class WithParent:
     def __init__(self):
-        with Child() as child:
+        self.state = {}
+        with Child(state=self.state) as child:
             self.add_subprocess("with_child", child)
 
     def _compute(self):
@@ -1232,6 +1301,9 @@ def test_add_subprocess_state_lineage_uses_split_class_state_namespace(tmp_path)
     (tmp_path / "sample.py").write_text(
         """
 class Child:
+    def __init__(self, state):
+        self.state = state
+
     def _compute(self):
         pass
 
@@ -1242,7 +1314,7 @@ class Parent:
         self.config = {}
         self.results = {}
         self.lookup = {}
-        child = Child()
+        child = Child(state=self.state)
         self.add_subprocess("child", child)
 
     def load(self):

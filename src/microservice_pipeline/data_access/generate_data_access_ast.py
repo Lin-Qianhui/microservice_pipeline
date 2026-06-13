@@ -84,11 +84,7 @@ try:
         _xarray_call_fields,
         _xarray_indexer_fields,
     )
-    from microservice_pipeline.subprocess_coupling import (
-        add_subprocess_child_expr,
-        add_subprocess_name,
-        is_add_subprocess_call,
-    )
+    from microservice_pipeline.data_access.subprocess_lineage import SubprocessStateLineageMixin
 except ImportError:  # pragma: no cover - supports direct script execution
     from microservice_pipeline.data_access.attrdict import (  # type: ignore
         collect_attrdict_classes,
@@ -150,11 +146,7 @@ except ImportError:  # pragma: no cover - supports direct script execution
         _xarray_call_fields,
         _xarray_indexer_fields,
     )
-    from microservice_pipeline.subprocess_coupling import (  # type: ignore
-        add_subprocess_child_expr,
-        add_subprocess_name,
-        is_add_subprocess_call,
-    )
+    from microservice_pipeline.data_access.subprocess_lineage import SubprocessStateLineageMixin  # type: ignore
 
 try:
     from microservice_pipeline.call_graph.generate_call_graph_ast import (
@@ -167,6 +159,8 @@ try:
         iter_analysis_files,
         iter_python_files,
         module_callable_id,
+        parse_python_file,
+        parse_python_source,
         path_to_module,
     )
     from microservice_pipeline.data_access.pyright_type_probe import (
@@ -195,6 +189,8 @@ except ImportError:  # pragma: no cover - supports direct script execution
         iter_analysis_files,
         iter_python_files,
         module_callable_id,
+        parse_python_file,
+        parse_python_source,
         path_to_module,
     )
     from microservice_pipeline.data_access.pyright_type_probe import (  # type: ignore
@@ -785,7 +781,7 @@ def collect_pyright_families_from_analysis_files(
     for analysis_file in analysis_files:
         py_file = analysis_file.path
         module = analysis_file.module
-        tree = ast.parse(py_file.read_text(encoding="utf-8"), filename=str(py_file))
+        tree = parse_python_file(py_file)
         targets.extend(collect_pyright_probe_targets(tree, module, py_file))
     return probe_pyright_targets(project_root, targets, pyright_bin)
 
@@ -855,7 +851,7 @@ def collect_module_imports(
     return imports, star_imports
 
 
-class DataAccessCollector(ast.NodeVisitor):
+class DataAccessCollector(SubprocessStateLineageMixin, ast.NodeVisitor):
     def __init__(
         self,
         module: str,
@@ -1890,6 +1886,7 @@ class DataAccessCollector(ast.NodeVisitor):
     def visit_For(self, node: ast.For | ast.AsyncFor) -> None:
         iter_ref = self._resolve_expr(node.iter)
         element_class_types = self._element_class_types_from_value(node.iter)
+        element_state_owners = self._element_shared_state_owner_types_from_value(node.iter)
         self.visit(node.iter)
         if iter_ref:
             iter_binding: Optional[LocalBinding] = None
@@ -1925,9 +1922,15 @@ class DataAccessCollector(ast.NodeVisitor):
                         self.scope.local_class_types[name] = set(element_class_types)
                     else:
                         self.scope.local_class_types.pop(name, None)
+                    if element_state_owners:
+                        self.scope.local_shared_state_owner_types[name] = set(element_state_owners)
+                    else:
+                        self.scope.local_shared_state_owner_types.pop(name, None)
         elif element_class_types and self.scope is not None:
             for name in self._target_names(node.target):
                 self.scope.local_class_types[name] = set(element_class_types)
+                if element_state_owners:
+                    self.scope.local_shared_state_owner_types[name] = set(element_state_owners)
         for stmt in node.body:
             self.visit(stmt)
         for stmt in node.orelse:
@@ -1963,10 +1966,15 @@ class DataAccessCollector(ast.NodeVisitor):
                 self.visit(context)
                 if isinstance(item.optional_vars, ast.Name) and self.scope:
                     class_types = self._class_types_from_value(context)
+                    state_owners = self._shared_state_owner_types_from_value(context)
                     if class_types:
                         self.scope.local_class_types[item.optional_vars.id] = set(class_types)
                     else:
                         self.scope.local_class_types.pop(item.optional_vars.id, None)
+                    if state_owners:
+                        self.scope.local_shared_state_owner_types[item.optional_vars.id] = set(state_owners)
+                    else:
+                        self.scope.local_shared_state_owner_types.pop(item.optional_vars.id, None)
             if item.optional_vars is not None and not isinstance(item.optional_vars, ast.Name):
                 self._handle_store_target(item.optional_vars, item.context_expr, "create")
         for stmt in node.body:
@@ -2134,43 +2142,6 @@ class DataAccessCollector(ast.NodeVisitor):
             recorded = True
         return recorded
 
-    def _class_state_object_id_for_owner(self, owner: str, node: ast.AST) -> str:
-        split_class_state = owner in self.split_class_owners
-        object_id = f"class_attr_state:{owner}:state" if split_class_state else f"class_state:{owner}"
-        self._register_object(
-            object_id=object_id,
-            kind="class_attr_state" if split_class_state else "class_state",
-            display_name=_class_attr_state_display(owner, "state") if split_class_state else _class_state_display(owner),
-            scope="class",
-            owner=owner,
-            field="state" if split_class_state else "",
-            node=node,
-            inferred_type=FAMILY_OBJECT,
-            confidence="medium",
-            access_path="self.state" if split_class_state else f"{owner.rsplit('.', 1)[-1]} state",
-        )
-        return object_id
-
-    def _record_subprocess_state_lineage(self, node: ast.Call) -> None:
-        if not is_add_subprocess_call(node) or not isinstance(node.func, ast.Attribute):
-            return
-        child_expr = add_subprocess_child_expr(node)
-        if child_expr is None:
-            return
-        parent_types = sorted(self._class_types_from_expr(node.func.value))
-        child_types = sorted(self._class_types_from_expr(child_expr))
-        if len(parent_types) != 1 or len(child_types) != 1:
-            return
-        parent_state = self._class_state_object_id_for_owner(parent_types[0], node)
-        child_state = self._class_state_object_id_for_owner(child_types[0], node)
-        self._record_lineage(
-            child_state,
-            parent_state,
-            "state_assign",
-            node,
-            slot=add_subprocess_name(node),
-        )
-
     def _resolve_expr(self, node: ast.AST) -> Optional[ExprRef]:
         if isinstance(node, ast.Name):
             return self._resolve_name(node.id, node)
@@ -2324,6 +2295,8 @@ class DataAccessCollector(ast.NodeVisitor):
     ) -> None:
         class_types = self._class_types_from_value(value)
         element_class_types = self._element_class_types_from_value(value)
+        state_owners = self._shared_state_owner_types_from_value(value)
+        element_state_owners = self._element_shared_state_owner_types_from_value(value)
         if isinstance(target, ast.Name):
             if self.scope is not None:
                 if class_types:
@@ -2334,6 +2307,14 @@ class DataAccessCollector(ast.NodeVisitor):
                     self.scope.local_element_class_types[target.id] = set(element_class_types)
                 else:
                     self.scope.local_element_class_types.pop(target.id, None)
+                if state_owners:
+                    self.scope.local_shared_state_owner_types[target.id] = set(state_owners)
+                else:
+                    self.scope.local_shared_state_owner_types.pop(target.id, None)
+                if element_state_owners:
+                    self.scope.local_element_shared_state_owner_types[target.id] = set(element_state_owners)
+                else:
+                    self.scope.local_element_shared_state_owner_types.pop(target.id, None)
             inferred_type, alias_of, confidence = self._infer_type_from_value(value)
             if inferred_type in CONTAINER_TYPES or alias_of:
                 expose = bool(alias_of)
@@ -2373,6 +2354,10 @@ class DataAccessCollector(ast.NodeVisitor):
                     self.scope.attr_class_types[attr_path] = set(class_types)
                 else:
                     self.scope.attr_class_types.pop(attr_path, None)
+                if state_owners:
+                    self.scope.attr_shared_state_owner_types[attr_path] = set(state_owners)
+                else:
+                    self.scope.attr_shared_state_owner_types.pop(attr_path, None)
             if self._target_causes_escape(target):
                 self._expose_escaping_locals_in_value(value, target, operation="escape_assign")
             ref = self._resolve_attribute(target)
@@ -2654,13 +2639,13 @@ def collect_data_access_from_source(
     return_tuple_summaries: Dict[str, Tuple[Optional[ExprRef], ...]] = {}
     callable_params: Dict[str, Tuple[str, ...]] = {}
     file = Path(filename)
-    attrdict_classes = collect_attrdict_classes(ast.parse(source, filename=filename), module, file)
+    attrdict_classes = collect_attrdict_classes(parse_python_source(source, filename=filename), module, file)
     # Iterate to a small fixpoint so transitive return aliases like A -> B -> C
     # can stabilize without relying on source-order.
     for _ in range(MAX_RETURN_SUMMARY_PASSES):
         before = _return_summary_snapshot(return_summaries)
         before_tuple = _return_tuple_summary_snapshot(return_tuple_summaries)
-        tree = ast.parse(source, filename=filename)
+        tree = parse_python_source(source, filename=filename)
         collect_data_access_from_tree(
             tree,
             module=module,
@@ -2677,7 +2662,7 @@ def collect_data_access_from_source(
         ):
             break
 
-    tree = ast.parse(source, filename=filename)
+    tree = parse_python_source(source, filename=filename)
     param_bindings: Dict[str, Set[str]] = {}
     param_access_paths: Dict[str, Set[str]] = {}
     lineage_edges: List[LineageEdge] = []
@@ -2738,7 +2723,7 @@ def collect_data_access_from_analysis_files(
         for analysis_file in analysis_files:
             py_file = analysis_file.path
             module = analysis_file.module
-            tree = ast.parse(py_file.read_text(encoding="utf-8"), filename=str(py_file))
+            tree = parse_python_file(py_file)
             collect_data_access_from_tree(
                 tree=tree,
                 module=module,
@@ -2761,7 +2746,7 @@ def collect_data_access_from_analysis_files(
     for analysis_file in analysis_files:
         py_file = analysis_file.path
         module = analysis_file.module
-        tree = ast.parse(py_file.read_text(encoding="utf-8"), filename=str(py_file))
+        tree = parse_python_file(py_file)
         module_lineage_edges: List[LineageEdge] = []
         module_objects, module_edges, module_lineage_edges = collect_data_access_from_tree(
             tree=tree,

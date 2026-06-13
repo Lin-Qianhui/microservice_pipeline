@@ -99,6 +99,43 @@ def test_probe_pyright_targets_parses_fake_pyright_output(tmp_path: Path):
     assert families == {"param:sample.fn:data": "dict"}
 
 
+def test_probe_pyright_targets_writes_limited_config_for_top_level_package(tmp_path: Path):
+    package_dir = tmp_path / "climlab"
+    package_dir.mkdir()
+    source_file = package_dir / "sample.py"
+    source_file.write_text("def fn(data):\n    return data\n", encoding="utf-8")
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir()
+    (docs_dir / "conf.py").write_text("import missing_docs_dependency\n", encoding="utf-8")
+
+    fake_pyright = tmp_path / "fake_pyright"
+    fake_pyright.write_text(
+        "#!/bin/sh\n"
+        "config=\"$2\"\n"
+        "if [ ! -f \"$config\" ]; then echo missing config; exit 5; fi\n"
+        "if grep -q 'docs' \"$config\"; then echo docs included; exit 6; fi\n"
+        "if ! grep -q 'climlab/sample.py' \"$config\"; then echo sample missing; exit 7; fi\n"
+        "printf '%s\n' 'climlab/sample.py:2:1 - information: Type of \"__msp_probe_1\" is \"dict[str, float]\"'\n"
+        "exit 1\n",
+        encoding="utf-8",
+    )
+    fake_pyright.chmod(0o755)
+
+    target = PyrightProbeTarget(
+        target_id="param:climlab.sample.fn:data",
+        expression="data",
+        file=source_file,
+        module="climlab.sample",
+        mode="callable_entry",
+        callable_id="climlab.sample.fn",
+        lineno=1,
+    )
+
+    families = probe_pyright_targets(tmp_path, [target], str(fake_pyright))
+
+    assert families == {"param:climlab.sample.fn:data": "dict"}
+
+
 def test_attribute_probe_uses_statement_end_for_multiline_assignment(tmp_path: Path):
     source = """\
 class Compartment:

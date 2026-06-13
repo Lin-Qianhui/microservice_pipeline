@@ -133,6 +133,8 @@ try:
         DEFAULT_EVALUATION_NODE_TYPES,
         DEFAULT_MANUAL,
         NA_DEFAULTS,
+        build_evaluation_input_from_rows,
+        build_evaluation_payload,
         evaluate_assignment_rows,
         evaluation_summary_row,
         parse_evaluation_tokens,
@@ -143,6 +145,8 @@ except ImportError:  # pragma: no cover - supports direct script execution
         DEFAULT_EVALUATION_NODE_TYPES,
         DEFAULT_MANUAL,
         NA_DEFAULTS,
+        build_evaluation_input_from_rows,
+        build_evaluation_payload,
         evaluate_assignment_rows,
         evaluation_summary_row,
         parse_evaluation_tokens,
@@ -2793,6 +2797,20 @@ def _resolve_optional_project_path(project_root: Path, value: Any) -> Optional[P
     return _resolve_project_path(project_root, value)
 
 
+def _expand_algorithm_path_template(value: Any, algorithm: str) -> Any:
+    if value in (None, ""):
+        return value
+    text = str(value)
+    return text.replace("${algorithm}", algorithm).replace("{algorithm}", algorithm)
+
+
+def _expand_algorithm_output_path_templates(args: argparse.Namespace) -> argparse.Namespace:
+    for name in ("outdir", "sweep_outdir", "sweep_best_outdir"):
+        if hasattr(args, name):
+            setattr(args, name, _expand_algorithm_path_template(getattr(args, name), args.algorithm))
+    return args
+
+
 def _config_section(config: Mapping[str, Any], name: str) -> Mapping[str, Any]:
     value = config.get(name, {})
     if not isinstance(value, Mapping):
@@ -2856,6 +2874,7 @@ def structural_config_defaults(
     defaults: Dict[str, Any] = {}
     paths = _config_section(config, "paths")
     algorithm = _config_section(config, "algorithm")
+    evaluation = _config_section(config, "evaluation")
     sweep = _config_section(config, "sweep")
     sweep_best = _config_section(config, "sweep_best")
     hub_policy = _config_section(config, "hub_policy")
@@ -3454,8 +3473,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Data hub access_count threshold",
     )
     parser.set_defaults(**config_defaults)
-    return parser.parse_args(argv)
-
+    return _expand_algorithm_output_path_templates(parser.parse_args(argv))
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
     args = parse_args(argv)

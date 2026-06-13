@@ -520,6 +520,9 @@ To use the generated worksheet during parameter sweeps, fill it and update
   "paths": {
     "manual_mapping": "configs/microservice_pipeline/manual_mapping.csv"
   },
+  "evaluation": {
+    "enabled": false
+  },
   "sweep": {
     "evaluation_enabled": true
   }
@@ -629,3 +632,6 @@ microservice-pipeline call-cluster \
   --edges artifacts/call_graph/edges.csv \
   --outdir artifacts/call_graph_clusters
 ```
+
+cd /Users/qianhuilin/Desktop/Envision
+source .venvs/msa-analysis-climlab/bin/activate

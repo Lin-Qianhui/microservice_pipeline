@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import ast
+import json
 import re
 import shutil
 import subprocess
@@ -18,9 +19,9 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 try:
-    from microservice_pipeline.call_graph.generate_call_graph_ast import attach_parents
+    from microservice_pipeline.call_graph.generate_call_graph_ast import attach_parents, parse_python_source
 except ImportError:  # pragma: no cover - supports direct script execution
-    from microservice_pipeline.call_graph.generate_call_graph_ast import attach_parents  # type: ignore
+    from microservice_pipeline.call_graph.generate_call_graph_ast import attach_parents, parse_python_source  # type: ignore
 
 
 PROBE_NAME_PREFIX = "__msp_probe_"
@@ -290,6 +291,20 @@ def _apply_probes_to_source(
     return "\n".join(output) + ("\n" if source_text.endswith("\n") else "")
 
 
+def _write_probe_config(temp_root: Path, include_paths: Sequence[Path]) -> Path:
+    config_path = temp_root / "pyrightconfig.json"
+    include = sorted({path.as_posix() for path in include_paths})
+    config = {
+        "include": include,
+        "pythonVersion": f"{sys.version_info.major}.{sys.version_info.minor}",
+        "typeCheckingMode": "basic",
+        "reportMissingImports": "none",
+        "reportMissingModuleSource": "none",
+    }
+    config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+    return config_path
+
+
 def probe_pyright_targets(
     project_root: Path,
     targets: Iterable[PyrightProbeTarget],
@@ -314,15 +329,14 @@ def probe_pyright_targets(
             src_dir = project_root / folder_name
             if src_dir.exists():
                 shutil.copytree(src_dir, temp_root / folder_name)
-        config_path = project_root / "pyrightconfig.json"
-        if config_path.exists():
-            shutil.copy2(config_path, temp_root / "pyrightconfig.json")
 
+        include_paths: List[Path] = []
         for file_path, file_targets in targets_by_file.items():
             rel_path = file_path.relative_to(project_root)
+            include_paths.append(rel_path)
             temp_file = temp_root / rel_path
             source_text = file_path.read_text(encoding="utf-8")
-            tree = ast.parse(source_text, filename=str(file_path))
+            tree = parse_python_source(source_text, filename=str(file_path))
             attach_parents(tree)
             module = file_targets[0][1].module
             callable_nodes = _callable_node_map(tree, module)
@@ -332,8 +346,9 @@ def probe_pyright_targets(
                 encoding="utf-8",
             )
 
+        config_path = _write_probe_config(temp_root, include_paths)
         result = subprocess.run(
-            [pyright_path, "--project", str(temp_root / "pyrightconfig.json")],
+            [pyright_path, "--project", str(config_path)],
             capture_output=True,
             text=True,
             check=False,
