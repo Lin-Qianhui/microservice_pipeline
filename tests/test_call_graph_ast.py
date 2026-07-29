@@ -1,3 +1,5 @@
+import warnings
+
 from microservice_pipeline.call_graph.generate_call_graph_ast import (
     build_indices,
     build_return_summaries,
@@ -618,3 +620,758 @@ build()
     assert _edge_exists(edges, "main.<module>", "main.Registrar.__init__", "constructor")
     assert _edge_exists(edges, "main.<module>", "main.Registrar.register", "inferred_type")
     assert _edge_exists(edges, "main.<module>", "main.build", "direct")
+
+
+def test_deep_return_chain_resolves_beyond_the_pass_limit(tmp_path):
+    """A return chain longer than max_iterations still resolves.
+
+    Each summary pass advances a chain by one hop, so before the return-link
+    back-fill this five-deep chain outran the default max_iterations=3 and the
+    ``order.submit()`` edge was silently lost.
+    """
+    (tmp_path / "shop.py").write_text(
+        """
+class Order:
+    def submit(self):
+        return None
+
+
+def level5():
+    return Order()
+
+
+def level4():
+    return level5()
+
+
+def level3():
+    return level4()
+
+
+def level2():
+    return level3()
+
+
+def level1():
+    return level2()
+
+
+def checkout():
+    order = level1()
+    order.submit()
+""",
+        encoding="utf-8",
+    )
+
+    _nodes, edges = _build_call_graph(tmp_path)
+
+    assert _edge_exists(edges, "shop.checkout", "shop.Order.submit", "inferred_type")
+
+
+def test_deep_container_return_chain_carries_element_types(tmp_path):
+    """Element types survive a chain too, not just directly returned objects."""
+    (tmp_path / "shop.py").write_text(
+        """
+class Item:
+    def price(self):
+        return 0
+
+
+def level4():
+    return [Item()]
+
+
+def level3():
+    return level4()
+
+
+def level2():
+    return level3()
+
+
+def level1():
+    return level2()
+
+
+def total():
+    for item in level1():
+        item.price()
+""",
+        encoding="utf-8",
+    )
+
+    _nodes, edges = _build_call_graph(tmp_path)
+
+    assert _edge_exists(edges, "shop.total", "shop.Item.price", "inferred_type")
+
+
+def test_returned_call_carries_tuple_slot_types(tmp_path):
+    """``return make_pair()`` forwards the callee's per-slot types.
+
+    Only a literal tuple used to produce slot facts, so a function that returned
+    another function's tuple lost the shape and destructuring it inferred nothing.
+    """
+    (tmp_path / "shop.py").write_text(
+        """
+class Order:
+    def submit(self):
+        return None
+
+
+class Cart:
+    def clear(self):
+        return None
+
+
+def make_pair():
+    return Order(), Cart()
+
+
+def forward():
+    return make_pair()
+
+
+def use():
+    order, cart = forward()
+    order.submit()
+    cart.clear()
+""",
+        encoding="utf-8",
+    )
+
+    _nodes, edges = _build_call_graph(tmp_path)
+
+    assert _edge_exists(edges, "shop.use", "shop.Order.submit", "inferred_type")
+    assert _edge_exists(edges, "shop.use", "shop.Cart.clear", "inferred_type")
+
+
+def test_mutually_recursive_returns_terminate_without_warning(tmp_path):
+    """Cyclic return dependencies must settle instead of looping forever."""
+    (tmp_path / "shop.py").write_text(
+        """
+class Order:
+    def submit(self):
+        return None
+
+
+def ping(flag):
+    if flag:
+        return Order()
+    return pong(flag)
+
+
+def pong(flag):
+    return ping(flag)
+
+
+def run():
+    order = pong(True)
+    order.submit()
+""",
+        encoding="utf-8",
+    )
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        _nodes, edges = _build_call_graph(tmp_path)
+
+    assert _edge_exists(edges, "shop.run", "shop.Order.submit", "inferred_type")
+
+
+def test_awaited_call_return_types_are_inferred(tmp_path):
+    """``return await build()`` carries the callee's return types.
+
+    ``ast.Await`` used to fall through every shape test, so an async codebase
+    lost the return type of any function that awaited another -- and lost the
+    deferred return link with it, since inference never reached the call.
+    """
+    (tmp_path / "shop.py").write_text(
+        """
+class Order:
+    def submit(self):
+        return None
+
+
+async def make_order():
+    return Order()
+
+
+async def get_order():
+    return await make_order()
+
+
+async def run():
+    order = await get_order()
+    order.submit()
+""",
+        encoding="utf-8",
+    )
+
+    _nodes, edges = _build_call_graph(tmp_path)
+
+    assert _edge_exists(edges, "shop.run", "shop.Order.submit", "inferred_type")
+
+
+def test_awaited_call_carries_tuple_slot_types(tmp_path):
+    """Awaiting must not lose the per-slot shape either."""
+    (tmp_path / "shop.py").write_text(
+        """
+class Order:
+    def submit(self):
+        return None
+
+
+class Cart:
+    def clear(self):
+        return None
+
+
+async def make_pair():
+    return Order(), Cart()
+
+
+async def forward():
+    return await make_pair()
+
+
+async def use():
+    order, cart = await forward()
+    order.submit()
+    cart.clear()
+""",
+        encoding="utf-8",
+    )
+
+    _nodes, edges = _build_call_graph(tmp_path)
+
+    assert _edge_exists(edges, "shop.use", "shop.Order.submit", "inferred_type")
+    assert _edge_exists(edges, "shop.use", "shop.Cart.clear", "inferred_type")
+
+
+def test_conditional_return_infers_both_branches(tmp_path):
+    """A ternary return is knowable on both arms, so both must be recorded."""
+    (tmp_path / "shop.py").write_text(
+        """
+class Order:
+    def submit(self):
+        return None
+
+
+class Cart:
+    def clear(self):
+        return None
+
+
+def make_cart():
+    return Cart()
+
+
+def pick(flag):
+    return Order() if flag else make_cart()
+
+
+def run(flag):
+    value = pick(flag)
+    value.submit()
+    value.clear()
+""",
+        encoding="utf-8",
+    )
+
+    _nodes, edges = _build_call_graph(tmp_path)
+
+    assert _edge_exists(edges, "shop.run", "shop.Order.submit", "inferred_type")
+    assert _edge_exists(edges, "shop.run", "shop.Cart.clear", "inferred_type")
+
+
+def test_boolop_return_infers_every_operand(tmp_path):
+    """``return cached or build()`` can evaluate to either operand."""
+    (tmp_path / "shop.py").write_text(
+        """
+class Order:
+    def submit(self):
+        return None
+
+
+def build():
+    return Order()
+
+
+def get(cached):
+    return cached or build()
+
+
+def run(cached):
+    order = get(cached)
+    order.submit()
+""",
+        encoding="utf-8",
+    )
+
+    _nodes, edges = _build_call_graph(tmp_path)
+
+    assert _edge_exists(edges, "shop.run", "shop.Order.submit", "inferred_type")
+
+
+def test_indexing_a_collection_yields_its_element_type(tmp_path):
+    """``orders[0]`` is one element; ``orders[1:]`` is still the collection."""
+    (tmp_path / "shop.py").write_text(
+        """
+class Order:
+    def submit(self):
+        return None
+
+
+def list_orders():
+    return [Order()]
+
+
+def first():
+    orders = list_orders()
+    return orders[0]
+
+
+def rest():
+    orders = list_orders()
+    return orders[1:]
+
+
+def use_first():
+    order = first()
+    order.submit()
+
+
+def use_rest():
+    for order in rest():
+        order.submit()
+""",
+        encoding="utf-8",
+    )
+
+    _nodes, edges = _build_call_graph(tmp_path)
+
+    assert _edge_exists(edges, "shop.use_first", "shop.Order.submit", "inferred_type")
+    assert _edge_exists(edges, "shop.use_rest", "shop.Order.submit", "inferred_type")
+
+
+def test_walrus_return_is_transparent(tmp_path):
+    """``return (order := build())`` returns what ``build()`` returned."""
+    (tmp_path / "shop.py").write_text(
+        """
+class Order:
+    def submit(self):
+        return None
+
+
+def build():
+    return Order()
+
+
+def get():
+    return (order := build())
+
+
+def run():
+    order = get()
+    order.submit()
+""",
+        encoding="utf-8",
+    )
+
+    _nodes, edges = _build_call_graph(tmp_path)
+
+    assert _edge_exists(edges, "shop.run", "shop.Order.submit", "inferred_type")
+
+
+def test_method_called_on_a_call_result_resolves(tmp_path):
+    """``build().submit()`` resolves without binding the result to a name first.
+
+    Receiver inference only understood names and attributes, so calling a
+    method straight off a call result produced no edge at all.
+    """
+    (tmp_path / "shop.py").write_text(
+        """
+class Order:
+    def submit(self):
+        return None
+
+
+def build():
+    return Order()
+
+
+def run():
+    build().submit()
+""",
+        encoding="utf-8",
+    )
+
+    _nodes, edges = _build_call_graph(tmp_path)
+
+    assert _edge_exists(edges, "shop.run", "shop.Order.submit", "inferred_type")
+
+
+def test_chained_calls_resolve_through_each_receiver(tmp_path):
+    """Each link of ``a().b().c()`` is the receiver of the next."""
+    (tmp_path / "shop.py").write_text(
+        """
+class Order:
+    def submit(self):
+        return None
+
+
+class Repo:
+    def find(self):
+        return Order()
+
+
+def get_repo():
+    return Repo()
+
+
+def run():
+    get_repo().find().submit()
+""",
+        encoding="utf-8",
+    )
+
+    _nodes, edges = _build_call_graph(tmp_path)
+
+    assert _edge_exists(edges, "shop.run", "shop.Repo.find", "inferred_type")
+    assert _edge_exists(edges, "shop.run", "shop.Order.submit", "inferred_type")
+
+
+def test_receiver_type_is_not_mistaken_for_the_return_type(tmp_path):
+    """``return build().submit()`` returns submit's value, not build's.
+
+    Resolving the receiver runs the same inference that records return links, so
+    it must not be attributed to the enclosing return.
+    """
+    (tmp_path / "shop.py").write_text(
+        """
+class Receipt:
+    def show(self):
+        return None
+
+
+class Order:
+    def submit(self):
+        return Receipt()
+
+
+def build():
+    return Order()
+
+
+def run():
+    return build().submit()
+""",
+        encoding="utf-8",
+    )
+
+    nodes, module_map, known_classes = build_indices(tmp_path)
+    summaries = build_return_summaries(
+        tmp_path,
+        callable_map=nodes,
+        module_map=module_map,
+        known_classes=known_classes,
+    )
+
+    assert summaries["shop.run"].class_types == {"shop.Receipt"}
+
+
+def test_chain_through_local_variables_resolves_past_the_pass_cap(tmp_path):
+    """``x = f(); return x`` links, so long chains no longer need one pass each.
+
+    Assigning to a local before returning it used to record no return link, so
+    the chain advanced a single hop per pass and died at ``max_iterations``.
+    Warnings are errors here: the run must reach a fixed point, not just happen
+    to get far enough.
+    """
+    (tmp_path / "shop.py").write_text(
+        """
+class Order:
+    def submit(self):
+        return None
+
+
+def make():
+    return Order()
+
+
+def a():
+    x = make()
+    return x
+
+
+def b():
+    x = a()
+    return x
+
+
+def c():
+    x = b()
+    return x
+
+
+def d():
+    x = c()
+    return x
+
+
+def run():
+    order = d()
+    order.submit()
+""",
+        encoding="utf-8",
+    )
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        _nodes, edges = _build_call_graph(tmp_path)
+
+    assert _edge_exists(edges, "shop.run", "shop.Order.submit", "inferred_type")
+
+
+def test_variable_assigned_in_both_branches_links_to_both(tmp_path):
+    """A name bound in each arm of an ``if`` depends on both expressions.
+
+    Pinned at ``max_iterations=1`` deliberately. With the default three passes
+    the pass loop re-derives these types directly, which would hide the second
+    arm's provenance overwriting the first's; one pass forces the answer to
+    arrive over the links alone.
+    """
+    (tmp_path / "shop.py").write_text(
+        """
+class Order:
+    def submit(self):
+        return None
+
+
+class Cart:
+    def clear(self):
+        return None
+
+
+def base_order():
+    return Order()
+
+
+def o1():
+    x = base_order()
+    return x
+
+
+def base_cart():
+    return Cart()
+
+
+def c1():
+    x = base_cart()
+    return x
+
+
+def pick(flag):
+    if flag:
+        value = o1()
+    else:
+        value = c1()
+    return value
+""",
+        encoding="utf-8",
+    )
+
+    nodes, module_map, known_classes = build_indices(tmp_path)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        summaries = build_return_summaries(
+            tmp_path,
+            callable_map=nodes,
+            module_map=module_map,
+            known_classes=known_classes,
+            max_iterations=1,
+        )
+
+    assert summaries["shop.pick"].class_types == {"shop.Order", "shop.Cart"}
+
+
+def test_destructured_local_keeps_its_slot(tmp_path):
+    """``order, cart = pair(); return order`` links to slot 0, not the whole value.
+
+    Pinned at ``max_iterations=1`` for the same reason as the branch test above:
+    only then must the tuple position survive on the link itself rather than
+    being re-derived by a later pass.
+    """
+    (tmp_path / "shop.py").write_text(
+        """
+class Order:
+    def submit(self):
+        return None
+
+
+class Cart:
+    def clear(self):
+        return None
+
+
+def base():
+    return Order(), Cart()
+
+
+def p1():
+    return base()
+
+
+def first():
+    order, cart = p1()
+    return order
+
+
+def second():
+    order, cart = p1()
+    return cart
+""",
+        encoding="utf-8",
+    )
+
+    nodes, module_map, known_classes = build_indices(tmp_path)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        summaries = build_return_summaries(
+            tmp_path,
+            callable_map=nodes,
+            module_map=module_map,
+            known_classes=known_classes,
+            max_iterations=1,
+        )
+
+    assert summaries["shop.first"].class_types == {"shop.Order"}
+    assert summaries["shop.second"].class_types == {"shop.Cart"}
+
+
+def test_collection_returned_via_a_local_keeps_element_types(tmp_path):
+    """Provenance covers element types, not just object types."""
+    (tmp_path / "shop.py").write_text(
+        """
+class Order:
+    def submit(self):
+        return None
+
+
+def base():
+    return [Order()]
+
+
+def l1():
+    x = base()
+    return x
+
+
+def l2():
+    x = l1()
+    return x
+
+
+def l3():
+    x = l2()
+    return x
+
+
+def l4():
+    x = l3()
+    return x
+
+
+def run():
+    for order in l4():
+        order.submit()
+""",
+        encoding="utf-8",
+    )
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        _nodes, edges = _build_call_graph(tmp_path)
+
+    assert _edge_exists(edges, "shop.run", "shop.Order.submit", "inferred_type")
+
+
+def test_rebinding_a_local_drops_the_old_provenance(tmp_path):
+    """A rebound name no longer depends on what it used to hold."""
+    (tmp_path / "shop.py").write_text(
+        """
+class Order:
+    def submit(self):
+        return None
+
+
+class Cart:
+    def clear(self):
+        return None
+
+
+def make_order():
+    return Order()
+
+
+def make_cart():
+    return Cart()
+
+
+def run():
+    value = make_order()
+    value.submit()
+    value = make_cart()
+    return value
+""",
+        encoding="utf-8",
+    )
+
+    nodes, module_map, known_classes = build_indices(tmp_path)
+    summaries = build_return_summaries(
+        tmp_path,
+        callable_map=nodes,
+        module_map=module_map,
+        known_classes=known_classes,
+    )
+
+    assert summaries["shop.run"].class_types == {"shop.Cart"}
+
+
+def test_tuple_shape_survives_a_local_variable(tmp_path):
+    """``pair = make_pair(); return pair`` keeps the per-slot types."""
+    (tmp_path / "shop.py").write_text(
+        """
+class Order:
+    def submit(self):
+        return None
+
+
+class Cart:
+    def clear(self):
+        return None
+
+
+def make_pair():
+    return Order(), Cart()
+
+
+def forward():
+    pair = make_pair()
+    return pair
+
+
+def use():
+    order, cart = forward()
+    order.submit()
+    cart.clear()
+""",
+        encoding="utf-8",
+    )
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        _nodes, edges = _build_call_graph(tmp_path)
+
+    assert _edge_exists(edges, "shop.use", "shop.Order.submit", "inferred_type")
+    assert _edge_exists(edges, "shop.use", "shop.Cart.clear", "inferred_type")
