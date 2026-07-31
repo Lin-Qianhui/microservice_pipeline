@@ -28,6 +28,7 @@ from .ast_utils import attribute_to_name, unwrap_passthrough
 from .discovery import module_callable_id
 from .return_links import ReturnLink, ReturnLinkTable
 from .models import (
+    ClassAttrTypes,
     Edge,
     FunctionParamSummary,
     FunctionReturnSummary,
@@ -163,7 +164,7 @@ class CallCollector(ast.NodeVisitor):
         package_prefix: Optional[str] | Sequence[str],
         return_summaries: Optional[Dict[str, FunctionReturnSummary]] = None,
         param_summaries: Optional[Dict[str, FunctionParamSummary]] = None,
-        class_attr_types: Optional[Dict[Tuple[str, str], Set[str]]] = None,
+        class_attr_types: Optional[ClassAttrTypes] = None,
         return_links: Optional[ReturnLinkTable] = None,
     ):
         self.module = module
@@ -179,13 +180,22 @@ class CallCollector(ast.NodeVisitor):
         )
         self.param_summaries = param_summaries if param_summaries is not None else {}
         self.class_attr_types = (
-            class_attr_types if class_attr_types is not None else {}
+            class_attr_types if class_attr_types is not None else ClassAttrTypes()
         )
         self.class_bases = {
             class_id: bases
             for module_info in module_map.values()
             for class_id, bases in module_info.class_bases.items()
         }
+        # Reverse of ``class_bases``, for resolving a ``self.hook()`` call in a
+        # base class down to the subclass overrides that really run. Base IDs are
+        # canonicalized on the way in because a base recorded through a package
+        # re-export is an alias of the defining path.
+        self.subclasses: Dict[str, Set[str]] = {}
+        for class_id, bases in self.class_bases.items():
+            for base_id in bases:
+                canonical_base = known_classes.get(base_id, base_id)
+                self.subclasses.setdefault(canonical_base, set()).add(class_id)
         self.module_callable = module_callable_id(module)
         self.property_ids = {
             property_id
@@ -466,12 +476,42 @@ class CallCollector(ast.NodeVisitor):
 
             attr_types: Set[str] = set()
             for base_type in base_types:
-                attr_types.update(
-                    self.class_attr_types.get((base_type, expr.attr), set())
-                )
+                for owner in self._class_and_ancestors(base_type):
+                    attr_types.update(
+                        self.class_attr_types.object_types.get((owner, expr.attr), set())
+                    )
             attr_types.update(self._infer_property_return_class_types(expr))
             return attr_types
         return set()
+
+    def _class_attr_element_types(self, expr: ast.AST) -> Set[str]:
+        """Element types recorded for ``self.<attr>`` and friends across methods.
+
+        This is what makes a registry attribute usable: ``add_child`` stores into
+        ``self.children`` in one method and another method iterates it, so the
+        fact has to survive the boundary between them.
+        """
+        if not isinstance(expr, ast.Attribute):
+            return set()
+
+        base_types: Set[str] = set()
+        if (
+            isinstance(expr.value, ast.Name)
+            and expr.value.id in {"self", "cls"}
+            and self.current_class
+        ):
+            class_id = self.current_class_id()
+            if class_id:
+                base_types.add(class_id)
+        base_types.update(self.get_expr_types(expr.value))
+
+        element_types: Set[str] = set()
+        for base_type in base_types:
+            for owner in self._class_and_ancestors(base_type):
+                element_types.update(
+                    self.class_attr_types.element_types.get((owner, expr.attr), set())
+                )
+        return element_types
 
     def _receiver_types_for_expr(self, expr: ast.AST) -> Set[str]:
         receiver_types: Set[str] = set()
@@ -510,14 +550,7 @@ class CallCollector(ast.NodeVisitor):
                 element_types.update(summary.element_types)
         return element_types
 
-    def set_attribute_types(self, target: ast.Attribute, types: Set[str]) -> None:
-        if not types:
-            return
-
-        attr_name = attribute_to_name(target)
-        if attr_name:
-            self.set_attr_expr_types(attr_name, types)
-
+    def _attribute_owner_types(self, target: ast.Attribute) -> Set[str]:
         base_types: Set[str] = set()
         if (
             isinstance(target.value, ast.Name)
@@ -528,9 +561,38 @@ class CallCollector(ast.NodeVisitor):
             if class_id:
                 base_types.add(class_id)
         base_types.update(self.get_expr_types(target.value))
+        return base_types
 
-        for base_type in base_types:
-            self.class_attr_types.setdefault((base_type, target.attr), set()).update(types)
+    def set_attribute_types(self, target: ast.Attribute, types: Set[str]) -> None:
+        if not types:
+            return
+
+        attr_name = attribute_to_name(target)
+        if attr_name:
+            self.set_attr_expr_types(attr_name, types)
+
+        for base_type in self._attribute_owner_types(target):
+            self.class_attr_types.add_object_types((base_type, target.attr), types)
+
+    def set_attribute_element_types(self, target: ast.Attribute, types: Set[str]) -> None:
+        """Record what an attribute *contains*, from a whole-value assignment."""
+        if not types:
+            return
+        for base_type in self._attribute_owner_types(target):
+            self.class_attr_types.add_element_types((base_type, target.attr), types)
+
+    def record_attribute_container_store(self, container: ast.AST, values: Set[str]) -> None:
+        """Note types added into a container attribute, however they got there.
+
+        Covers both ``self.x[k] = v`` and ``self.x.append(v)`` styles. Only the
+        element facts are touched: storing into a container says nothing about
+        what the attribute itself is, and claiming otherwise would make the
+        container look like the thing it holds.
+        """
+        if not values or not isinstance(container, ast.Attribute):
+            return
+        for base_type in self._attribute_owner_types(container):
+            self.class_attr_types.add_element_types((base_type, container.attr), values)
 
     def current_class_id(self) -> Optional[str]:
         if self.current_class:
@@ -612,6 +674,64 @@ class CallCollector(ast.NodeVisitor):
                     self._known_class_id(base_id), method_name, seen=seen.copy()
                 )
             )
+        return self._unique(targets)
+
+    def _class_and_ancestors(self, class_id: str) -> List[str]:
+        """``class_id`` followed by every base class reachable from it.
+
+        Attribute facts are recorded against whichever class the assigning method
+        belongs to, which is often a base. ``self.subprocess`` is populated by
+        ``Process.add_subprocess`` but read by ``TimeDependentProcess``, so a
+        lookup that checks only the reading class finds nothing.
+        """
+        chain: List[str] = []
+        queue: List[str] = [class_id]
+        seen: Set[str] = set()
+        while queue:
+            current = queue.pop(0)
+            if current in seen:
+                continue
+            seen.add(current)
+            chain.append(current)
+            for base_id in self.class_bases.get(current, []):
+                canonical = self._known_class_id(base_id)
+                if canonical not in seen:
+                    queue.append(canonical)
+        return chain
+
+    def _resolve_subclass_override_targets(self, class_id: str, method_name: str) -> List[str]:
+        """Find overrides of ``method_name`` below ``class_id`` in the hierarchy.
+
+        This is the Template Method pattern, which scientific frameworks lean on
+        heavily. ``_SurfaceFlux._compute_heating_rates`` calls
+        ``self._compute_flux()``, but ``_SurfaceFlux`` never defines
+        ``_compute_flux`` -- its two subclasses do, and one of those is what
+        actually runs. Resolving ``self`` only to the enclosing class, as normal
+        method resolution does, finds nothing at all here. On climlab this shape
+        was 49 of the 55 edges still missing after alias canonicalization.
+
+        Every override found is a genuine runtime possibility, so all of them are
+        returned. That deliberately over-approximates -- a base with ten
+        subclasses yields ten edges -- which is why callers label these
+        ``virtual_override`` and the structural graph weights them below literal
+        calls rather than treating them as ordinary resolved edges.
+        """
+        targets: List[str] = []
+        queue: List[str] = [class_id]
+        seen: Set[str] = {class_id}
+        while queue:
+            current = queue.pop()
+            for subclass_id in sorted(self.subclasses.get(current, ())):
+                if subclass_id in seen:
+                    continue
+                seen.add(subclass_id)
+                queue.append(subclass_id)
+                # A subclass that overrides the method is one possible target;
+                # keep descending regardless, because a deeper subclass can
+                # override it again and instances of that class dispatch there.
+                candidate = f"{subclass_id}.{method_name}"
+                if candidate in self.callable_ids:
+                    targets.append(candidate)
         return self._unique(targets)
 
     def _resolve_constructor_targets(self, class_id: str) -> List[str]:
@@ -844,6 +964,13 @@ class CallCollector(ast.NodeVisitor):
 
         if isinstance(target, ast.Attribute):
             self.set_attribute_types(target, class_types)
+            self.set_attribute_element_types(target, container_types)
+            return
+
+        # ``self.registry[key] = value``: the assignment target is a subscript
+        # of an attribute, so the value becomes an element of that attribute.
+        if isinstance(target, ast.Subscript):
+            self.record_attribute_container_store(target.value, class_types)
 
     def visit_Module(self, node: ast.Module) -> None:
         """Treat top-level statements as the body of the synthetic module node."""
@@ -916,26 +1043,120 @@ class CallCollector(ast.NodeVisitor):
                 if first_arg in {"self", "cls"}:
                     cls_id = f"{self.module}.{self.current_class}"
                     self.set_var_type(first_arg, cls_id)
-            param_summary = self.param_summaries.get(self.current_callable)
-            if param_summary:
-                positional_args = [*node.args.posonlyargs, *node.args.args]
-                for index, arg in enumerate(positional_args):
-                    param_types = set(param_summary.positional_types.get(index, set()))
-                    param_types.update(param_summary.named_types.get(arg.arg, set()))
-                    if param_types:
-                        self.set_var_types(arg.arg, param_types)
-                for index, arg in enumerate(
-                    node.args.kwonlyargs, start=len(positional_args)
-                ):
-                    param_types = set(param_summary.positional_types.get(index, set()))
-                    param_types.update(param_summary.named_types.get(arg.arg, set()))
-                    if param_types:
-                        self.set_var_types(arg.arg, param_types)
+            # An empty summary still matters: annotations are read here too, and
+            # they are available whether or not any call site was observed.
+            param_summary = self.param_summaries.get(self.current_callable) or FunctionParamSummary()
+            positional_args = [*node.args.posonlyargs, *node.args.args]
+            for index, arg in enumerate(positional_args):
+                self._seed_param_types(param_summary, index, arg)
+            for index, arg in enumerate(
+                node.args.kwonlyargs, start=len(positional_args)
+            ):
+                self._seed_param_types(param_summary, index, arg)
 
         self.generic_visit(node)
         self.pop_scope()
         self.callable_stack.pop()
         self.current_callable = prev_callable
+
+    # Typing constructs that wrap the type actually of interest. ``Optional[X]``
+    # and ``Union[X, None]`` still denote an ``X``; the container forms denote a
+    # collection *of* ``X``, which is a different fact and handled separately.
+    _TRANSPARENT_ANNOTATION_NAMES = frozenset(
+        {"Optional", "Union", "Final", "Annotated", "ClassVar", "typing"}
+    )
+    _CONTAINER_ANNOTATION_NAMES = frozenset(
+        {
+            "List", "list", "Set", "set", "FrozenSet", "frozenset",
+            "Sequence", "Iterable", "Iterator", "Collection", "MutableSequence",
+            "Tuple", "tuple", "Dict", "dict", "Mapping", "MutableMapping",
+            "DefaultDict", "defaultdict", "OrderedDict", "Deque", "deque",
+        }
+    )
+
+    @staticmethod
+    def _annotation_head(node: ast.AST) -> str:
+        name = attribute_to_name(node) or ""
+        return name.rsplit(".", 1)[-1]
+
+    def _annotation_types(self, node: Optional[ast.AST]) -> Tuple[Set[str], Set[str]]:
+        """Resolve an annotation to ``(object types, element types)``.
+
+        Annotations are free, reliable inference that the collectors previously
+        ignored entirely. ``def solve(mesh: Mesh)`` states outright what a call
+        site might never reveal.
+
+        A container annotation contributes only element types: ``items: List[Order]``
+        means ``items`` *holds* orders, so treating ``Order`` as the type of
+        ``items`` itself would resolve ``items.submit()`` to a method that
+        instances of ``list`` do not have. Mapping annotations follow the same
+        rule as dict literals -- the values are the elements.
+        """
+        if node is None:
+            return set(), set()
+
+        # ``"Mesh"`` as a forward reference, and the string halves of
+        # ``from __future__ import annotations`` output.
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return set(self._resolve_class_reference_name(node.value)), set()
+
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+            left_objects, left_elements = self._annotation_types(node.left)
+            right_objects, right_elements = self._annotation_types(node.right)
+            return left_objects | right_objects, left_elements | right_elements
+
+        if isinstance(node, ast.Subscript):
+            head = self._annotation_head(node.value)
+            inner = node.slice
+            parts = list(inner.elts) if isinstance(inner, ast.Tuple) else [inner]
+
+            if head in self._CONTAINER_ANNOTATION_NAMES:
+                # ``Dict[K, V]`` -- the values are the elements; a one-argument
+                # container annotates its elements directly.
+                targets = parts[1:] if head.lower() in {"dict", "mapping", "mutablemapping", "defaultdict", "ordereddict"} and len(parts) > 1 else parts
+                element_types: Set[str] = set()
+                for part in targets:
+                    part_objects, part_elements = self._annotation_types(part)
+                    element_types |= part_objects | part_elements
+                return set(), element_types
+
+            if head in self._TRANSPARENT_ANNOTATION_NAMES:
+                objects: Set[str] = set()
+                elements: Set[str] = set()
+                for part in parts:
+                    part_objects, part_elements = self._annotation_types(part)
+                    objects |= part_objects
+                    elements |= part_elements
+                return objects, elements
+            return set(), set()
+
+        name = attribute_to_name(node)
+        if not name or name == "None":
+            return set(), set()
+        return set(self._resolve_class_reference_name(name)), set()
+
+    def _seed_param_types(
+        self, param_summary: FunctionParamSummary, index: int, arg: ast.arg
+    ) -> None:
+        """Bind one parameter to the types observed at its call sites.
+
+        Object and element facts are seeded into different maps: a parameter that
+        received a list of ``Order`` must answer ``Order`` when iterated, not
+        when called on directly.
+        """
+        annotated_objects, annotated_elements = self._annotation_types(arg.annotation)
+
+        param_types = set(param_summary.positional_types.get(index, set()))
+        param_types.update(param_summary.named_types.get(arg.arg, set()))
+        param_types |= annotated_objects
+        if param_types:
+            self.set_var_types(arg.arg, param_types)
+
+        element_types = set(param_summary.positional_element_types.get(index, set()))
+        element_types.update(param_summary.named_element_types.get(arg.arg, set()))
+        element_types |= annotated_elements
+        if element_types:
+            self.set_container_types(arg.arg, element_types)
 
     def _resolve_enclosing_local_callable(self, name: str) -> Optional[str]:
         for scope_callable in reversed(self.callable_stack):
@@ -981,10 +1202,35 @@ class CallCollector(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+        # The annotation is a fact in its own right, so ``self.grid: Grid`` is
+        # useful even with no assigned value -- which is exactly the form a
+        # class-level attribute declaration takes.
+        annotated_objects, annotated_elements = self._annotation_types(node.annotation)
+        class_types = set(annotated_objects)
+        container_types = set(annotated_elements)
         if node.value is not None:
-            class_types = self._infer_class_types_from_value(node.value)
-            container_types = self._infer_container_element_types(node.value)
-            self._assign_target_types(node.target, class_types, container_types, node.value)
+            class_types |= self._infer_class_types_from_value(node.value)
+            container_types |= self._infer_container_element_types(node.value)
+
+        if class_types or container_types:
+            # ``engine: Engine`` written directly in a class body declares an
+            # instance attribute, not a local. Its target is a bare Name, so
+            # without this it would be filed as a variable in the class scope and
+            # never seen by ``self.engine`` lookups in the methods below it.
+            if (
+                isinstance(node.target, ast.Name)
+                and isinstance(getattr(node, "parent", None), ast.ClassDef)
+                and self.current_class
+            ):
+                class_id = self.current_class_id()
+                if class_id:
+                    key = (class_id, node.target.id)
+                    self.class_attr_types.add_object_types(key, class_types)
+                    self.class_attr_types.add_element_types(key, container_types)
+            else:
+                self._assign_target_types(
+                    node.target, class_types, container_types, node.value or node
+                )
         self.generic_visit(node)
 
     def visit_AugAssign(self, node: ast.AugAssign) -> None:
@@ -1008,6 +1254,15 @@ class CallCollector(ast.NodeVisitor):
             element_types = self._infer_container_element_types(node.iter)
             if element_types:
                 self.set_var_types(node.target.id, element_types)
+        elif isinstance(node.target, (ast.Tuple, ast.List)):
+            # ``for name, proc in registry.items()``: each loop variable takes
+            # one slot of the element, so bind them position by position.
+            for index, item in enumerate(node.target.elts):
+                if not isinstance(item, ast.Name):
+                    continue
+                slot_types = self._infer_sequence_slot_class_types(node.iter, index)
+                if slot_types:
+                    self.set_var_types(item.id, slot_types)
         for stmt in node.body:
             self.visit(stmt)
         for stmt in node.orelse:
@@ -1019,22 +1274,52 @@ class CallCollector(ast.NodeVisitor):
     def visit_AsyncFor(self, node: ast.AsyncFor) -> None:
         self._visit_for_like(node)
 
+    def _container_mutation_element_types(self, node: ast.Call) -> Set[str]:
+        """Element types a mutating container call introduces, if any.
+
+        ``append``/``add`` contribute the argument's own type; ``extend``/
+        ``update`` contribute the argument's *elements*, since they merge one
+        collection into another. ``update`` is what makes dict-style registries
+        work -- ``self.children.update({name: child})`` is the idiom frameworks
+        use to register something under a key.
+        """
+        if not node.args:
+            return set()
+        if node.func.attr in {"append", "add"}:  # type: ignore[union-attr]
+            return self._infer_class_types_from_value(node.args[0])
+        if node.func.attr in {"extend", "update"}:  # type: ignore[union-attr]
+            return self._infer_container_element_types(node.args[0])
+        return set()
+
     def _record_container_mutation(self, node: ast.Call) -> None:
-        """Learn element types introduced by simple ``append``/``extend`` calls."""
+        """Learn element types introduced by mutating container calls.
+
+        Handles both a local (``items.append(x)``) and an attribute container
+        (``self.items.append(x)``). The attribute case is the one that crosses
+        method boundaries, so it is what lets a registry populated in one method
+        be resolved where another method iterates it.
+        """
         if not isinstance(node.func, ast.Attribute):
             return
-        if not isinstance(node.func.value, ast.Name):
+
+        element_types = self._container_mutation_element_types(node)
+        if not element_types:
             return
 
-        container_name = node.func.value.id
-        if node.func.attr == "append" and node.args:
-            self.add_container_types(
-                container_name, self._infer_class_types_from_value(node.args[0])
-            )
-        elif node.func.attr == "extend" and node.args:
-            self.add_container_types(
-                container_name, self._infer_container_element_types(node.args[0])
-            )
+        container = node.func.value
+        # ``self.buckets[key].append(x)`` -- a container nested one level inside
+        # an attribute. The nesting level is deliberately flattened away: what
+        # matters for resolving a later ``for item in self.buckets[k]`` is which
+        # classes ended up somewhere under ``self.buckets``, not the shape of the
+        # boxes they sit in. climlab's process tree needs exactly this, since it
+        # bins subprocesses into ``self.process_types[time_type]`` lists.
+        if isinstance(container, ast.Subscript):
+            container = container.value
+
+        if isinstance(container, ast.Name):
+            self.add_container_types(container.id, element_types)
+        elif isinstance(container, ast.Attribute):
+            self.record_attribute_container_store(container, element_types)
 
     def _replay_var_sources(self, name: str, *, elements: bool) -> Set[str]:
         """Re-infer what ``name`` was assigned from, under the current link target.
@@ -1133,12 +1418,25 @@ class CallCollector(ast.NodeVisitor):
                 value.id, elements=True
             )
         if isinstance(value, ast.Attribute):
-            return self._infer_property_return_element_types(value)
+            return (
+                self._infer_property_return_element_types(value)
+                | self._class_attr_element_types(value)
+            )
         if isinstance(value, (ast.List, ast.Tuple, ast.Set)):
             element_types: Set[str] = set()
             for item in value.elts:
                 element_types.update(self._infer_class_types_from_value(item))
             return element_types
+        # A dict's elements are its values: ``{"albedo": P2Albedo()}`` is a
+        # registry of albedo objects, and the keys are just labels. This is the
+        # dominant config-driven dispatch idiom in scientific code.
+        if isinstance(value, ast.Dict):
+            element_types: Set[str] = set()
+            for item in value.values:
+                element_types.update(self._infer_class_types_from_value(item))
+            return element_types
+        if isinstance(value, ast.DictComp):
+            return self._infer_class_types_from_value(value.value)
         if isinstance(value, (ast.ListComp, ast.SetComp)):
             return self._infer_class_types_from_value(value.elt)
         if isinstance(value, ast.BinOp) and isinstance(value.op, ast.Add):
@@ -1157,6 +1455,13 @@ class CallCollector(ast.NodeVisitor):
         # Slicing a collection yields a collection holding the same elements.
         if isinstance(value, ast.Subscript) and isinstance(value.slice, ast.Slice):
             return self._infer_container_element_types(value.value)
+        # Indexing an attribute that holds nested containers, as in
+        # ``self.buckets[key]``, yields the inner container. Element facts are
+        # recorded flattened by ``_record_container_mutation``, so they are read
+        # back the same way rather than expecting a level of nesting that was
+        # never stored.
+        if isinstance(value, ast.Subscript) and isinstance(value.value, ast.Attribute):
+            return self._class_attr_element_types(value.value)
         if isinstance(value, ast.Call):
             if self._is_copy_call(value) and value.args:
                 return self._infer_container_element_types(value.args[0])
@@ -1167,6 +1472,15 @@ class CallCollector(ast.NodeVisitor):
                 if value.args:
                     return self._infer_container_element_types(value.args[0])
                 return set()
+            # ``registry.values()`` yields what the registry holds. Dict-backed
+            # registries are almost always walked this way rather than iterated
+            # directly, so without this the element facts are never read back.
+            if (
+                isinstance(value.func, ast.Attribute)
+                and value.func.attr == "values"
+                and not value.args
+            ):
+                return self._infer_container_element_types(value.func.value)
 
             element_types: Set[str] = set()
             for callee, _relation, is_resolved in self._resolve_callees(value.func):
@@ -1179,10 +1493,24 @@ class CallCollector(ast.NodeVisitor):
             return element_types
         return set()
 
+    def _is_dict_items_call(self, value: ast.AST) -> bool:
+        return (
+            isinstance(value, ast.Call)
+            and isinstance(value.func, ast.Attribute)
+            and value.func.attr == "items"
+            and not value.args
+        )
+
     def _infer_sequence_slot_class_types(self, value: ast.AST, index: int) -> Set[str]:
         value = unwrap_passthrough(value)
         if isinstance(value, (ast.Tuple, ast.List)) and index < len(value.elts):
             return self._infer_class_types_from_value(value.elts[index])
+        # ``for name, proc in self.subprocess.items()`` destructures a key/value
+        # pair, so slot 1 is an element of the container. This is how frameworks
+        # walk a registry when they need the key as well -- climlab's process
+        # tree is traversed exactly this way.
+        if self._is_dict_items_call(value) and index == 1:
+            return self._infer_container_element_types(value.func.value)  # type: ignore[union-attr]
         if isinstance(value, ast.Call):
             slot_types: Set[str] = set()
             for callee, _relation, is_resolved in self._resolve_callees(value.func):
@@ -1398,8 +1726,25 @@ class CallCollector(ast.NodeVisitor):
                 class_id = self.current_class_id()
                 if class_id:
                     targets = self._resolve_method_targets(class_id, func.attr)
-                    if targets:
-                        return [(target, "self_method", True) for target in targets]
+                    # ``self`` is not necessarily an instance of the class the
+                    # code is written in, so a subclass override is an equally
+                    # real target -- and usually the one that runs. This holds
+                    # whether or not the base supplies its own definition, so the
+                    # override edges are added alongside rather than as a
+                    # fallback: on climlab the base defines the hook in most
+                    # cases (``_Insolation._compute_fixed``,
+                    # ``GreyGas._compute_emission``), which a fallback-only rule
+                    # would never see past.
+                    overrides = [
+                        target
+                        for target in self._resolve_subclass_override_targets(class_id, func.attr)
+                        if target not in targets
+                    ]
+                    if targets or overrides:
+                        return [
+                            *((target, "self_method", True) for target in targets),
+                            *((target, "virtual_override", True) for target in overrides),
+                        ]
                     return [(f"{class_id}.{func.attr}", "self_method", False)]
 
             if isinstance(func.value, ast.Name):
@@ -1706,7 +2051,7 @@ class TypeSummaryCollector(CallCollector):
         known_classes: Dict[str, str],
         return_summaries: Dict[str, FunctionReturnSummary],
         param_summaries: Dict[str, FunctionParamSummary],
-        class_attr_types: Dict[Tuple[str, str], Set[str]],
+        class_attr_types: ClassAttrTypes,
     ):
         super().__init__(
             module=module,
@@ -1741,6 +2086,11 @@ class TypeSummaryCollector(CallCollector):
                     index + positional_offset,
                     self._infer_class_types_from_value(arg),
                 )
+                add_indexed_types(
+                    summary.positional_element_types,
+                    index + positional_offset,
+                    self._infer_container_element_types(arg),
+                )
             for keyword in node.keywords:
                 if keyword.arg is None:
                     continue
@@ -1748,6 +2098,11 @@ class TypeSummaryCollector(CallCollector):
                     summary.named_types,
                     keyword.arg,
                     self._infer_class_types_from_value(keyword.value),
+                )
+                add_types(
+                    summary.named_element_types,
+                    keyword.arg,
+                    self._infer_container_element_types(keyword.value),
                 )
 
         self.generic_visit(node)

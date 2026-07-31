@@ -24,6 +24,7 @@ from .definitions import DefinitionCollector, merge_module_index
 from .discovery import iter_analysis_files
 from .models import (
     AnalysisFile,
+    ClassAttrTypes,
     CallableDef,
     Edge,
     FunctionParamSummary,
@@ -140,11 +141,11 @@ def build_type_summaries_from_analysis_files(
     max_iterations: int = 5,
     *,
     cache: Optional[ParsedFileCache] = None,
-) -> Tuple[Dict[str, FunctionParamSummary], Dict[Tuple[str, str], Set[str]]]:
+) -> Tuple[Dict[str, FunctionParamSummary], ClassAttrTypes]:
     """Propagate parameter and class-attribute types until facts stabilize."""
     cache = cache if cache is not None else ParsedFileCache()
     param_summaries: Dict[str, FunctionParamSummary] = {}
-    class_attr_types: Dict[Tuple[str, str], Set[str]] = {}
+    class_attr_types = ClassAttrTypes()
     callable_ids = set(callable_map.keys())
 
     for _ in range(max_iterations):
@@ -199,7 +200,7 @@ def build_type_summaries(
     include_globs: Sequence[str] = (),
     exclude_globs: Sequence[str] = (),
     max_iterations: int = 5,
-) -> Tuple[Dict[str, FunctionParamSummary], Dict[Tuple[str, str], Set[str]]]:
+) -> Tuple[Dict[str, FunctionParamSummary], ClassAttrTypes]:
     return build_type_summaries_from_analysis_files(
         list(
             iter_analysis_files(
@@ -228,7 +229,7 @@ def collect_edges_from_analysis_files(
     package_prefix: Optional[str] | Sequence[str],
     return_summaries: Optional[Dict[str, FunctionReturnSummary]] = None,
     param_summaries: Optional[Dict[str, FunctionParamSummary]] = None,
-    class_attr_types: Optional[Dict[Tuple[str, str], Set[str]]] = None,
+    class_attr_types: Optional[ClassAttrTypes] = None,
     *,
     cache: Optional[ParsedFileCache] = None,
 ) -> List[Edge]:
@@ -274,7 +275,7 @@ def collect_edges(
     exclude_globs: Sequence[str] = (),
     return_summaries: Optional[Dict[str, FunctionReturnSummary]] = None,
     param_summaries: Optional[Dict[str, FunctionParamSummary]] = None,
-    class_attr_types: Optional[Dict[Tuple[str, str], Set[str]]] = None,
+    class_attr_types: Optional[ClassAttrTypes] = None,
 ) -> List[Edge]:
     return collect_edges_from_analysis_files(
         list(
@@ -318,7 +319,7 @@ class SourceCallResolver:
         package_prefix: Optional[str],
         return_summaries: Optional[Dict[str, FunctionReturnSummary]] = None,
         param_summaries: Optional[Dict[str, FunctionParamSummary]] = None,
-        class_attr_types: Optional[Dict[Tuple[str, str], Set[str]]] = None,
+        class_attr_types: Optional[ClassAttrTypes] = None,
     ):
         self.module = module
         self.file = file

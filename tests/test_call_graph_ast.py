@@ -1375,3 +1375,510 @@ def use():
 
     assert _edge_exists(edges, "shop.use", "shop.Order.submit", "inferred_type")
     assert _edge_exists(edges, "shop.use", "shop.Cart.clear", "inferred_type")
+
+
+def test_base_class_reached_through_package_reexport_resolves_inherited_methods(tmp_path):
+    """A base imported from a package must not lose its inherited methods.
+
+    ``from pkg import Base`` records the base as ``pkg.Base``, but the class is
+    defined at ``pkg.base.Base``. Without alias canonicalization the MRO walk
+    stops at the unrecognized name and every inherited call vanishes -- this was
+    55 of 110 missing edges on climlab.
+    """
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("from .base import Base\n", encoding="utf-8")
+    (pkg / "base.py").write_text(
+        """
+class Base:
+    def register(self, item):
+        pass
+""",
+        encoding="utf-8",
+    )
+    (tmp_path / "child.py").write_text(
+        """
+from pkg import Base
+
+
+class Child(Base):
+    def __init__(self):
+        self.register("thing")
+""",
+        encoding="utf-8",
+    )
+
+    _nodes, edges = _build_call_graph(tmp_path)
+
+    assert _edge_exists(edges, "child.Child.__init__", "pkg.base.Base.register", "self_method")
+
+
+def test_reexport_chain_through_nested_packages_resolves(tmp_path):
+    """Re-exports chain, so alias resolution has to reach a fixpoint."""
+    outer = tmp_path / "outer"
+    inner = outer / "inner"
+    inner.mkdir(parents=True)
+    (outer / "__init__.py").write_text("from .inner import Base\n", encoding="utf-8")
+    (inner / "__init__.py").write_text("from .impl import Base\n", encoding="utf-8")
+    (inner / "impl.py").write_text(
+        """
+class Base:
+    def hook(self):
+        pass
+""",
+        encoding="utf-8",
+    )
+    (tmp_path / "leaf.py").write_text(
+        """
+from outer import Base
+
+
+class Leaf(Base):
+    def go(self):
+        self.hook()
+""",
+        encoding="utf-8",
+    )
+
+    _nodes, edges = _build_call_graph(tmp_path)
+
+    assert _edge_exists(edges, "leaf.Leaf.go", "outer.inner.impl.Base.hook", "self_method")
+
+
+def test_real_class_definition_wins_over_a_same_named_alias(tmp_path):
+    """An alias may never shadow a class actually defined in that module."""
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    # pkg/__init__.py both defines Base and imports a different Base. The local
+    # definition is what ``pkg.Base`` means at runtime.
+    (pkg / "__init__.py").write_text(
+        """
+from .other import Base as _Other
+
+
+class Base:
+    def local_hook(self):
+        pass
+""",
+        encoding="utf-8",
+    )
+    (pkg / "other.py").write_text(
+        """
+class Base:
+    def other_hook(self):
+        pass
+""",
+        encoding="utf-8",
+    )
+    (tmp_path / "leaf.py").write_text(
+        """
+from pkg import Base
+
+
+class Leaf(Base):
+    def go(self):
+        self.local_hook()
+""",
+        encoding="utf-8",
+    )
+
+    _nodes, edges = _build_call_graph(tmp_path)
+
+    assert _edge_exists(edges, "leaf.Leaf.go", "pkg.Base.local_hook", "self_method")
+    assert not _edge_exists(edges, "leaf.Leaf.go", "pkg.other.Base.other_hook")
+
+
+def test_self_call_resolves_to_subclass_overrides_when_base_has_no_definition(tmp_path):
+    """The Template Method shape: base declares the hook only by calling it."""
+    (tmp_path / "flux.py").write_text(
+        """
+class Base:
+    def run(self):
+        self.compute_flux()
+
+
+class Sensible(Base):
+    def compute_flux(self):
+        pass
+
+
+class Latent(Base):
+    def compute_flux(self):
+        pass
+""",
+        encoding="utf-8",
+    )
+
+    _nodes, edges = _build_call_graph(tmp_path)
+
+    assert _edge_exists(edges, "flux.Base.run", "flux.Sensible.compute_flux", "virtual_override")
+    assert _edge_exists(edges, "flux.Base.run", "flux.Latent.compute_flux", "virtual_override")
+
+
+def test_self_call_reaches_overrides_even_when_the_base_defines_the_hook(tmp_path):
+    """``self`` may be a subclass instance, so the override is a real target.
+
+    A fallback-only rule (overrides *only* when the base defines nothing) misses
+    this entirely, and on climlab that is the common case -- the base almost
+    always supplies a default implementation that subclasses replace.
+    """
+    (tmp_path / "insol.py").write_text(
+        """
+class Base:
+    def refresh(self):
+        self.compute_fixed()
+
+    def compute_fixed(self):
+        pass
+
+
+class Steady(Base):
+    def compute_fixed(self):
+        pass
+""",
+        encoding="utf-8",
+    )
+
+    _nodes, edges = _build_call_graph(tmp_path)
+
+    assert _edge_exists(edges, "insol.Base.refresh", "insol.Base.compute_fixed", "self_method")
+    assert _edge_exists(edges, "insol.Base.refresh", "insol.Steady.compute_fixed", "virtual_override")
+
+
+def test_virtual_override_reaches_indirect_subclasses(tmp_path):
+    """Overrides can appear at any depth below the class holding the call."""
+    (tmp_path / "deep.py").write_text(
+        """
+class A:
+    def go(self):
+        self.hook()
+
+
+class B(A):
+    pass
+
+
+class C(B):
+    def hook(self):
+        pass
+""",
+        encoding="utf-8",
+    )
+
+    _nodes, edges = _build_call_graph(tmp_path)
+
+    assert _edge_exists(edges, "deep.A.go", "deep.C.hook", "virtual_override")
+
+
+def test_virtual_override_does_not_duplicate_an_inherited_self_method_target(tmp_path):
+    """A subclass that does not override must not produce a second edge."""
+    (tmp_path / "plain.py").write_text(
+        """
+class Base:
+    def run(self):
+        self.helper()
+
+    def helper(self):
+        pass
+
+
+class Child(Base):
+    pass
+""",
+        encoding="utf-8",
+    )
+
+    _nodes, edges = _build_call_graph(tmp_path)
+
+    matching = [
+        edge for edge in edges
+        if edge.caller == "plain.Base.run" and edge.callee == "plain.Base.helper"
+    ]
+    assert len(matching) == 1
+    assert matching[0].relation == "self_method"
+    assert not any(edge.relation == "virtual_override" for edge in edges)
+
+
+def test_registry_element_types_cross_method_boundaries(tmp_path):
+    """Types stored into a container attribute must survive to another method.
+
+    ``register`` puts a child into ``self.children``; ``go`` iterates it. Without
+    an element dimension on class attributes the fact dies at the method
+    boundary and ``child.run()`` resolves to nothing.
+    """
+    (tmp_path / "reg.py").write_text(
+        """
+class Child:
+    def run(self):
+        pass
+
+
+class Parent:
+    def __init__(self):
+        self.children = {}
+
+    def register(self, name, child):
+        self.children[name] = child
+
+    def go(self):
+        for child in self.children.values():
+            child.run()
+
+
+def build():
+    parent = Parent()
+    parent.register("a", Child())
+    return parent
+""",
+        encoding="utf-8",
+    )
+
+    _nodes, edges = _build_call_graph(tmp_path)
+
+    assert _edge_exists(edges, "reg.Parent.go", "reg.Child.run", "inferred_type")
+
+
+def test_registry_populated_by_dict_update_and_walked_with_items(tmp_path):
+    """The climlab shape: ``dict.update`` to store, ``.items()`` to traverse."""
+    (tmp_path / "tree.py").write_text(
+        """
+class Leaf:
+    def compute(self):
+        pass
+
+
+class Node:
+    def __init__(self):
+        self.parts = {}
+
+    def attach(self, name, part):
+        self.parts.update({name: part})
+
+    def run(self):
+        for name, part in self.parts.items():
+            part.compute()
+
+
+def assemble():
+    node = Node()
+    node.attach("leaf", Leaf())
+    return node
+""",
+        encoding="utf-8",
+    )
+
+    _nodes, edges = _build_call_graph(tmp_path)
+
+    assert _edge_exists(edges, "tree.Node.run", "tree.Leaf.compute", "inferred_type")
+
+
+def test_container_element_types_flow_through_a_parameter(tmp_path):
+    """A list of objects handed across a call keeps its element types."""
+    (tmp_path / "batch.py").write_text(
+        """
+class Order:
+    def submit(self):
+        pass
+
+
+def process(items):
+    for item in items:
+        item.submit()
+
+
+def run():
+    process([Order()])
+""",
+        encoding="utf-8",
+    )
+
+    _nodes, edges = _build_call_graph(tmp_path)
+
+    assert _edge_exists(edges, "batch.process", "batch.Order.submit", "inferred_type")
+
+
+def test_attribute_types_are_found_on_base_classes(tmp_path):
+    """A registry filled by a base method must be readable from a subclass.
+
+    ``Base.attach`` records into ``self.parts``, so the fact is keyed on
+    ``Base``. ``Derived.run`` reads ``self.parts`` and would find nothing if the
+    lookup did not walk up to the base that owns the attribute -- which is
+    exactly how climlab splits ``Process.add_subprocess`` from the
+    ``TimeDependentProcess`` code that traverses the result.
+    """
+    (tmp_path / "split.py").write_text(
+        """
+class Part:
+    def compute(self):
+        pass
+
+
+class Base:
+    def __init__(self):
+        self.parts = {}
+
+    def attach(self, name, part):
+        self.parts.update({name: part})
+
+
+class Derived(Base):
+    def run(self):
+        for part in self.parts.values():
+            part.compute()
+
+
+def build():
+    obj = Derived()
+    obj.attach("p", Part())
+    return obj
+""",
+        encoding="utf-8",
+    )
+
+    _nodes, edges = _build_call_graph(tmp_path)
+
+    assert _edge_exists(edges, "split.Derived.run", "split.Part.compute", "inferred_type")
+
+
+def test_nested_container_attributes_flatten_for_dispatch(tmp_path):
+    """``self.buckets[key].append(x)`` then iterating ``self.buckets[key]``.
+
+    This two-hop shape is how climlab bins subprocesses into
+    ``self.process_types[time_type]`` before walking them.
+    """
+    (tmp_path / "bins.py").write_text(
+        """
+class Job:
+    def run(self):
+        pass
+
+
+class Scheduler:
+    def __init__(self):
+        self.queues = {"fast": [], "slow": []}
+        self.jobs = {}
+
+    def submit(self, name, job):
+        self.jobs.update({name: job})
+
+    def rebuild(self):
+        for name, job in self.jobs.items():
+            self.queues["fast"].append(job)
+
+    def drain(self):
+        for job in self.queues["fast"]:
+            job.run()
+
+
+def build():
+    scheduler = Scheduler()
+    scheduler.submit("a", Job())
+    return scheduler
+""",
+        encoding="utf-8",
+    )
+
+    _nodes, edges = _build_call_graph(tmp_path)
+
+    assert _edge_exists(edges, "bins.Scheduler.drain", "bins.Job.run", "inferred_type")
+
+
+def test_parameter_annotations_resolve_method_calls(tmp_path):
+    """A bare annotation is enough; no call site has to be observed."""
+    (tmp_path / "solver.py").write_text(
+        """
+class Mesh:
+    def refine(self):
+        pass
+
+
+def solve(mesh: Mesh):
+    mesh.refine()
+""",
+        encoding="utf-8",
+    )
+
+    _nodes, edges = _build_call_graph(tmp_path)
+
+    assert _edge_exists(edges, "solver.solve", "solver.Mesh.refine", "inferred_type")
+
+
+def test_optional_and_union_annotations_unwrap_to_the_inner_class(tmp_path):
+    (tmp_path / "opt.py").write_text(
+        """
+from typing import Optional
+
+
+class Grid:
+    def build(self):
+        pass
+
+
+def a(grid: Optional[Grid]):
+    grid.build()
+
+
+def b(grid: Grid | None):
+    grid.build()
+""",
+        encoding="utf-8",
+    )
+
+    _nodes, edges = _build_call_graph(tmp_path)
+
+    assert _edge_exists(edges, "opt.a", "opt.Grid.build", "inferred_type")
+    assert _edge_exists(edges, "opt.b", "opt.Grid.build", "inferred_type")
+
+
+def test_container_annotations_give_element_types_not_object_types(tmp_path):
+    """``List[Order]`` means it holds orders -- iterating resolves, calling does not."""
+    (tmp_path / "coll.py").write_text(
+        """
+from typing import Dict, List
+
+
+class Order:
+    def submit(self):
+        pass
+
+
+def each(orders: List[Order]):
+    for order in orders:
+        order.submit()
+
+
+def mapped(orders: Dict[str, Order]):
+    for order in orders.values():
+        order.submit()
+""",
+        encoding="utf-8",
+    )
+
+    _nodes, edges = _build_call_graph(tmp_path)
+
+    assert _edge_exists(edges, "coll.each", "coll.Order.submit", "inferred_type")
+    assert _edge_exists(edges, "coll.mapped", "coll.Order.submit", "inferred_type")
+    # The parameter itself is a list, so it must not be treated as an Order.
+    assert not _edge_exists(edges, "coll.each", "coll.Order.submit", "self_method")
+
+
+def test_annotated_attribute_declaration_without_a_value_is_used(tmp_path):
+    (tmp_path / "decl.py").write_text(
+        """
+class Engine:
+    def start(self):
+        pass
+
+
+class Car:
+    engine: Engine
+
+    def go(self):
+        self.engine.start()
+""",
+        encoding="utf-8",
+    )
+
+    _nodes, edges = _build_call_graph(tmp_path)
+
+    assert _edge_exists(edges, "decl.Car.go", "decl.Engine.start", "inferred_type")

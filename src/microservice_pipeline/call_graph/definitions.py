@@ -256,7 +256,58 @@ def build_indices_from_analysis_files(
         for _class_name, class_id in defs.module_index.classes.items():
             known_classes[class_id] = class_id
 
+    add_reexport_class_aliases(known_classes, module_map)
+
     return callable_map, module_map, known_classes
+
+
+def add_reexport_class_aliases(
+    known_classes: Dict[str, str],
+    module_map: Dict[str, ModuleIndex],
+    max_iterations: int = 10,
+) -> int:
+    """Teach ``known_classes`` the names a class is *re-exported* under.
+
+    A class reference is recorded as the symbol path the referring module used,
+    not the path where the class is defined. So ``from climlab.process import
+    TimeDependentProcess`` makes a subclass record its base as
+    ``climlab.process.TimeDependentProcess``, while the class itself lives at
+    ``climlab.process.time_dependent_process.TimeDependentProcess``. Those are
+    different strings, and only the second one is a known class.
+
+    That difference is expensive: method resolution walks base classes and stops
+    at the first one it cannot recognize, so a class reached through a package
+    re-export loses *every* inherited method call. On climlab that was 55 of 110
+    missing edges.
+
+    ``known_classes`` is the intended place to fix it -- it is consulted as an
+    alias-to-canonical map and was simply never given any aliases. Filling it in
+    here means no resolver code has to change.
+
+    Iterates because re-exports chain: a top-level ``__init__.py`` re-exports
+    from a subpackage ``__init__.py`` which re-exports from the defining module.
+    Returns the number of aliases added, which is useful for diagnostics.
+    """
+    added_total = 0
+    for _ in range(max_iterations):
+        added = 0
+        for module, module_index in module_map.items():
+            for name, target in module_index.imports.items():
+                alias = f"{module}.{name}"
+                # A real class definition of this name always wins; an alias may
+                # never shadow one, and an alias already recorded is left alone
+                # so the loop stays monotone and terminates.
+                if alias in known_classes:
+                    continue
+                canonical = known_classes.get(target)
+                if canonical is None:
+                    continue
+                known_classes[alias] = canonical
+                added += 1
+        added_total += added
+        if not added:
+            break
+    return added_total
 
 
 def build_indices(

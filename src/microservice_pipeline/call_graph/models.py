@@ -101,9 +101,43 @@ class FunctionReturnSummary:
 
 @dataclass
 class FunctionParamSummary:
-    """Object types observed at a callable's positional and named parameters."""
+    """Types observed at a callable's positional and named parameters.
+
+    Element types are tracked beside object types for the same reason
+    ``FunctionReturnSummary`` does it: a parameter that receives a list of
+    ``Order`` is a different fact from one that receives an ``Order``, and code
+    inside the callee iterates the former. Without this, any collection handed
+    across a call boundary loses its contents.
+    """
     positional_types: Dict[int, Set[str]] = field(default_factory=dict)
     named_types: Dict[str, Set[str]] = field(default_factory=dict)
+    positional_element_types: Dict[int, Set[str]] = field(default_factory=dict)
+    named_element_types: Dict[str, Set[str]] = field(default_factory=dict)
+
+
+@dataclass
+class ClassAttrTypes:
+    """Types inferred for ``self.<attr>`` on each class, by attribute.
+
+    Both maps are keyed by ``(class id, attribute name)``. ``object_types`` is
+    what the attribute holds; ``element_types`` is what it *contains*, which is
+    how a registry attribute such as ``self.subprocess`` carries the classes
+    stored into it across method boundaries.
+
+    Grouped into one object rather than two parallel arguments because every
+    pass threads them together, and splitting them would double the plumbing on
+    signatures that are already wide.
+    """
+    object_types: Dict[Tuple[str, str], Set[str]] = field(default_factory=dict)
+    element_types: Dict[Tuple[str, str], Set[str]] = field(default_factory=dict)
+
+    def add_object_types(self, key: Tuple[str, str], types: Set[str]) -> None:
+        if types:
+            self.object_types.setdefault(key, set()).update(types)
+
+    def add_element_types(self, key: Tuple[str, str], types: Set[str]) -> None:
+        if types:
+            self.element_types.setdefault(key, set()).update(types)
 
 
 def add_types(target: Dict[str, Set[str]], key: str, types: Set[str]) -> None:
@@ -149,12 +183,15 @@ def copy_param_summaries(
         key: FunctionParamSummary(
             positional_types=copy_indexed_type_map(value.positional_types),
             named_types=copy_type_map(value.named_types),
+            positional_element_types=copy_indexed_type_map(value.positional_element_types),
+            named_element_types=copy_type_map(value.named_element_types),
         )
         for key, value in summaries.items()
     }
 
 
-def copy_class_attr_types(
-    class_attr_types: Dict[Tuple[str, str], Set[str]],
-) -> Dict[Tuple[str, str], Set[str]]:
-    return {key: set(values) for key, values in class_attr_types.items()}
+def copy_class_attr_types(class_attr_types: ClassAttrTypes) -> ClassAttrTypes:
+    return ClassAttrTypes(
+        object_types={key: set(values) for key, values in class_attr_types.object_types.items()},
+        element_types={key: set(values) for key, values in class_attr_types.element_types.items()},
+    )
