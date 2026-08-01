@@ -26,16 +26,22 @@ from typing import Dict, Generator, Iterable, List, Optional, Sequence, Set, Tup
 
 from .ast_utils import attribute_to_name, unwrap_passthrough
 from .discovery import module_callable_id
+from .dunders import (
+    AUGASSIGN_DUNDER_METHODS,
+    BINOP_DUNDER_METHODS,
+    COMPARE_DUNDER_METHODS,
+    REVERSE_BINOP_DUNDER_METHODS,
+    UNARY_DUNDER_METHODS,
+)
+from .project_index import ProjectIndex, unique
 from .return_links import ReturnLink, ReturnLinkTable
+from .type_env import TypeEnv, TypeState, VarSource
 from .models import (
     ClassAttrTypes,
     Edge,
     FunctionParamSummary,
     FunctionReturnSummary,
     ModuleIndex,
-    add_indexed_types,
-    add_types,
-    copy_type_map,
 )
 
 try:
@@ -60,97 +66,16 @@ except ImportError:  # pragma: no cover - supports direct script execution
     )
 
 
-# Python syntax can invoke methods implicitly. These tables translate AST
-# operator node types into the corresponding data-model ("dunder") methods so,
-# for example, ``left + right`` can produce an edge to ``left.__add__``.
-BINOP_DUNDER_METHODS = {
-    ast.Add: "__add__",
-    ast.Sub: "__sub__",
-    ast.Mult: "__mul__",
-    ast.MatMult: "__matmul__",
-    ast.Div: "__truediv__",
-    ast.FloorDiv: "__floordiv__",
-    ast.Mod: "__mod__",
-    ast.Pow: "__pow__",
-    ast.LShift: "__lshift__",
-    ast.RShift: "__rshift__",
-    ast.BitOr: "__or__",
-    ast.BitXor: "__xor__",
-    ast.BitAnd: "__and__",
-}
-
-REVERSE_BINOP_DUNDER_METHODS = {
-    ast.Add: "__radd__",
-    ast.Sub: "__rsub__",
-    ast.Mult: "__rmul__",
-    ast.MatMult: "__rmatmul__",
-    ast.Div: "__rtruediv__",
-    ast.FloorDiv: "__rfloordiv__",
-    ast.Mod: "__rmod__",
-    ast.Pow: "__rpow__",
-    ast.LShift: "__rlshift__",
-    ast.RShift: "__rrshift__",
-    ast.BitOr: "__ror__",
-    ast.BitXor: "__rxor__",
-    ast.BitAnd: "__rand__",
-}
-
-AUGASSIGN_DUNDER_METHODS = {
-    ast.Add: "__iadd__",
-    ast.Sub: "__isub__",
-    ast.Mult: "__imul__",
-    ast.MatMult: "__imatmul__",
-    ast.Div: "__itruediv__",
-    ast.FloorDiv: "__ifloordiv__",
-    ast.Mod: "__imod__",
-    ast.Pow: "__ipow__",
-    ast.LShift: "__ilshift__",
-    ast.RShift: "__irshift__",
-    ast.BitOr: "__ior__",
-    ast.BitXor: "__ixor__",
-    ast.BitAnd: "__iand__",
-}
-
-COMPARE_DUNDER_METHODS = {
-    ast.Eq: "__eq__",
-    ast.NotEq: "__ne__",
-    ast.Lt: "__lt__",
-    ast.LtE: "__le__",
-    ast.Gt: "__gt__",
-    ast.GtE: "__ge__",
-}
-
-UNARY_DUNDER_METHODS = {
-    ast.UAdd: "__pos__",
-    ast.USub: "__neg__",
-    ast.Invert: "__invert__",
-}
-
-
-# What a local variable was assigned from: the value expression, plus the tuple
-# position taken from it when the assignment destructured (``a, b = make_pair()``
-# stores slot 0 for ``a``). Kept so ``return a`` can re-run inference on the
-# expression -- see ``CallCollector._replay_var_sources``.
-VarSource = Tuple[ast.AST, Optional[int]]
-
-TypeStack = List[Dict[str, Set[str]]]
-SourceStack = List[Dict[str, Set[VarSource]]]
-TypeState = Tuple[TypeStack, TypeStack, TypeStack, SourceStack]
-
-
 class CallCollector(ast.NodeVisitor):
     """Resolve calls and implicit Python operations into graph edges.
 
-    The visitor also performs deliberately small-scale type inference. Each
-    active lexical scope has three maps:
+    The visitor also performs deliberately small-scale type inference, whose
+    scoped state lives in ``self.types`` (:class:`~.type_env.TypeEnv`) and whose
+    whole-project facts live in ``self.project_index``
+    (:class:`~.project_index.ProjectIndex`).
 
-    * ``var_types_stack``: variable -> possible object class IDs
-    * ``container_types_stack``: variable -> possible element class IDs
-    * ``attr_types_stack``: dotted attribute expression -> possible class IDs
-
-    Values are sets because control flow can make more than one runtime type
-    possible. Resolution prefers known project definitions, but can retain an
-    unresolved descriptive target when ``include_external`` is enabled.
+    Resolution prefers known project definitions, but can retain an unresolved
+    descriptive target when ``include_external`` is enabled.
     """
     def __init__(
         self,
@@ -166,6 +91,7 @@ class CallCollector(ast.NodeVisitor):
         param_summaries: Optional[Dict[str, FunctionParamSummary]] = None,
         class_attr_types: Optional[ClassAttrTypes] = None,
         return_links: Optional[ReturnLinkTable] = None,
+        project_index: Optional[ProjectIndex] = None,
     ):
         self.module = module
         self.file = file
@@ -182,36 +108,15 @@ class CallCollector(ast.NodeVisitor):
         self.class_attr_types = (
             class_attr_types if class_attr_types is not None else ClassAttrTypes()
         )
-        self.class_bases = {
-            class_id: bases
-            for module_info in module_map.values()
-            for class_id, bases in module_info.class_bases.items()
-        }
-        # Reverse of ``class_bases``, for resolving a ``self.hook()`` call in a
-        # base class down to the subclass overrides that really run. Base IDs are
-        # canonicalized on the way in because a base recorded through a package
-        # re-export is an alias of the defining path.
-        self.subclasses: Dict[str, Set[str]] = {}
-        for class_id, bases in self.class_bases.items():
-            for base_id in bases:
-                canonical_base = known_classes.get(base_id, base_id)
-                self.subclasses.setdefault(canonical_base, set()).add(class_id)
+        # Whole-project class facts. Shared across every file and every pass of a
+        # run when the caller supplies one; built here only for callers that have
+        # no run to share (tests, one-off use).
+        self.project_index = (
+            project_index
+            if project_index is not None
+            else ProjectIndex(module_map, known_classes, callable_ids)
+        )
         self.module_callable = module_callable_id(module)
-        self.property_ids = {
-            property_id
-            for module_info in module_map.values()
-            for property_id in module_info.properties
-        }
-        self.static_method_ids = {
-            method_id
-            for module_info in module_map.values()
-            for method_id in module_info.static_methods
-        }
-        self.class_method_ids = {
-            method_id
-            for module_info in module_map.values()
-            for method_id in module_info.class_methods
-        }
 
         # Deferred "we return whatever that callee returns" facts. ``None``
         # switches recording off, which is what every collector except
@@ -222,13 +127,7 @@ class CallCollector(ast.NodeVisitor):
         self.current_callable: Optional[str] = None
         self.current_class: Optional[str] = None
         self.callable_stack: List[str] = []
-        self.var_types_stack: TypeStack = []
-        self.container_types_stack: TypeStack = []
-        self.attr_types_stack: TypeStack = []
-        self.var_sources_stack: SourceStack = []
-        # Variable names whose assigned expression is being replayed, so a
-        # self-referential binding such as ``x = x.next()`` cannot loop.
-        self._replaying: Set[str] = set()
+        self.types = TypeEnv()
         self.edges: List[Edge] = []
 
     @contextmanager
@@ -303,154 +202,56 @@ class CallCollector(ast.NodeVisitor):
             prefixes = tuple(self.package_prefix)
         return any(callee == prefix or callee.startswith(prefix + ".") for prefix in prefixes)
 
+    # Delegating shims onto ``TypeEnv``. The visitor below uses these constantly,
+    # so they stay on the collector rather than forcing ``self.types.`` at every
+    # one of the several hundred call sites.
     def push_scope(self) -> None:
-        """Start empty type-inference maps for a module/function scope."""
-        self.var_types_stack.append({})
-        self.container_types_stack.append({})
-        self.attr_types_stack.append({})
-        self.var_sources_stack.append({})
+        self.types.push_scope()
 
     def pop_scope(self) -> None:
-        self.var_types_stack.pop()
-        self.container_types_stack.pop()
-        self.attr_types_stack.pop()
-        self.var_sources_stack.pop()
+        self.types.pop_scope()
 
     def _copy_type_state(self) -> TypeState:
-        """Deep-copy mutable inference state before exploring a branch."""
-        return (
-            [copy_type_map(scope) for scope in self.var_types_stack],
-            [copy_type_map(scope) for scope in self.container_types_stack],
-            [copy_type_map(scope) for scope in self.attr_types_stack],
-            [self._copy_source_map(scope) for scope in self.var_sources_stack],
-        )
+        return self.types.copy_state()
 
     def _restore_type_state(self, state: TypeState) -> None:
-        self.var_types_stack = [copy_type_map(scope) for scope in state[0]]
-        self.container_types_stack = [copy_type_map(scope) for scope in state[1]]
-        self.attr_types_stack = [copy_type_map(scope) for scope in state[2]]
-        self.var_sources_stack = [self._copy_source_map(scope) for scope in state[3]]
-
-    @staticmethod
-    def _copy_source_map(
-        source_map: Dict[str, Set[VarSource]],
-    ) -> Dict[str, Set[VarSource]]:
-        return {key: set(values) for key, values in source_map.items()}
-
-    def _merge_type_maps(
-        self, maps: Iterable[Dict[str, Set[str]]]
-    ) -> Dict[str, Set[str]]:
-        merged: Dict[str, Set[str]] = {}
-        for type_map in maps:
-            for key, values in type_map.items():
-                add_types(merged, key, values)
-        return merged
-
-    def _merge_type_stack_states(
-        self, states: Iterable[List[Dict[str, Set[str]]]]
-    ) -> List[Dict[str, Set[str]]]:
-        state_list = list(states)
-        if not state_list:
-            return []
-        depth = len(state_list[0])
-        return [
-            self._merge_type_maps(state[index] for state in state_list)
-            for index in range(depth)
-        ]
-
-    def _merge_source_stack_states(
-        self, states: Iterable[SourceStack]
-    ) -> SourceStack:
-        """Union provenance across branches.
-
-        A variable assigned in both arms of an ``if`` was really assigned by
-        either, so ``return x`` afterwards depends on both expressions. Merging
-        here is what stops the second arm's assignment from simply overwriting
-        the first's.
-        """
-        state_list = list(states)
-        if not state_list:
-            return []
-        depth = len(state_list[0])
-        merged: SourceStack = []
-        for index in range(depth):
-            scope: Dict[str, Set[VarSource]] = {}
-            for state in state_list:
-                for key, values in state[index].items():
-                    if values:
-                        scope.setdefault(key, set()).update(values)
-            merged.append(scope)
-        return merged
+        self.types.restore_state(state)
 
     def _merge_type_states(self, states: Iterable[TypeState]) -> TypeState:
-        """Union facts from control-flow alternatives into one safe state."""
-        state_list = list(states)
-        return (
-            self._merge_type_stack_states(state[0] for state in state_list),
-            self._merge_type_stack_states(state[1] for state in state_list),
-            self._merge_type_stack_states(state[2] for state in state_list),
-            self._merge_source_stack_states(state[3] for state in state_list),
-        )
+        return self.types.merge_states(states)
 
     def set_var_type(self, var: str, typ: str) -> None:
-        self.set_var_types(var, {typ})
+        self.types.set_var_type(var, typ)
 
     def set_var_types(self, var: str, types: Set[str]) -> None:
-        if self.var_types_stack:
-            self.var_types_stack[-1][var] = set(types)
+        self.types.set_var_types(var, types)
 
     def get_var_types(self, var: str) -> Set[str]:
-        for scope in reversed(self.var_types_stack):
-            if var in scope:
-                return set(scope[var])
-        return set()
-
-    def set_container_types(self, var: str, types: Set[str]) -> None:
-        if self.container_types_stack:
-            self.container_types_stack[-1][var] = set(types)
-
-    def add_container_types(self, var: str, types: Set[str]) -> None:
-        if not self.container_types_stack or not types:
-            return
-        existing = self.container_types_stack[-1].setdefault(var, set())
-        existing.update(types)
-
-    def get_container_types(self, var: str) -> Set[str]:
-        for scope in reversed(self.container_types_stack):
-            if var in scope:
-                return set(scope[var])
-        return set()
-
-    def set_var_source(self, var: str, value: ast.AST, slot: Optional[int]) -> None:
-        """Remember the expression ``var`` was just assigned from.
-
-        Replaces rather than accumulates, matching ``set_var_types``: a rebound
-        name no longer depends on what it used to hold.
-        """
-        if self.var_sources_stack:
-            self.var_sources_stack[-1][var] = {(value, slot)}
-
-    def get_var_sources(self, var: str) -> Set[VarSource]:
-        for scope in reversed(self.var_sources_stack):
-            if var in scope:
-                return set(scope[var])
-        return set()
+        return self.types.get_var_types(var)
 
     def get_var_type(self, var: str) -> Optional[str]:
-        types = sorted(self.get_var_types(var))
-        if types:
-            return types[0]
-        return None
+        return self.types.get_var_type(var)
+
+    def set_container_types(self, var: str, types: Set[str]) -> None:
+        self.types.set_container_types(var, types)
+
+    def add_container_types(self, var: str, types: Set[str]) -> None:
+        self.types.add_container_types(var, types)
+
+    def get_container_types(self, var: str) -> Set[str]:
+        return self.types.get_container_types(var)
+
+    def set_var_source(self, var: str, value: ast.AST, slot: Optional[int]) -> None:
+        self.types.set_var_source(var, value, slot)
+
+    def get_var_sources(self, var: str) -> Set[VarSource]:
+        return self.types.get_var_sources(var)
 
     def set_attr_expr_types(self, attr_expr: str, types: Set[str]) -> None:
-        if self.attr_types_stack and types:
-            add_types(self.attr_types_stack[-1], attr_expr, types)
+        self.types.set_attr_expr_types(attr_expr, types)
 
     def get_attr_expr_types(self, attr_expr: str) -> Set[str]:
-        for scope in reversed(self.attr_types_stack):
-            if attr_expr in scope:
-                return set(scope[attr_expr])
-        return set()
+        return self.types.get_attr_expr_types(attr_expr)
 
     def get_expr_types(self, expr: ast.AST) -> Set[str]:
         """Infer possible class IDs for a simple name or attribute expression."""
@@ -530,7 +331,7 @@ class CallCollector(ast.NodeVisitor):
         targets: List[str] = []
         for receiver_type in sorted(self._receiver_types_for_expr(node.value)):
             for target in self._resolve_method_targets(receiver_type, node.attr):
-                if target in self.property_ids:
+                if target in self.project_index.property_ids:
                     targets.append(target)
         return self._unique(targets)
 
@@ -599,159 +400,45 @@ class CallCollector(ast.NodeVisitor):
             return f"{self.module}.{self.current_class}"
         return None
 
+    # Delegating shims onto ``ProjectIndex``. The resolution below depends only
+    # on whole-project definition facts, never on inference state, which is why
+    # it can live outside the collector and be shared across every pass.
     def _is_known_class(self, class_id: str) -> bool:
-        return (
-            class_id in self.known_classes
-            or class_id in self.known_classes.values()
-        )
+        return self.project_index.is_known_class(class_id)
 
     def _known_class_id(self, class_id: str) -> str:
-        return self.known_classes.get(class_id, class_id)
+        return self.project_index.known_class_id(class_id)
 
     def _unique(self, values: Iterable[str]) -> List[str]:
-        seen: Set[str] = set()
-        ordered: List[str] = []
-        for value in values:
-            if value not in seen:
-                seen.add(value)
-                ordered.append(value)
-        return ordered
+        return unique(values)
 
     def _resolve_class_reference_name(self, name: str) -> List[str]:
-        matches: Set[str] = set()
-
-        if "." not in name:
-            local_class = self.module_index.classes.get(name)
-            if local_class:
-                matches.add(local_class)
-
-            imported = self.module_index.imports.get(name)
-            if imported and self._is_known_class(imported):
-                matches.add(self._known_class_id(imported))
-
-            for imported in self._resolve_star_import_targets(name):
-                if self._is_known_class(imported):
-                    matches.add(self._known_class_id(imported))
-
-            local_name = f"{self.module}.{name}"
-            if self._is_known_class(local_name):
-                matches.add(self._known_class_id(local_name))
-
-            return sorted(matches)
-
-        base, rest = name.split(".", 1)
-        imported_base = self.module_index.imports.get(base)
-        if imported_base:
-            candidate = f"{imported_base}.{rest}"
-            if self._is_known_class(candidate):
-                matches.add(self._known_class_id(candidate))
-
-        if self._is_known_class(name):
-            matches.add(self._known_class_id(name))
-
-        return sorted(matches)
+        return self.project_index.resolve_class_reference_name(
+            self.module, self.module_index, name
+        )
 
     def _resolve_method_targets(
         self, class_id: str, method_name: str, seen: Optional[Set[str]] = None
     ) -> List[str]:
-        """Find a method on a class or, recursively, its indexed base classes."""
-        if seen is None:
-            seen = set()
-        if class_id in seen:
-            return []
-        seen.add(class_id)
-
-        direct = f"{class_id}.{method_name}"
-        if direct in self.callable_ids:
-            return [direct]
-
-        targets: List[str] = []
-        for base_id in self.class_bases.get(class_id, []):
-            if not self._is_known_class(base_id):
-                continue
-            targets.extend(
-                self._resolve_method_targets(
-                    self._known_class_id(base_id), method_name, seen=seen.copy()
-                )
-            )
-        return self._unique(targets)
+        return self.project_index.resolve_method_targets(class_id, method_name, seen)
 
     def _class_and_ancestors(self, class_id: str) -> List[str]:
-        """``class_id`` followed by every base class reachable from it.
+        return self.project_index.class_and_ancestors(class_id)
 
-        Attribute facts are recorded against whichever class the assigning method
-        belongs to, which is often a base. ``self.subprocess`` is populated by
-        ``Process.add_subprocess`` but read by ``TimeDependentProcess``, so a
-        lookup that checks only the reading class finds nothing.
-        """
-        chain: List[str] = []
-        queue: List[str] = [class_id]
-        seen: Set[str] = set()
-        while queue:
-            current = queue.pop(0)
-            if current in seen:
-                continue
-            seen.add(current)
-            chain.append(current)
-            for base_id in self.class_bases.get(current, []):
-                canonical = self._known_class_id(base_id)
-                if canonical not in seen:
-                    queue.append(canonical)
-        return chain
-
-    def _resolve_subclass_override_targets(self, class_id: str, method_name: str) -> List[str]:
-        """Find overrides of ``method_name`` below ``class_id`` in the hierarchy.
-
-        This is the Template Method pattern, which scientific frameworks lean on
-        heavily. ``_SurfaceFlux._compute_heating_rates`` calls
-        ``self._compute_flux()``, but ``_SurfaceFlux`` never defines
-        ``_compute_flux`` -- its two subclasses do, and one of those is what
-        actually runs. Resolving ``self`` only to the enclosing class, as normal
-        method resolution does, finds nothing at all here. On climlab this shape
-        was 49 of the 55 edges still missing after alias canonicalization.
-
-        Every override found is a genuine runtime possibility, so all of them are
-        returned. That deliberately over-approximates -- a base with ten
-        subclasses yields ten edges -- which is why callers label these
-        ``virtual_override`` and the structural graph weights them below literal
-        calls rather than treating them as ordinary resolved edges.
-        """
-        targets: List[str] = []
-        queue: List[str] = [class_id]
-        seen: Set[str] = {class_id}
-        while queue:
-            current = queue.pop()
-            for subclass_id in sorted(self.subclasses.get(current, ())):
-                if subclass_id in seen:
-                    continue
-                seen.add(subclass_id)
-                queue.append(subclass_id)
-                # A subclass that overrides the method is one possible target;
-                # keep descending regardless, because a deeper subclass can
-                # override it again and instances of that class dispatch there.
-                candidate = f"{subclass_id}.{method_name}"
-                if candidate in self.callable_ids:
-                    targets.append(candidate)
-        return self._unique(targets)
+    def _resolve_subclass_override_targets(
+        self, class_id: str, method_name: str
+    ) -> List[str]:
+        return self.project_index.resolve_subclass_override_targets(
+            class_id, method_name
+        )
 
     def _resolve_constructor_targets(self, class_id: str) -> List[str]:
-        return self._resolve_method_targets(class_id, "__init__")
+        return self.project_index.resolve_constructor_targets(class_id)
 
     def _resolve_super_method_targets(self, method_name: str) -> List[str]:
-        class_id = self.current_class_id()
-        if not class_id:
-            return []
-
-        targets: List[str] = []
-        for base_id in self.class_bases.get(class_id, []):
-            if not self._is_known_class(base_id):
-                continue
-            targets.extend(
-                self._resolve_method_targets(
-                    self._known_class_id(base_id), method_name
-                )
-            )
-        return self._unique(targets)
+        return self.project_index.resolve_super_method_targets(
+            self.current_class_id(), method_name
+        )
 
     def _add_edge(
         self, callee: str, relation: str, is_resolved: bool, lineno: int
@@ -800,19 +487,16 @@ class CallCollector(ast.NodeVisitor):
         return self._unique_callee_results(targets)
 
     def _callable_belongs_to_known_class(self, callable_id: str) -> bool:
-        return any(
-            callable_id.startswith(f"{class_id}.")
-            for class_id in self.known_classes.values()
-        )
+        return self.project_index.callable_belongs_to_known_class(callable_id)
 
     def _implicit_receiver_arg_offset(self, callee: str, relation: str) -> int:
         """Account for implicit ``self``/``cls`` in positional parameter facts."""
-        if callee in self.static_method_ids:
+        if callee in self.project_index.static_method_ids:
             return 0
         if relation == "constructor":
             return 1
         if relation == "class_method":
-            return 1 if callee in self.class_method_ids else 0
+            return 1 if callee in self.project_index.class_method_ids else 0
         if relation in {"self_method", "super_method", "inferred_type"}:
             if self._callable_belongs_to_known_class(callee):
                 return 1
@@ -951,7 +635,7 @@ class CallCollector(ast.NodeVisitor):
                 )
             return
 
-        if isinstance(target, ast.Name) and self.var_types_stack:
+        if isinstance(target, ast.Name) and self.types.var_types_stack:
             if class_types:
                 self.set_var_types(target.id, class_types)
             if container_types or self._is_container_literal(value):
@@ -1333,11 +1017,11 @@ class CallCollector(ast.NodeVisitor):
         assignment could not.
 
         Gated on an active link target: anywhere else this would be duplicated
-        work, since whatever it can infer is already in ``var_types_stack``.
+        work, since whatever it can infer is already in the type environment.
         """
-        if not self._link_target or name in self._replaying:
+        if not self._link_target or name in self.types.replaying:
             return set()
-        self._replaying.add(name)
+        self.types.replaying.add(name)
         try:
             types: Set[str] = set()
             for source, slot in self.get_var_sources(name):
@@ -1356,7 +1040,7 @@ class CallCollector(ast.NodeVisitor):
                     types.update(self._infer_class_types_from_value(source))
             return types
         finally:
-            self._replaying.discard(name)
+            self.types.replaying.discard(name)
 
     def _infer_class_types_from_value(self, value: ast.AST) -> Set[str]:
         value = unwrap_passthrough(value)
@@ -1662,44 +1346,12 @@ class CallCollector(ast.NodeVisitor):
     def _resolve_name_from_module_exports(
         self, module_name: str, name: str, seen: Optional[Set[str]] = None
     ) -> List[str]:
-        if seen is None:
-            seen = set()
-        if module_name in seen:
-            return []
-        seen.add(module_name)
-
-        matches: Set[str] = set()
-        module_index = self.module_map.get(module_name)
-        local_name = f"{module_name}.{name}"
-
-        if local_name in self.callable_ids:
-            matches.add(local_name)
-        if module_index and name in module_index.classes:
-            matches.add(module_index.classes[name])
-        elif local_name in self.known_classes.values() or local_name in self.known_classes:
-            matches.add(self.known_classes.get(local_name, local_name))
-
-        if not module_index:
-            return sorted(matches)
-
-        imported = module_index.imports.get(name)
-        if imported:
-            matches.add(self.known_classes.get(imported, imported))
-
-        for imported_module in module_index.star_imports:
-            matches.update(
-                self._resolve_name_from_module_exports(
-                    imported_module, name, seen=seen.copy()
-                )
-            )
-
-        return sorted(matches)
+        return self.project_index.resolve_name_from_module_exports(
+            module_name, name, seen
+        )
 
     def _resolve_star_import_targets(self, name: str) -> List[str]:
-        matches: Set[str] = set()
-        for imported_module in self.module_index.star_imports:
-            matches.update(self._resolve_name_from_module_exports(imported_module, name))
-        return sorted(matches)
+        return self.project_index.resolve_star_import_targets(self.module_index, name)
 
     def _resolve_callees(self, func: ast.AST) -> List[Tuple[str, str, bool]]:
         """Resolve a call target, allowing multiple method candidates.
@@ -1911,198 +1563,3 @@ class CallCollector(ast.NodeVisitor):
             return (full, "attribute", is_known)
 
         return None
-
-
-class ReturnSummaryCollector(CallCollector):
-    """Analysis pass that records the types produced by each callable.
-
-    It inherits scope and expression inference from ``CallCollector`` but does
-    not emit call edges; calls are visited only to maintain local type facts.
-    """
-    def __init__(
-        self,
-        module: str,
-        file: Path,
-        module_index: ModuleIndex,
-        callable_ids: Set[str],
-        module_map: Dict[str, ModuleIndex],
-        known_classes: Dict[str, str],
-        return_summaries: Optional[Dict[str, FunctionReturnSummary]] = None,
-        return_links: Optional[ReturnLinkTable] = None,
-    ):
-        super().__init__(
-            module=module,
-            file=file,
-            module_index=module_index,
-            callable_ids=callable_ids,
-            module_map=module_map,
-            known_classes=known_classes,
-            include_external=False,
-            package_prefix=None,
-            return_summaries=return_summaries,
-            return_links=return_links,
-        )
-        self.collected_summaries: Dict[str, FunctionReturnSummary] = {}
-
-    def visit_Call(self, node: ast.Call) -> None:
-        self._record_container_mutation(node)
-        self._visit_call_children(node)
-
-    def visit_Return(self, node: ast.Return) -> None:
-        """Merge one return statement's object, element, and slot type facts.
-
-        Each inference runs inside ``_recording_return_links`` naming the field
-        it fills. Whatever the inference reaches -- however deeply nested the
-        expression -- then records a link from that field back to whichever
-        field of the callee it consulted, so facts learned later still find
-        their way here.
-        """
-        if self.current_callable and node.value is not None:
-            summary = self.collected_summaries.setdefault(
-                self.current_callable, FunctionReturnSummary()
-            )
-            # ``return await build()`` returns exactly what ``build()`` does, so
-            # the shape tests below have to see through the wrapper.
-            returned = unwrap_passthrough(node.value)
-            with self._recording_return_links("class_types"):
-                summary.class_types.update(
-                    self._infer_class_types_from_value(returned)
-                )
-            with self._recording_return_links("element_types"):
-                summary.element_types.update(
-                    self._infer_container_element_types(returned)
-                )
-            if isinstance(returned, (ast.Tuple, ast.List)):
-                for index, item in enumerate(returned.elts):
-                    with self._recording_return_links("slot_types", index):
-                        add_indexed_types(
-                            summary.slot_types,
-                            index,
-                            self._infer_class_types_from_value(item),
-                        )
-                    with self._recording_return_links("slot_element_types", index):
-                        add_indexed_types(
-                            summary.slot_element_types,
-                            index,
-                            self._infer_container_element_types(item),
-                        )
-            elif isinstance(returned, ast.Call):
-                self._note_returned_call_slots(returned)
-            elif isinstance(returned, ast.Name):
-                self._note_returned_var_slots(returned.id)
-        self.generic_visit(node)
-
-    def _note_returned_var_slots(self, name: str) -> None:
-        """Carry a tuple shape across ``pair = make_pair(); return pair``.
-
-        The bare-call branch above cannot see through the local, and the
-        class/element replay only reproduces flat fields, so without this the
-        positions are lost exactly as they were before return links existed.
-        """
-        if name in self._replaying:
-            return
-        self._replaying.add(name)
-        try:
-            for source, slot in self.get_var_sources(name):
-                # A destructured binding is one position, not a whole shape.
-                if slot is not None:
-                    continue
-                source = unwrap_passthrough(source)
-                if isinstance(source, ast.Call):
-                    self._note_returned_call_slots(source)
-                elif isinstance(source, ast.Name):
-                    self._note_returned_var_slots(source.id)
-        finally:
-            self._replaying.discard(name)
-
-    def _note_returned_call_slots(self, value: ast.Call) -> None:
-        """Carry a callee's whole tuple shape across ``return make_pair()``.
-
-        The branch above only learns slot types from a literal tuple or list.
-        For a bare call there is no literal to walk, so link the slot-keyed
-        fields wholesale: whatever positions the callee is found to return, this
-        callable returns at the same positions.
-        """
-        if self.return_links is None or not self.current_callable:
-            return
-        for callee, _relation, is_resolved in self._resolve_callees(value.func):
-            if not is_resolved:
-                continue
-            for field_name in ("slot_types", "slot_element_types"):
-                self.return_links.record(
-                    ReturnLink(
-                        caller=self.current_callable,
-                        callee=callee,
-                        source_field=field_name,
-                        target_field=field_name,
-                    )
-                )
-
-
-class TypeSummaryCollector(CallCollector):
-    """Analysis pass that propagates argument and instance-attribute types."""
-    def __init__(
-        self,
-        module: str,
-        file: Path,
-        module_index: ModuleIndex,
-        callable_ids: Set[str],
-        module_map: Dict[str, ModuleIndex],
-        known_classes: Dict[str, str],
-        return_summaries: Dict[str, FunctionReturnSummary],
-        param_summaries: Dict[str, FunctionParamSummary],
-        class_attr_types: ClassAttrTypes,
-    ):
-        super().__init__(
-            module=module,
-            file=file,
-            module_index=module_index,
-            callable_ids=callable_ids,
-            module_map=module_map,
-            known_classes=known_classes,
-            include_external=False,
-            package_prefix=None,
-            return_summaries=return_summaries,
-            param_summaries=param_summaries,
-            class_attr_types=class_attr_types,
-        )
-
-    def visit_Call(self, node: ast.Call) -> None:
-        """Feed inferred argument types into the resolved callee's parameters."""
-        self._record_container_mutation(node)
-
-        dynamic_resolved = self._resolve_dynamic_getattr_callees(node.func)
-        resolved_callees = dynamic_resolved or self._resolve_callees(node.func)
-        for callee, relation, is_resolved in resolved_callees:
-            if not is_resolved:
-                continue
-            summary = self.param_summaries.setdefault(callee, FunctionParamSummary())
-            positional_offset = self._implicit_receiver_arg_offset(callee, relation)
-            for index, arg in enumerate(node.args):
-                if isinstance(arg, ast.Starred):
-                    continue
-                add_indexed_types(
-                    summary.positional_types,
-                    index + positional_offset,
-                    self._infer_class_types_from_value(arg),
-                )
-                add_indexed_types(
-                    summary.positional_element_types,
-                    index + positional_offset,
-                    self._infer_container_element_types(arg),
-                )
-            for keyword in node.keywords:
-                if keyword.arg is None:
-                    continue
-                add_types(
-                    summary.named_types,
-                    keyword.arg,
-                    self._infer_class_types_from_value(keyword.value),
-                )
-                add_types(
-                    summary.named_element_types,
-                    keyword.arg,
-                    self._infer_container_element_types(keyword.value),
-                )
-
-        self.generic_visit(node)

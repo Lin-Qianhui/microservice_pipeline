@@ -46,8 +46,22 @@ it:
     ``DefinitionCollector`` and the definition-indexing pass.
 ``return_links``
     Deferred "this callable returns whatever that one returns" facts.
+``dunders``
+    Operator-to-dunder-method tables. Pure data.
+``project_index``
+    ``ProjectIndex``: the class hierarchy and the resolution that depends only
+    on whole-project definition facts. Built once and shared by every pass.
+``type_env``
+    ``TypeEnv``: the scoped variable/container/attribute type state a single
+    collector accumulates as it walks one file.
 ``collectors``
-    ``CallCollector`` and its return/type summary subclasses.
+    ``CallCollector`` -- the AST visitor together with the type inference and
+    callee resolution it drives. These stay in one module because they are
+    mutually recursive: resolving ``build().submit()`` needs the inferred type
+    of ``build()``, and inferring that type needs to resolve ``build``.
+``summary_collectors``
+    ``ReturnSummaryCollector`` and ``TypeSummaryCollector``, the two edge-free
+    passes built on ``CallCollector``.
 ``passes``
     Drivers that run the collectors over a file set, plus ``SourceCallResolver``.
 
@@ -114,7 +128,8 @@ from .discovery import (
     module_for_analysis_file,
     path_to_module,
 )
-from .collectors import CallCollector, ReturnSummaryCollector, TypeSummaryCollector
+from .collectors import CallCollector
+from .summary_collectors import ReturnSummaryCollector, TypeSummaryCollector
 from .models import (
     MODULE_CALLABLE_QUALNAME,
     AnalysisFile,
@@ -124,6 +139,7 @@ from .models import (
     FunctionReturnSummary,
     ModuleIndex,
 )
+from .project_index import ProjectIndex
 from .passes import (
     SourceCallResolver,
     build_return_summaries,
@@ -171,6 +187,8 @@ __all__ = [
     "ReturnSummaryCollector",
     "SourceCallResolver",
     "TypeSummaryCollector",
+    # Whole-project facts
+    "ProjectIndex",
     # Passes
     "build_indices",
     "build_indices_from_analysis_files",
@@ -200,18 +218,26 @@ def build_call_graph_from_analysis_files(
     One ``ParsedFileCache`` is shared by every pass, so each file is read and
     parsed exactly once for the whole run instead of once per pass per loop
     iteration. The cache is discarded when this function returns.
+
+    One ``ProjectIndex`` is shared the same way. It holds the whole-project class
+    hierarchy and callable facts, which the definition pass has already settled
+    by this point and which no later pass changes -- so building it once here
+    replaces one rebuild per collector, of which there is one per file per
+    fixpoint iteration.
     """
     cache = ParsedFileCache()
     nodes, module_map, known_classes = build_indices_from_analysis_files(
         analysis_files,
         cache=cache,
     )
+    project_index = ProjectIndex(module_map, known_classes, set(nodes.keys()))
     return_summaries = build_return_summaries_from_analysis_files(
         analysis_files,
         callable_map=nodes,
         module_map=module_map,
         known_classes=known_classes,
         cache=cache,
+        project_index=project_index,
     )
     param_summaries, class_attr_types = build_type_summaries_from_analysis_files(
         analysis_files,
@@ -220,6 +246,7 @@ def build_call_graph_from_analysis_files(
         known_classes=known_classes,
         return_summaries=return_summaries,
         cache=cache,
+        project_index=project_index,
     )
     edges = collect_edges_from_analysis_files(
         analysis_files,
@@ -232,6 +259,7 @@ def build_call_graph_from_analysis_files(
         param_summaries=param_summaries,
         class_attr_types=class_attr_types,
         cache=cache,
+        project_index=project_index,
     )
     return nodes, edges
 

@@ -19,7 +19,8 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from .ast_utils import ParsedFileCache, attach_parents, parse_python_source
-from .collectors import CallCollector, ReturnSummaryCollector, TypeSummaryCollector
+from .collectors import CallCollector
+from .summary_collectors import ReturnSummaryCollector, TypeSummaryCollector
 from .definitions import DefinitionCollector, merge_module_index
 from .discovery import iter_analysis_files
 from .models import (
@@ -33,6 +34,7 @@ from .models import (
     copy_class_attr_types,
     copy_param_summaries,
 )
+from .project_index import ProjectIndex
 from .return_links import ReturnLinkTable, resolve_return_links
 
 
@@ -44,6 +46,7 @@ def build_return_summaries_from_analysis_files(
     max_iterations: int = 3,
     *,
     cache: Optional[ParsedFileCache] = None,
+    project_index: Optional[ProjectIndex] = None,
 ) -> Dict[str, FunctionReturnSummary]:
     """Infer return types repeatedly so facts can cross call chains.
 
@@ -64,6 +67,9 @@ def build_return_summaries_from_analysis_files(
     summaries: Dict[str, FunctionReturnSummary] = {}
     links = ReturnLinkTable()
     callable_ids = set(callable_map.keys())
+    project_index = project_index or ProjectIndex(
+        module_map, known_classes, callable_ids
+    )
 
     for _ in range(max_iterations):
         collected: Dict[str, FunctionReturnSummary] = {}
@@ -81,6 +87,7 @@ def build_return_summaries_from_analysis_files(
                 known_classes=known_classes,
                 return_summaries=summaries,
                 return_links=links,
+                project_index=project_index,
             )
             collector.visit(tree)
             collected.update(collector.collected_summaries)
@@ -141,12 +148,16 @@ def build_type_summaries_from_analysis_files(
     max_iterations: int = 5,
     *,
     cache: Optional[ParsedFileCache] = None,
+    project_index: Optional[ProjectIndex] = None,
 ) -> Tuple[Dict[str, FunctionParamSummary], ClassAttrTypes]:
     """Propagate parameter and class-attribute types until facts stabilize."""
     cache = cache if cache is not None else ParsedFileCache()
     param_summaries: Dict[str, FunctionParamSummary] = {}
     class_attr_types = ClassAttrTypes()
     callable_ids = set(callable_map.keys())
+    project_index = project_index or ProjectIndex(
+        module_map, known_classes, callable_ids
+    )
 
     for _ in range(max_iterations):
         next_param_summaries = copy_param_summaries(param_summaries)
@@ -166,6 +177,7 @@ def build_type_summaries_from_analysis_files(
                 return_summaries=return_summaries,
                 param_summaries=next_param_summaries,
                 class_attr_types=next_class_attr_types,
+                project_index=project_index,
             )
             collector.visit(tree)
 
@@ -232,11 +244,15 @@ def collect_edges_from_analysis_files(
     class_attr_types: Optional[ClassAttrTypes] = None,
     *,
     cache: Optional[ParsedFileCache] = None,
+    project_index: Optional[ProjectIndex] = None,
 ) -> List[Edge]:
     """Run the final, fully informed edge-collection pass over every file."""
     cache = cache if cache is not None else ParsedFileCache()
     edges: List[Edge] = []
     callable_ids = set(callable_map.keys())
+    project_index = project_index or ProjectIndex(
+        module_map, known_classes, callable_ids
+    )
 
     for analysis_file in analysis_files:
         py_file = analysis_file.path
@@ -254,6 +270,7 @@ def collect_edges_from_analysis_files(
             return_summaries=return_summaries,
             param_summaries=param_summaries,
             class_attr_types=class_attr_types,
+            project_index=project_index,
         )
         collector.visit(tree)
         edges.extend(collector.edges)
