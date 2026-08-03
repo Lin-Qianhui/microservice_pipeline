@@ -1549,7 +1549,7 @@ def build_resolver(
         known_classes=known_classes,
         module_prefix=module_prefix,
     )
-    param_summaries, class_attr_types = build_type_summaries(
+    summaries = build_type_summaries(
         source_root,
         callable_map=nodes,
         module_map=module_map,
@@ -1566,8 +1566,8 @@ def build_resolver(
         include_external=True,
         package_prefix=package,
         return_summaries=return_summaries,
-        param_summaries=param_summaries,
-        class_attr_types=class_attr_types,
+        param_summaries=summaries.params,
+        class_attr_types=summaries.class_attrs,
     )
 
 

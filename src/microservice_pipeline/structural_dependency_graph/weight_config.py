@@ -18,6 +18,11 @@ class StructuralWeightConfig:
     schema: str
     name: str
     call_weight: float
+    # Per-relation overrides for call edges. Not every call edge deserves the
+    # same confidence: an inferred ``virtual_override`` target is a possibility,
+    # while a ``direct`` call is a certainty. Relations absent here fall back to
+    # ``call_weight``, so profiles written before this existed stay valid.
+    call_weights: Dict[str, float]
     data_access_weights: Dict[str, float]
     data_access_fallback_weight: float
     data_lineage_weights: Dict[str, float]
@@ -41,6 +46,7 @@ class StructuralWeightConfig:
             schema=_required_text(payload, "schema"),
             name=str(payload.get("name") or ""),
             call_weight=_required_float(call, "base_weight"),
+            call_weights=_float_mapping(call.get("weights", {})),
             data_access_weights=_float_mapping(_required_mapping(data_access, "weights")),
             data_access_fallback_weight=_required_float(data_access, "fallback_weight"),
             data_lineage_weights=_float_mapping(_required_mapping(data_lineage, "weights")),
@@ -51,6 +57,9 @@ class StructuralWeightConfig:
             reweighted_settings=_plain_mapping(clustering.get("reweighted", {})),
             multiplex_settings=_plain_mapping(clustering.get("multiplex", {})),
         )
+
+    def call_relation_weight(self, relation: str) -> float:
+        return self.call_weights.get(relation, self.call_weight)
 
     def data_access_weight(self, access: str) -> float:
         return self.data_access_weights.get(access, self.data_access_fallback_weight)
@@ -71,6 +80,7 @@ class StructuralWeightConfig:
             "generation": {
                 "call": {
                     "base_weight": self.call_weight,
+                    "weights": dict(self.call_weights),
                 },
                 "data_access": {
                     "weights": dict(self.data_access_weights),

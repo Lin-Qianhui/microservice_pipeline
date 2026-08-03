@@ -11,9 +11,28 @@ from microservice_pipeline.data_access.generate_data_access_ast import (
 )
 from microservice_pipeline.call_graph.generate_call_graph_ast import (
     AnalysisFile,
+    analyze_analysis_files,
     build_indices,
     build_indices_from_analysis_files,
+    iter_analysis_files,
 )
+
+
+def _collect_with_registration(tmp_path):
+    """Run data access the way the CLI does, with registration rules derived.
+
+    ``collect_data_access`` on its own records no registration lineage -- the
+    rules are an optional input. This mirrors ``run_from_extraction_config``, so
+    these tests exercise what a real run produces.
+    """
+    analysis = analyze_analysis_files(list(iter_analysis_files(tmp_path)))
+    return collect_data_access(
+        tmp_path,
+        callable_map=analysis.project_nodes(),
+        pyright_families={},
+        registration_rules=analysis.registration_rules,
+        project_index=analysis.project_index,
+    )
 
 
 def _collect(source, shared_config=None, pyright_families=None):
@@ -1150,70 +1169,64 @@ def load(path):
     assert any(obj.kind == "dict_key" and obj.field == "lev" for obj in objects.values())
 
 
-def test_add_subprocess_without_shared_state_does_not_record_state_assign_lineage(tmp_path):
+def test_registration_without_shared_state_does_not_record_state_assign_lineage(tmp_path):
     (tmp_path / "sample.py").write_text(
         """
 class Child:
-    def _compute(self):
+    def run(self):
         pass
 
 
 class Parent:
     def __init__(self):
+        self.children = {}
         child = Child()
-        self.add_subprocess("child", child)
+        self.wire_up("child", child)
 
-    def _compute(self):
-        pass
+    def wire_up(self, name, proc):
+        self.children.update({name: proc})
 
-    def add_subprocess(self, name, proc):
-        pass
+    def run(self):
+        for name, proc in self.children.items():
+            proc.run()
 """,
         encoding="utf-8",
     )
 
-    callable_map, _module_map, _known_classes = build_indices(tmp_path)
-    _objects, _edges, lineage = collect_data_access(
-        tmp_path,
-        callable_map=callable_map,
-        pyright_families={},
-    )
+    _objects, _edges, lineage = _collect_with_registration(tmp_path)
 
     assert not any(edge.relation == "state_assign" for edge in lineage)
 
 
-def test_add_subprocess_with_shared_state_constructor_records_state_assign_lineage(tmp_path):
+def test_registration_with_shared_state_constructor_records_state_assign_lineage(tmp_path):
     (tmp_path / "sample.py").write_text(
         """
 class Child:
     def __init__(self, state):
         self.state = state
 
-    def _compute(self):
+    def run(self):
         pass
 
 
 class Parent:
     def __init__(self):
         self.state = {}
+        self.children = {}
         child = Child(state=self.state)
-        self.add_subprocess("child", child)
+        self.wire_up("child", child)
 
-    def _compute(self):
-        pass
+    def wire_up(self, name, proc):
+        self.children.update({name: proc})
 
-    def add_subprocess(self, name, proc):
-        pass
+    def run(self):
+        for name, proc in self.children.items():
+            proc.run()
 """,
         encoding="utf-8",
     )
 
-    callable_map, _module_map, _known_classes = build_indices(tmp_path)
-    objects, _edges, lineage = collect_data_access(
-        tmp_path,
-        callable_map=callable_map,
-        pyright_families={},
-    )
+    objects, _edges, lineage = _collect_with_registration(tmp_path)
 
     assert "class_state:sample.Child" in objects
     assert "class_state:sample.Parent" in objects
@@ -1226,7 +1239,7 @@ class Parent:
     )
 
 
-def test_add_subprocess_resolves_loop_and_with_bound_child_types(tmp_path):
+def test_registration_resolves_loop_and_with_bound_child_types(tmp_path):
     (tmp_path / "sample.py").write_text(
         """
 class Child:
@@ -1246,38 +1259,37 @@ class Child:
 class LoopParent:
     def __init__(self):
         self.state = {}
+        self.children = {}
         children = [Child(state=self.state)]
         for child in children:
-            self.add_subprocess("loop_child", child)
+            self.wire_up("loop_child", child)
 
-    def _compute(self):
-        pass
+    def wire_up(self, name, proc):
+        self.children.update({name: proc})
 
-    def add_subprocess(self, name, proc):
-        pass
+    def run(self):
+        for name, proc in self.children.items():
+            proc.run()
 
 
 class WithParent:
     def __init__(self):
         self.state = {}
+        self.children = {}
         with Child(state=self.state) as child:
-            self.add_subprocess("with_child", child)
+            self.wire_up("with_child", child)
 
-    def _compute(self):
-        pass
+    def wire_up(self, name, proc):
+        self.children.update({name: proc})
 
-    def add_subprocess(self, name, proc):
-        pass
+    def run(self):
+        for name, proc in self.children.items():
+            proc.run()
 """,
         encoding="utf-8",
     )
 
-    callable_map, _module_map, _known_classes = build_indices(tmp_path)
-    _objects, _edges, lineage = collect_data_access(
-        tmp_path,
-        callable_map=callable_map,
-        pyright_families={},
-    )
+    _objects, _edges, lineage = _collect_with_registration(tmp_path)
 
     lineage_tuples = {
         (edge.src_object_id, edge.dst_object_id, edge.relation, edge.slot)
@@ -1297,25 +1309,26 @@ class WithParent:
     ) in lineage_tuples
 
 
-def test_add_subprocess_state_lineage_uses_split_class_state_namespace(tmp_path):
+def test_registration_state_lineage_uses_split_class_state_namespace(tmp_path):
     (tmp_path / "sample.py").write_text(
         """
 class Child:
     def __init__(self, state):
         self.state = state
 
-    def _compute(self):
+    def run(self):
         pass
 
 
 class Parent:
     def __init__(self):
         self.state = {}
+        self.children = {}
         self.config = {}
         self.results = {}
         self.lookup = {}
         child = Child(state=self.state)
-        self.add_subprocess("child", child)
+        self.wire_up("child", child)
 
     def load(self):
         self.results["mass_g"] = self.state["mass_g"]
@@ -1326,21 +1339,17 @@ class Parent:
     def index(self):
         return self.lookup["Air"]
 
-    def _compute(self):
-        pass
+    def wire_up(self, name, proc):
+        self.children.update({name: proc})
 
-    def add_subprocess(self, name, proc):
-        pass
+    def run(self):
+        for name, proc in self.children.items():
+            proc.run()
 """,
         encoding="utf-8",
     )
 
-    callable_map, _module_map, _known_classes = build_indices(tmp_path)
-    objects, _edges, lineage = collect_data_access(
-        tmp_path,
-        callable_map=callable_map,
-        pyright_families={},
-    )
+    objects, _edges, lineage = _collect_with_registration(tmp_path)
 
     assert "class_attr_state:sample.Parent:state" in objects
     assert any(
@@ -1350,6 +1359,96 @@ class Parent:
         and edge.slot == "child"
         for edge in lineage
     )
+
+
+def test_registration_lineage_resolves_a_registrar_defined_on_a_base_class(tmp_path):
+    """The registering method usually lives further up than the call site.
+
+    climlab calls ``self.add_subprocess(...)`` on a ``StepFunctionAlbedo``, but
+    the method that retains the child is defined on ``Process``, three classes
+    up. The data-access collector's own ``known_classes`` is a flat set with no
+    ancestors, so this only resolves through the shared ``ProjectIndex``.
+    """
+    (tmp_path / "sample.py").write_text(
+        """
+class Node:
+    def __init__(self):
+        self.children = {}
+
+    def wire_up(self, name, proc):
+        self.children.update({name: proc})
+
+    def run(self):
+        for name, proc in self.children.items():
+            proc.run()
+
+
+class Middle(Node):
+    pass
+
+
+class Child(Node):
+    def __init__(self, state):
+        Node.__init__(self)
+        self.state = state
+
+
+class Parent(Middle):
+    def __init__(self):
+        Middle.__init__(self)
+        self.state = {}
+        self.wire_up("child", Child(state=self.state))
+""",
+        encoding="utf-8",
+    )
+
+    _objects, _edges, lineage = _collect_with_registration(tmp_path)
+
+    assert any(
+        edge.src_object_id == "class_state:sample.Child"
+        and edge.dst_object_id == "class_state:sample.Parent"
+        and edge.relation == "state_assign"
+        and edge.slot == "child"
+        for edge in lineage
+    )
+
+
+def test_a_call_shaped_like_a_registration_but_retaining_nothing_records_no_lineage(tmp_path):
+    """Same signature, same shared state, but the child is not retained.
+
+    ``inspect`` takes a name and a child exactly as a registrar would, and the
+    child does hold the parent's state. Nothing keeps the child, so there is no
+    registration and no lineage -- the evidence, not the shape, is what decides.
+    """
+    (tmp_path / "sample.py").write_text(
+        """
+class Child:
+    def __init__(self, state):
+        self.state = state
+
+    def run(self):
+        pass
+
+
+class Parent:
+    def __init__(self):
+        self.state = {}
+        self.children = {}
+        self.inspect("child", Child(state=self.state))
+
+    def inspect(self, name, proc):
+        return proc.run()
+
+    def run(self):
+        for name, proc in self.children.items():
+            proc.run()
+""",
+        encoding="utf-8",
+    )
+
+    _objects, _edges, lineage = _collect_with_registration(tmp_path)
+
+    assert not any(edge.relation == "state_assign" and edge.slot for edge in lineage)
 
 
 def test_unique_passed_object_lineage_rolls_param_state_up_to_producer_for_clustering():

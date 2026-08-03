@@ -532,16 +532,32 @@ def build_structural_graph(
         callee = _text(edge.get("callee"))
         if not caller or not callee:
             continue
+        relation = _text(edge.get("relation"))
+        # Two independent discounts, because they answer different questions.
+        #
+        # ``relation`` is the *kind* of dependency: a registered child is coupled
+        # to its parent differently from a literal call, whether or not either is
+        # certain.
+        #
+        # ``confidence`` is how sure the analyzer is that this call happens at
+        # all, graded by how many targets its call site resolved to. Without it a
+        # receiver with one possible type and a receiver with five both arrived
+        # here as ``inferred_type`` at full weight, and a guess pulled two
+        # unrelated classes into one cluster exactly as hard as a certainty. On
+        # climlab the graded buckets differ by 70x in measured falsification rate.
+        base_weight = weight_config.call_relation_weight(relation)
+        confidence = _text(edge.get("confidence")) or "high"
+        confidence_weight = weight_config.confidence_weight(confidence)
         _add_edge(
             edge_map=edge_map,
             src=_prefixed_callable(caller),
             dst=_prefixed_callable(callee),
             edge_type="call",
-            relation=_text(edge.get("relation")),
-            base_weight=weight_config.call_weight,
-            weight=weight_config.call_weight,
-            confidence="high",
-            confidence_weight=1.0,
+            relation=relation,
+            base_weight=base_weight,
+            weight=base_weight * confidence_weight,
+            confidence=confidence,
+            confidence_weight=confidence_weight,
             file=_text(edge.get("file")),
             lineno=edge.get("lineno"),
         )

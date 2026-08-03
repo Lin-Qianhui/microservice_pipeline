@@ -84,7 +84,11 @@ try:
         _xarray_call_fields,
         _xarray_indexer_fields,
     )
-    from microservice_pipeline.data_access.subprocess_lineage import SubprocessStateLineageMixin
+    from microservice_pipeline.data_access.registration_lineage import (
+        RegisteredStateLineageMixin,
+        _class_attr_state_display,
+        _class_state_display,
+    )
 except ImportError:  # pragma: no cover - supports direct script execution
     from microservice_pipeline.data_access.attrdict import (  # type: ignore
         collect_attrdict_classes,
@@ -146,10 +150,18 @@ except ImportError:  # pragma: no cover - supports direct script execution
         _xarray_call_fields,
         _xarray_indexer_fields,
     )
-    from microservice_pipeline.data_access.subprocess_lineage import SubprocessStateLineageMixin  # type: ignore
+    from microservice_pipeline.data_access.registration_lineage import (
+        RegisteredStateLineageMixin,
+        _class_attr_state_display,
+        _class_state_display,
+    )  # type: ignore
 
 try:
     from microservice_pipeline.call_graph.generate_call_graph_ast import (
+        CallGraphAnalysis,
+        ProjectIndex,
+        RegistrationRule,
+        analyze_analysis_files,
         AnalysisFile,
         CallableDef,
         attach_parents,
@@ -180,6 +192,10 @@ try:
     )
 except ImportError:  # pragma: no cover - supports direct script execution
     from microservice_pipeline.call_graph.generate_call_graph_ast import (  # type: ignore
+        CallGraphAnalysis,
+        ProjectIndex,
+        RegistrationRule,
+        analyze_analysis_files,
         AnalysisFile,
         CallableDef,
         attach_parents,
@@ -225,15 +241,6 @@ def _is_state_object_id(object_id: str) -> bool:
 
 def _is_class_state_object_id(object_id: str) -> bool:
     return object_id.startswith("class_state:") or object_id.startswith("class_attr_state:")
-
-
-def _class_state_display(owner: str) -> str:
-    return f"{owner.rsplit('.', 1)[-1]} state"
-
-
-def _class_attr_state_display(owner: str, attr_name: str) -> str:
-    class_name = owner.rsplit(".", 1)[-1]
-    return f"{class_name}.{attr_name} state"
 
 
 def _confidence_max(a: str, b: str) -> str:
@@ -851,7 +858,7 @@ def collect_module_imports(
     return imports, star_imports
 
 
-class DataAccessCollector(SubprocessStateLineageMixin, ast.NodeVisitor):
+class DataAccessCollector(RegisteredStateLineageMixin, ast.NodeVisitor):
     def __init__(
         self,
         module: str,
@@ -869,6 +876,8 @@ class DataAccessCollector(SubprocessStateLineageMixin, ast.NodeVisitor):
         split_class_owners: Optional[Set[str]] = None,
         pyright_families: Optional[Dict[str, str]] = None,
         attrdict_classes: Optional[Set[str]] = None,
+        registration_rules: Optional[Dict[str, RegistrationRule]] = None,
+        project_index: Optional[ProjectIndex] = None,
     ):
         self.module = module
         self.file = file
@@ -887,6 +896,12 @@ class DataAccessCollector(SubprocessStateLineageMixin, ast.NodeVisitor):
         self.split_class_owners = split_class_owners if split_class_owners is not None else set()
         self.pyright_families = pyright_families if pyright_families is not None else {}
         self.attrdict_classes = attrdict_classes if attrdict_classes is not None else set()
+        # Registration facts derived by the call-graph passes. Both default to
+        # empty so a caller that only wants data access -- the direct
+        # ``collect_data_access`` entry point, and every test using it -- pays
+        # nothing for them; registration lineage is then simply not recorded.
+        self.registration_rules = registration_rules or {}
+        self.project_index = project_index
         self.attrdict_access_paths: Set[str] = set()
         self.known_classes = {
             f"{callable_def.module}.{callable_def.class_name}"
@@ -2043,7 +2058,7 @@ class DataAccessCollector(SubprocessStateLineageMixin, ast.NodeVisitor):
         self._handle_mutating_call(node)
         self._handle_method_receiver_read(node, suppress_receiver_read=labeled_access_recorded)
         self._record_confirmed_param_lineage(node)
-        self._record_subprocess_state_lineage(node)
+        self._record_registered_state_lineage(node)
         known_callees = [
             callable_id
             for callable_id in self._candidate_callable_ids_for_call(node)
@@ -2590,6 +2605,8 @@ def collect_data_access_from_tree(
     lineage_edges: Optional[List[LineageEdge]] = None,
     pyright_families: Optional[Dict[str, str]] = None,
     attrdict_classes: Optional[Set[str]] = None,
+    registration_rules: Optional[Dict[str, RegistrationRule]] = None,
+    project_index: Optional[ProjectIndex] = None,
 ) -> Tuple[Dict[str, DataObject], List[AccessEdge], List[LineageEdge]]:
     attach_parents(tree)
     if callable_map is None:
@@ -2621,6 +2638,8 @@ def collect_data_access_from_tree(
         split_class_owners=split_class_owners,
         pyright_families=pyright_families,
         attrdict_classes=resolved_attrdict_classes,
+        registration_rules=registration_rules,
+        project_index=project_index,
     )
     collector.visit(tree)
     return collector.objects, collector.edges, collector.lineage_edges
@@ -2694,6 +2713,8 @@ def collect_data_access_from_analysis_files(
     project_root: Optional[Path] = None,
     pyright_bin: str = "pyright",
     pyright_families: Optional[Dict[str, str]] = None,
+    registration_rules: Optional[Dict[str, RegistrationRule]] = None,
+    project_index: Optional[ProjectIndex] = None,
 ) -> Tuple[Dict[str, DataObject], List[AccessEdge], List[LineageEdge]]:
     objects: Dict[str, DataObject] = {}
     edges: List[AccessEdge] = []
@@ -2761,6 +2782,8 @@ def collect_data_access_from_analysis_files(
             lineage_edges=module_lineage_edges,
             pyright_families=resolved_pyright_families,
             attrdict_classes=attrdict_classes,
+            registration_rules=registration_rules,
+            project_index=project_index,
         )
         for object_id, data_object in module_objects.items():
             if object_id not in objects:
@@ -2789,6 +2812,8 @@ def collect_data_access(
     project_root: Optional[Path] = None,
     include_globs: Sequence[str] = (),
     exclude_globs: Sequence[str] = (),
+    registration_rules: Optional[Dict[str, RegistrationRule]] = None,
+    project_index: Optional[ProjectIndex] = None,
 ) -> Tuple[Dict[str, DataObject], List[AccessEdge], List[LineageEdge]]:
     analysis_files = list(
         iter_analysis_files(
@@ -2806,6 +2831,8 @@ def collect_data_access(
         project_root=project_root or discover_project_root(src_root),
         pyright_bin=pyright_bin,
         pyright_families=pyright_families,
+        registration_rules=registration_rules,
+        project_index=project_index,
     )
 
 
@@ -2842,7 +2869,13 @@ def run_from_extraction_config(config: ExtractionConfig, *, outdir: Optional[Pat
         include_globs=config.include_globs,
         exclude_globs=config.exclude_globs,
     )
-    callable_map, _module_map, _known_classes = build_indices_from_analysis_files(analysis_files)
+    # The call-graph passes are re-run here rather than read from that stage's
+    # artifacts: registration lineage would otherwise be silently wrong whenever
+    # edges.csv was stale, and neither stage would be runnable on its own.
+    analysis = analyze_analysis_files(
+        analysis_files, summary_packages=config.call_graph.summary_packages
+    )
+    callable_map = analysis.project_nodes()
     pyright_families = _pyright_families_for_config(config, analysis_files)
     objects, edges, lineage_edges = collect_data_access_from_analysis_files(
         analysis_files,
@@ -2850,6 +2883,8 @@ def run_from_extraction_config(config: ExtractionConfig, *, outdir: Optional[Pat
         project_root=config.project_root,
         pyright_bin=config.data_access.pyright.bin,
         pyright_families=pyright_families,
+        registration_rules=analysis.registration_rules,
+        project_index=analysis.project_index,
     )
     output_dir = (outdir or config.data_access.outdir).resolve()
     write_outputs(output_dir, callable_map, objects, edges, lineage_edges)
@@ -2955,11 +2990,18 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     )
     configure_shared_field_containers(shared_config)
 
-    callable_map, _module_map, _known_classes = build_indices(
-        root,
-        module_prefix=args.module_prefix,
-        entrypoints=entrypoints,
+    # Same passes as the config path, so ``--root`` is not quietly a
+    # lesser analysis that drops registration lineage.
+    analysis = analyze_analysis_files(
+        list(
+            iter_analysis_files(
+                root,
+                module_prefix=args.module_prefix,
+                entrypoints=entrypoints,
+            )
+        )
     )
+    callable_map = analysis.project_nodes()
     objects, edges, lineage_edges = collect_data_access(
         src_root=root,
         callable_map=callable_map,
@@ -2967,6 +3009,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         pyright_bin=args.pyright_bin,
         pyright_families={} if args.no_pyright else None,
         entrypoints=entrypoints,
+        registration_rules=analysis.registration_rules,
+        project_index=analysis.project_index,
     )
     write_outputs(outdir, callable_map, objects, edges, lineage_edges)
 

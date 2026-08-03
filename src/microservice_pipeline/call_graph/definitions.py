@@ -48,6 +48,69 @@ STATICMETHOD_DECORATOR_NAMES = {"staticmethod"}
 CLASSMETHOD_DECORATOR_NAMES = {"classmethod"}
 
 
+def class_body_expressions(node: ast.ClassDef) -> List[ast.AST]:
+    """Expressions the ``class`` statement itself evaluates, not the methods.
+
+    A class body is a code object that runs once, when the ``class`` statement
+    executes. Everything it evaluates therefore belongs to the class, not to the
+    method it is written next to -- most importantly a method's decorators and
+    its *default arguments*, which is why ``def __init__(self, axes=make_axis())``
+    calls ``make_axis`` at class-creation time and never again.
+
+    Method bodies are deliberately excluded: those run later, on invocation, in
+    their own scope.
+    """
+    expressions: List[ast.AST] = [*node.decorator_list, *node.bases]
+    expressions += [keyword.value for keyword in node.keywords]
+    for statement in node.body:
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            expressions += signature_expressions(statement)
+        else:
+            expressions.append(statement)
+    return expressions
+
+
+def signature_expressions(
+    node: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> List[ast.AST]:
+    """The parts of a ``def`` evaluated where the ``def`` appears, not inside it.
+
+    Decorators, default arguments, and annotations are all evaluated in the
+    enclosing scope at definition time. Attributing them to the function being
+    defined credits the callee with work its caller did, and disagrees with the
+    interpreter about *when* the code runs.
+    """
+    expressions: List[ast.AST] = [*node.decorator_list, *node.args.defaults]
+    expressions += [default for default in node.args.kw_defaults if default is not None]
+    if node.returns is not None:
+        expressions.append(node.returns)
+    all_args = [
+        *node.args.posonlyargs,
+        *node.args.args,
+        *node.args.kwonlyargs,
+        node.args.vararg,
+        node.args.kwarg,
+    ]
+    expressions += [
+        arg.annotation for arg in all_args if arg is not None and arg.annotation is not None
+    ]
+    return expressions
+
+
+def class_body_evaluates_calls(node: ast.ClassDef) -> bool:
+    """Whether a class body runs any call, i.e. whether it can own an edge.
+
+    Gating the node on this keeps the graph free of isolated class nodes: on
+    climlab only 8 of 77 classes qualify, so the node set grows by 8 rather than
+    77 and nothing degree-based downstream shifts under a crowd of leaves.
+    """
+    return any(
+        isinstance(inner, ast.Call)
+        for expression in class_body_expressions(node)
+        for inner in ast.walk(expression)
+    )
+
+
 class DefinitionCollector(ast.NodeVisitor):
     """First-pass AST visitor that indexes definitions and module-level names.
 
@@ -117,6 +180,21 @@ class DefinitionCollector(ast.NodeVisitor):
             if (base_id := self._resolve_class_reference(base)) is not None
         ]
         self.module_index.class_bases[class_id] = bases
+
+        if class_body_evaluates_calls(node):
+            self.module_index.class_bodies.add(class_id)
+            self.callables.append(
+                CallableDef(
+                    id=class_id,
+                    module=self.module,
+                    qualname=node.name,
+                    file=str(self.file),
+                    lineno=node.lineno,
+                    kind="class_body",
+                    class_name=node.name,
+                )
+            )
+
         prev_class = self.current_class
         self.current_class = node.name
         self.generic_visit(node)
@@ -203,6 +281,40 @@ class DefinitionCollector(ast.NodeVisitor):
                 self.module_index.class_methods.add(next_callable)
 
         self.current_callable = next_callable
+        self.generic_visit(node)
+        self.current_callable = prev_callable
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        """Index a lambda under the name CPython gives its code object.
+
+        ``<enclosing>.<locals>.<lambda>`` is exactly ``co_qualname``, so the
+        runtime tracer and the static pass agree on the ID by construction.
+        CPython does not disambiguate sibling lambdas in one scope, and neither
+        does this: a disambiguator would buy precision at the price of that
+        agreement, and agreement is what the whole comparison rests on.
+        """
+        if self.current_callable is not None:
+            lambda_id = f"{self.current_callable}.<locals>.<lambda>"
+        elif self.current_class:
+            lambda_id = f"{self.module}.{self.current_class}.<locals>.<lambda>"
+        else:
+            lambda_id = f"{self.module}.<lambda>"
+
+        if not any(existing.id == lambda_id for existing in self.callables):
+            self.callables.append(
+                CallableDef(
+                    id=lambda_id,
+                    module=self.module,
+                    qualname=lambda_id[len(self.module) + 1 :],
+                    file=str(self.file),
+                    lineno=node.lineno,
+                    kind="function",
+                    class_name=self.current_class or "",
+                )
+            )
+
+        prev_callable = self.current_callable
+        self.current_callable = lambda_id
         self.generic_visit(node)
         self.current_callable = prev_callable
 
@@ -308,6 +420,41 @@ def add_reexport_class_aliases(
         if not added:
             break
     return added_total
+
+
+def build_callable_aliases(
+    callable_ids: Set[str],
+    module_map: Dict[str, ModuleIndex],
+    max_iterations: int = 10,
+) -> Dict[str, str]:
+    """Map the names a *callable* is re-exported under to where it is defined.
+
+    The exact counterpart of ``add_reexport_class_aliases``, which solved this
+    for classes only. ``from climlab.domain import column_state`` records the
+    target as ``climlab.domain.column_state``, but the function is defined at
+    ``climlab.domain.initial.column_state`` and only the second is a known
+    callable -- so the call resolves to nothing and the edge is dropped.
+
+    Iterates for the same reason: re-exports chain through nested ``__init__``
+    files. A real definition always wins over an alias, which keeps the map
+    monotone and the loop terminating.
+    """
+    aliases: Dict[str, str] = {}
+    for _ in range(max_iterations):
+        added = 0
+        for module, module_index in module_map.items():
+            for name, target in module_index.imports.items():
+                alias = f"{module}.{name}"
+                if alias in callable_ids or alias in aliases:
+                    continue
+                canonical = target if target in callable_ids else aliases.get(target)
+                if canonical is None:
+                    continue
+                aliases[alias] = canonical
+                added += 1
+        if not added:
+            break
+    return aliases
 
 
 def build_indices(

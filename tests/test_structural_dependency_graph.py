@@ -487,3 +487,65 @@ def test_lineage_edges_use_object_identity():
     )
     assert lineage["base_weight"] == 2.0
     assert lineage["weight"] == 2.0
+
+
+def test_call_edge_weight_is_discounted_by_confidence():
+    """Confidence must reach the weight, or recording it is decoration.
+
+    The call branch used to stamp every edge ``confidence="high"`` and then
+    compute ``weight`` without ever multiplying by ``confidence_weight``, unlike
+    the data-access branch. Reading the field but not applying it would leave a
+    guess pulling clusters together exactly as hard as a certainty.
+    """
+    call_graph, data_access = _sample_payloads()
+    call_graph["edges"] = [
+        {
+            "caller": "sample.a",
+            "callee": "sample.b",
+            "file": "sample.py",
+            "lineno": 2,
+            "resolved": True,
+            "relation": "direct",
+            "confidence": "medium",
+        }
+    ]
+
+    graph = build_structural_graph(call_graph, data_access)
+    edge = _edge(
+        graph,
+        src="callable:sample.a",
+        dst="callable:sample.b",
+        edge_type="call",
+        relation="direct",
+    )
+
+    assert edge["confidence"] == "medium"
+    assert edge["confidence_weight"] == pytest.approx(0.65)
+    assert edge["base_weight"] == pytest.approx(1.0)
+    assert edge["weight"] == pytest.approx(0.65)
+
+
+def test_a_call_edge_without_confidence_keeps_its_full_weight():
+    """Older artifacts have no confidence column and must not be penalised."""
+    call_graph, data_access = _sample_payloads()
+    call_graph["edges"] = [
+        {
+            "caller": "sample.a",
+            "callee": "sample.b",
+            "file": "sample.py",
+            "lineno": 2,
+            "resolved": True,
+            "relation": "direct",
+        }
+    ]
+
+    graph = build_structural_graph(call_graph, data_access)
+    edge = _edge(
+        graph,
+        src="callable:sample.a",
+        dst="callable:sample.b",
+        edge_type="call",
+        relation="direct",
+    )
+
+    assert edge["weight"] == pytest.approx(1.0)

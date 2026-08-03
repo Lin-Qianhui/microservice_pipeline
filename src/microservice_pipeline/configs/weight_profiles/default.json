@@ -3,7 +3,14 @@
   "name": "default",
   "generation": {
     "call": {
-      "base_weight": 1.0
+      "base_weight": 1.0,
+      "weights": {
+        "virtual_override": 0.8,
+        "cooperative_super": 0.6,
+        "registered_invoke": 0.6,
+        "dunder_iter": 0.5,
+        "dunder_contains": 0.5
+      }
     },
     "data_access": {
       "weights": {

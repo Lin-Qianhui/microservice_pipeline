@@ -1,10 +1,15 @@
 import warnings
 
 from microservice_pipeline.call_graph.generate_call_graph_ast import (
+    CallGraphHealth,
+    ProjectIndex,
+    build_call_graph_from_analysis_files,
     build_indices,
+    build_registration_rules,
     build_return_summaries,
     build_type_summaries,
     collect_edges,
+    iter_analysis_files,
     iter_python_files,
 )
 
@@ -27,13 +32,14 @@ def _build_call_graph(tmp_path):
         module_map=module_map,
         known_classes=known_classes,
     )
-    param_summaries, class_attr_types = build_type_summaries(
+    summaries = build_type_summaries(
         tmp_path,
         callable_map=nodes,
         module_map=module_map,
         known_classes=known_classes,
         return_summaries=return_summaries,
     )
+    project_index = ProjectIndex(module_map, known_classes, set(nodes.keys()))
     edges = collect_edges(
         tmp_path,
         callable_map=nodes,
@@ -42,8 +48,12 @@ def _build_call_graph(tmp_path):
         include_external=False,
         package_prefix=None,
         return_summaries=return_summaries,
-        param_summaries=param_summaries,
-        class_attr_types=class_attr_types,
+        param_summaries=summaries.params,
+        class_attr_types=summaries.class_attrs,
+        registry_facts=summaries.registry,
+        registration_rules=build_registration_rules(
+            summaries.escapes, summaries.registry, project_index
+        ),
     )
     return nodes, edges
 
@@ -112,7 +122,7 @@ run(config)
         module_prefix="utopia",
         entrypoints=(entrypoint,),
     )
-    param_summaries, class_attr_types = build_type_summaries(
+    summaries = build_type_summaries(
         src,
         callable_map=nodes,
         module_map=module_map,
@@ -131,8 +141,8 @@ run(config)
         module_prefix="utopia",
         entrypoints=(entrypoint,),
         return_summaries=return_summaries,
-        param_summaries=param_summaries,
-        class_attr_types=class_attr_types,
+        param_summaries=summaries.params,
+        class_attr_types=summaries.class_attrs,
     )
 
     assert "docs.run_example.<module>" in nodes
@@ -244,24 +254,32 @@ def run():
     )
 
 
-def test_add_subprocess_synthesizes_compute_edge(tmp_path):
+def test_registering_a_child_couples_the_invoked_hook(tmp_path):
+    """The wiring method's name must not matter -- only what it does with the value.
+
+    ``wire_up`` is deliberately meaningless. What makes this a registration is
+    that its ``proc`` parameter is retained in ``self.slots`` and that elements
+    of ``self.slots`` are later invoked.
+    """
     (tmp_path / "sample.py").write_text(
         """
 class Child:
-    def _compute(self):
+    def run(self):
         pass
 
 
 class Parent:
     def __init__(self):
+        self.slots = {}
         child = Child()
-        self.add_subprocess("child", child)
+        self.wire_up("child", child)
 
-    def _compute(self):
-        pass
+    def wire_up(self, name, proc):
+        self.slots.update({name: proc})
 
-    def add_subprocess(self, name, proc):
-        pass
+    def run(self):
+        for name, proc in self.slots.items():
+            proc.run()
 """,
         encoding="utf-8",
     )
@@ -270,9 +288,407 @@ class Parent:
 
     assert _edge_exists(
         edges,
-        "sample.Parent._compute",
-        "sample.Child._compute",
-        "subprocess_compute",
+        "sample.Parent.run",
+        "sample.Child.run",
+        "registered_invoke",
+    )
+
+
+def test_registration_survives_a_relay_between_two_attributes(tmp_path):
+    """The attribute registered into need not be the one invoked.
+
+    climlab stores children in ``self.subprocess`` but iterates
+    ``self.process_types`` when it runs them, having copied between the two in a
+    third method. Keying the invoke fact on the attribute the child escaped into
+    would find nothing here.
+    """
+    (tmp_path / "sample.py").write_text(
+        """
+class Child:
+    kind = "fast"
+
+    def run(self):
+        pass
+
+
+class Parent:
+    def __init__(self):
+        self.slots = {}
+        self.by_kind = {"fast": [], "slow": []}
+        self.attach("child", Child())
+
+    def attach(self, name, proc):
+        self.slots.update({name: proc})
+
+    def regroup(self):
+        for name, proc in self.slots.items():
+            self.by_kind[proc.kind].append(proc)
+
+    def run(self):
+        for proc in self.by_kind["fast"]:
+            proc.run()
+""",
+        encoding="utf-8",
+    )
+
+    _nodes, edges = _build_call_graph(tmp_path)
+
+    assert _edge_exists(
+        edges,
+        "sample.Parent.run",
+        "sample.Child.run",
+        "registered_invoke",
+    )
+
+
+def test_registration_survives_leaving_through_a_return_value_and_an_argument(tmp_path):
+    """The registry's contents are handed out of the class, then invoked elsewhere.
+
+    This is matplotlib's ``add_artist`` shape. Nothing is stored in a second
+    attribute, so attribute-to-attribute relaying finds nothing: the children
+    leave via ``get_children()``'s return value, get bound to a local, are passed
+    as an argument to a free function, and are only invoked there.
+    """
+    (tmp_path / "sample.py").write_text(
+        """
+class Child:
+    def draw(self):
+        pass
+
+
+def draw_all(items):
+    for item in items:
+        item.draw()
+
+
+class Parent:
+    def __init__(self):
+        self.children = []
+        self.add_child(Child())
+
+    def add_child(self, artist):
+        self.children.append(artist)
+
+    def get_children(self):
+        return [*self.children]
+
+    def draw(self):
+        drawable = self.get_children()
+        draw_all(drawable)
+""",
+        encoding="utf-8",
+    )
+
+    _nodes, edges = _build_call_graph(tmp_path)
+
+    assert _edge_exists(
+        edges, "sample.Parent.draw", "sample.Child.draw", "registered_invoke"
+    )
+
+
+def test_registration_reprojects_through_a_template_method(tmp_path):
+    """A hook shared by both ends is useless, so follow the base's delegation.
+
+    ``run`` is defined only on ``Node`` and overridden by neither concrete class,
+    so linking it would produce an edge from a node to itself. The base hands off
+    to ``self._step()``, which subclasses do override, and that is what carries
+    which process this is.
+    """
+    (tmp_path / "sample.py").write_text(
+        """
+class Node:
+    def __init__(self):
+        self.slots = {}
+
+    def attach(self, name, proc):
+        self.slots.update({name: proc})
+
+    def run(self):
+        for name, proc in self.slots.items():
+            proc.run()
+        self._step()
+
+    def _step(self):
+        pass
+
+
+class Child(Node):
+    def _step(self):
+        pass
+
+
+class Parent(Node):
+    def __init__(self):
+        Node.__init__(self)
+        self.attach("child", Child())
+
+    def _step(self):
+        pass
+""",
+        encoding="utf-8",
+    )
+
+    _nodes, edges = _build_call_graph(tmp_path)
+
+    assert _edge_exists(
+        edges, "sample.Parent._step", "sample.Child._step", "registered_invoke"
+    )
+    assert not _edge_exists(
+        edges, "sample.Node.run", "sample.Node.run", "registered_invoke"
+    )
+
+
+def test_torch_style_module_registration_is_derived(tmp_path):
+    """A different framework shape, with no shared code and no shared names."""
+    (tmp_path / "sample.py").write_text(
+        """
+class Module:
+    def __init__(self):
+        self._modules = {}
+
+    def add_module(self, name, module):
+        self._modules[name] = module
+
+    def forward(self):
+        for name, module in self._modules.items():
+            module.forward()
+
+
+class Linear(Module):
+    def forward(self):
+        pass
+
+
+class Net(Module):
+    def __init__(self):
+        Module.__init__(self)
+        self.add_module("fc", Linear())
+
+    def forward(self):
+        pass
+""",
+        encoding="utf-8",
+    )
+
+    _nodes, edges = _build_call_graph(tmp_path)
+
+    assert _edge_exists(
+        edges, "sample.Net.forward", "sample.Linear.forward", "registered_invoke"
+    )
+
+
+def test_constructor_time_list_registration_is_derived(tmp_path):
+    """``Pipeline(steps=[...])`` registers at construction rather than by a setter."""
+    (tmp_path / "sample.py").write_text(
+        """
+class Scaler:
+    def fit(self):
+        pass
+
+
+class Pipeline:
+    def __init__(self, steps):
+        self.steps = []
+        self.steps.extend(steps)
+
+    def fit(self):
+        for step in self.steps:
+            step.fit()
+
+
+def build():
+    return Pipeline([Scaler()])
+""",
+        encoding="utf-8",
+    )
+
+    _nodes, edges = _build_call_graph(tmp_path)
+
+    assert _edge_exists(
+        edges, "sample.Pipeline.fit", "sample.Scaler.fit", "registered_invoke"
+    )
+
+
+def test_retained_but_never_invoked_state_is_not_registration(tmp_path):
+    """The invoke summary is the gate, and this is what it is gating out.
+
+    ``self.config = config`` retains its parameter exactly as a registration
+    does. Nothing ever calls a method on it, so it is state, not coupling.
+    """
+    (tmp_path / "sample.py").write_text(
+        """
+class Config:
+    def load(self):
+        pass
+
+
+class Service:
+    def __init__(self, config):
+        self.config = config
+
+    def load(self):
+        pass
+
+
+def build():
+    return Service(Config())
+""",
+        encoding="utf-8",
+    )
+
+    _nodes, edges = _build_call_graph(tmp_path)
+
+    assert not any(edge.relation == "registered_invoke" for edge in edges)
+
+
+def test_back_reference_to_a_parent_is_not_registration(tmp_path):
+    """A scalar back-reference points the opposite way from the coupling wanted.
+
+    ``self.parent = parent`` retains the parent and later calls a method on it.
+    Treating it as a registration would emit ``Child.notify -> Parent.notify``,
+    naming the child as the owner of its own owner.
+    """
+    (tmp_path / "sample.py").write_text(
+        """
+class Parent:
+    def notify(self):
+        pass
+
+
+class Child:
+    def __init__(self, parent):
+        self.parent = parent
+
+    def notify(self):
+        self.parent.notify()
+
+
+def build():
+    return Child(Parent())
+""",
+        encoding="utf-8",
+    )
+
+    _nodes, edges = _build_call_graph(tmp_path)
+
+    assert not any(edge.relation == "registered_invoke" for edge in edges)
+
+
+def test_hidden_directory_check_applies_below_the_scan_root(tmp_path):
+    """A tree living under a dot-directory must still be scanned.
+
+    Judging "hidden" on the absolute path makes discovery depend on where the
+    checkout happens to sit -- and silently returns nothing for every
+    ``summary_packages`` entry, since installed packages live under ``.venv``.
+    """
+    root = tmp_path / ".venv" / "lib" / "pkg"
+    root.mkdir(parents=True)
+    (root / "mod.py").write_text("def run():\n    pass\n", encoding="utf-8")
+    hidden = root / ".hidden"
+    hidden.mkdir()
+    (hidden / "skipped.py").write_text("def skipped():\n    pass\n", encoding="utf-8")
+
+    found = {path.name for path in iter_python_files(root)}
+
+    assert found == {"mod.py"}
+
+
+def test_summary_only_package_supplies_rules_without_becoming_graph(tmp_path, monkeypatch):
+    """A framework's registration method is readable without it entering the graph.
+
+    ``add_module`` stores into ``self._modules`` in the framework's own source,
+    which is the only place that fact exists. Reading it is what lets the call in
+    the project become coupling -- but nothing from the framework may appear as a
+    node or an edge, or the graph would describe someone else's code.
+    """
+    framework = tmp_path / "site" / "frameworklib"
+    framework.mkdir(parents=True)
+    (framework / "__init__.py").write_text(
+        """
+class Module:
+    def __init__(self):
+        self._modules = {}
+
+    def add_module(self, name, module):
+        self._modules[name] = module
+
+    def forward(self):
+        for name, module in self._modules.items():
+            module.forward()
+""",
+        encoding="utf-8",
+    )
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    (project / "net.py").write_text(
+        """
+from frameworklib import Module
+
+
+class Linear(Module):
+    def forward(self):
+        pass
+
+
+class Net(Module):
+    def __init__(self):
+        Module.__init__(self)
+        self.add_module("fc", Linear())
+
+    def forward(self):
+        pass
+""",
+        encoding="utf-8",
+    )
+
+    monkeypatch.syspath_prepend(str(tmp_path / "site"))
+    nodes, edges = build_call_graph_from_analysis_files(
+        list(iter_analysis_files(project)),
+        summary_packages=("frameworklib",),
+    )
+
+    assert _edge_exists(
+        edges, "net.Net.forward", "net.Linear.forward", "registered_invoke"
+    )
+    assert not any(node.startswith("frameworklib") for node in nodes)
+    assert not any(
+        edge.caller.startswith("frameworklib") or edge.callee.startswith("frameworklib")
+        for edge in edges
+    )
+
+
+def test_registration_through_a_delegating_wrapper(tmp_path):
+    """The store can be a call away from the method the caller uses."""
+    (tmp_path / "sample.py").write_text(
+        """
+class Child:
+    def run(self):
+        pass
+
+
+class Parent:
+    def __init__(self):
+        self.slots = {}
+        self.attach("child", Child())
+
+    def attach(self, name, proc):
+        self._store(name, proc)
+
+    def _store(self, name, proc):
+        self.slots.update({name: proc})
+
+    def run(self):
+        for name, proc in self.slots.items():
+            proc.run()
+""",
+        encoding="utf-8",
+    )
+
+    _nodes, edges = _build_call_graph(tmp_path)
+
+    assert _edge_exists(
+        edges, "sample.Parent.run", "sample.Child.run", "registered_invoke"
     )
 
 
@@ -319,7 +735,7 @@ def run():
         module_map=module_map,
         known_classes=known_classes,
     )
-    param_summaries, class_attr_types = build_type_summaries(
+    summaries = build_type_summaries(
         tmp_path,
         callable_map=nodes,
         module_map=module_map,
@@ -334,8 +750,8 @@ def run():
         include_external=False,
         package_prefix=None,
         return_summaries=return_summaries,
-        param_summaries=param_summaries,
-        class_attr_types=class_attr_types,
+        param_summaries=summaries.params,
+        class_attr_types=summaries.class_attrs,
     )
 
     assert _edge_exists(
@@ -397,7 +813,7 @@ class Model:
         module_map=module_map,
         known_classes=known_classes,
     )
-    param_summaries, class_attr_types = build_type_summaries(
+    summaries = build_type_summaries(
         tmp_path,
         callable_map=nodes,
         module_map=module_map,
@@ -412,8 +828,8 @@ class Model:
         include_external=False,
         package_prefix=None,
         return_summaries=return_summaries,
-        param_summaries=param_summaries,
-        class_attr_types=class_attr_types,
+        param_summaries=summaries.params,
+        class_attr_types=summaries.class_attrs,
     )
 
     assert _edge_exists(
@@ -1599,6 +2015,232 @@ class Child(Base):
     assert not any(edge.relation == "virtual_override" for edge in edges)
 
 
+def test_function_imported_through_a_package_reexport_resolves(tmp_path):
+    """A callable's re-export path is not where it is defined.
+
+    ``from pkg import helper`` records the target as ``pkg.helper``, but the
+    function is defined at ``pkg.impl.helper``. Only the second is a known
+    callable, so without an alias map the call resolves to nothing and the edge
+    is dropped entirely. ``add_reexport_class_aliases`` has always done this for
+    classes; this is the same fixpoint for callables.
+    """
+    package = tmp_path / "pkg"
+    package.mkdir()
+    (package / "__init__.py").write_text(
+        "from .impl import helper\n", encoding="utf-8"
+    )
+    (package / "impl.py").write_text(
+        """
+def helper():
+    pass
+""",
+        encoding="utf-8",
+    )
+    (tmp_path / "app.py").write_text(
+        """
+from pkg import helper
+
+
+def run():
+    helper()
+""",
+        encoding="utf-8",
+    )
+
+    _nodes, edges = _build_call_graph(tmp_path)
+
+    assert _edge_exists(edges, "app.run", "pkg.impl.helper", "imported")
+
+
+def test_reexport_aliases_chain_through_nested_packages(tmp_path):
+    """Two levels of ``__init__.py`` re-export must still reach the definition."""
+    outer = tmp_path / "outer"
+    inner = outer / "inner"
+    inner.mkdir(parents=True)
+    (outer / "__init__.py").write_text(
+        "from .inner import helper\n", encoding="utf-8"
+    )
+    (inner / "__init__.py").write_text(
+        "from .impl import helper\n", encoding="utf-8"
+    )
+    (inner / "impl.py").write_text(
+        """
+def helper():
+    pass
+""",
+        encoding="utf-8",
+    )
+    (tmp_path / "app.py").write_text(
+        """
+from outer import helper
+
+
+def run():
+    helper()
+""",
+        encoding="utf-8",
+    )
+
+    _nodes, edges = _build_call_graph(tmp_path)
+
+    assert _edge_exists(edges, "app.run", "outer.inner.impl.helper", "imported")
+
+
+def test_computed_default_argument_is_attributed_to_the_class_body(tmp_path):
+    """A default argument runs when the ``class`` statement runs, not on call.
+
+    Python evaluates ``axes=make_axis()`` once, inside the class body's code
+    object, so the interpreter reports the caller as ``Slab`` -- not
+    ``Slab.__init__``, which may never be invoked at all. Attributing it to the
+    method credits the callee with work its definition site did.
+    """
+    (tmp_path / "dom.py").write_text(
+        """
+def make_axis():
+    pass
+
+
+class Slab:
+    def __init__(self, axes=make_axis()):
+        self.axes = axes
+""",
+        encoding="utf-8",
+    )
+
+    _nodes, edges = _build_call_graph(tmp_path)
+
+    assert _edge_exists(edges, "dom.Slab", "dom.make_axis", "direct")
+    assert not _edge_exists(edges, "dom.Slab.__init__", "dom.make_axis", "direct")
+
+
+def test_a_class_body_node_is_never_a_call_target(tmp_path):
+    """Constructing the class must still reach ``__init__``, not the body.
+
+    The class body is a node so that edges can be attributed to it, but Python
+    offers no way to *call* one. If it leaks into the resolution universe,
+    ``Slab(...)`` resolves to the body and the constructor edge disappears.
+    """
+    (tmp_path / "ctor.py").write_text(
+        """
+def make_axis():
+    pass
+
+
+class Slab:
+    def __init__(self, axes=make_axis()):
+        self.axes = axes
+
+
+def build():
+    return Slab()
+""",
+        encoding="utf-8",
+    )
+
+    _nodes, edges = _build_call_graph(tmp_path)
+
+    assert _edge_exists(edges, "ctor.build", "ctor.Slab.__init__", "constructor")
+    assert not _edge_exists(edges, "ctor.build", "ctor.Slab")
+
+
+def test_a_class_without_body_calls_gets_no_node(tmp_path):
+    """Only class bodies that actually run something become nodes.
+
+    Otherwise every class in the project becomes an isolated leaf node, which
+    shifts every degree-based threshold downstream for no information gained.
+    """
+    (tmp_path / "plainc.py").write_text(
+        """
+class Quiet:
+    x = 1
+
+    def go(self):
+        pass
+""",
+        encoding="utf-8",
+    )
+
+    nodes, _edges = _build_call_graph(tmp_path)
+
+    assert "plainc.Quiet.go" in nodes
+    assert "plainc.Quiet" not in nodes
+
+
+def test_decorator_expression_is_attributed_to_the_enclosing_scope(tmp_path):
+    """A decorator expression runs at definition time, where the ``def`` sits.
+
+    Only the *expression* is asserted here. Applying a bare ``@register`` is a
+    call the interpreter makes but the AST has no ``Call`` node for, so it
+    produces no edge either before or after this change.
+    """
+    (tmp_path / "deco.py").write_text(
+        """
+def make_registrar(tag):
+    def register(fn):
+        return fn
+    return register
+
+
+@make_registrar("worker")
+def worker():
+    pass
+
+
+class Holder:
+    @make_registrar("method")
+    def method(self):
+        pass
+""",
+        encoding="utf-8",
+    )
+
+    _nodes, edges = _build_call_graph(tmp_path)
+
+    assert _edge_exists(edges, "deco.<module>", "deco.make_registrar", "direct")
+    assert not _edge_exists(edges, "deco.worker", "deco.make_registrar", "direct")
+    # A method's decorator belongs to the class body, which is where it runs.
+    assert _edge_exists(edges, "deco.Holder", "deco.make_registrar", "direct")
+    assert not _edge_exists(
+        edges, "deco.Holder.method", "deco.make_registrar", "direct"
+    )
+
+
+def test_virtual_override_argument_types_land_in_the_right_parameter(tmp_path):
+    """An argument passed through a subclass override must skip the ``self`` slot.
+
+    ``virtual_override`` arises from ``self.handle(...)`` exactly as
+    ``self_method`` does, so its targets are bound methods whose argument 0 is
+    the first *real* parameter. If the implicit receiver is not accounted for,
+    ``Order`` is filed against ``self`` instead of ``item``, and the
+    ``item.submit()`` below silently resolves to nothing -- a corrupted fact
+    rather than a missing one, which is why this is asserted directly.
+    """
+    (tmp_path / "disp.py").write_text(
+        """
+class Order:
+    def submit(self):
+        pass
+
+
+class Base:
+    def run(self):
+        order = Order()
+        self.handle(order)
+
+
+class Child(Base):
+    def handle(self, item):
+        item.submit()
+""",
+        encoding="utf-8",
+    )
+
+    _nodes, edges = _build_call_graph(tmp_path)
+
+    assert _edge_exists(edges, "disp.Base.run", "disp.Child.handle", "virtual_override")
+    assert _edge_exists(edges, "disp.Child.handle", "disp.Order.submit", "inferred_type")
+
+
 def test_registry_element_types_cross_method_boundaries(tmp_path):
     """Types stored into a container attribute must survive to another method.
 
@@ -1882,3 +2524,532 @@ class Car:
     _nodes, edges = _build_call_graph(tmp_path)
 
     assert _edge_exists(edges, "decl.Car.go", "decl.Engine.start", "inferred_type")
+
+
+def _build_health(tmp_path, *, include_external=False):
+    """Run the real pipeline and return what it could not resolve."""
+    health = CallGraphHealth()
+    analysis_files = list(iter_analysis_files(tmp_path))
+    build_call_graph_from_analysis_files(
+        analysis_files,
+        include_external=include_external,
+        package_prefix=None,
+        health=health,
+    )
+    return health
+
+
+def test_unresolved_calls_are_counted_even_though_they_are_dropped(tmp_path):
+    """The drop must be tallied before the filter that discards it.
+
+    With ``include_external`` off, an unresolved edge never reaches the edge
+    list, so any count taken from the artifact reports zero unresolved calls no
+    matter how many there were. That is a tautology printed as a perfect score.
+    """
+    (tmp_path / "ext.py").write_text(
+        """
+import numpy
+
+
+def run():
+    numpy.array([1, 2, 3])
+""",
+        encoding="utf-8",
+    )
+
+    _nodes, edges = _build_call_graph(tmp_path)
+    health = _build_health(tmp_path)
+
+    # The artifact cannot see the loss...
+    assert all(edge.resolved for edge in edges)
+    # ...but the tally taken at the point of loss can.
+    assert health.dropped_unresolved["imported"] >= 1
+
+
+def test_calling_a_parameter_is_recorded_as_an_inexpressible_callee(tmp_path):
+    """Calling a value is a different failure from failing to look up a name.
+
+    ``func`` resolves perfectly well as a name; the abstract domain is a set of
+    *class* ids and simply has no way to say that a variable holds a function.
+    Counting it beside unresolved ``numpy`` calls would bury the one gap that is
+    a limitation of the lattice rather than of the configuration.
+    """
+    (tmp_path / "crypto.py").write_text(
+        """
+import cryptops
+
+
+class Crypto:
+    def __init__(self, key):
+        self.key = key
+
+    def apply(self, msg, func):
+        return func(self.key, msg)
+
+
+crp = Crypto("secretkey")
+encrypted = crp.apply("hello world", cryptops.encrypt)
+""",
+        encoding="utf-8",
+    )
+
+    health = _build_health(tmp_path)
+
+    assert health.unresolvable_calls["name"] == 1
+    assert sum(health.unresolvable_calls.values()) == 1
+
+
+def test_fanout_is_counted_per_site_not_per_line(tmp_path):
+    """Two independent calls on one line are two sites, not one site of two.
+
+    Nearly a third of real call expressions share a line with another call, so a
+    fan-out histogram derived from ``edges.csv`` measures co-location rather than
+    resolution ambiguity. Counting at the emission point is what keeps the number
+    meaning what it says.
+    """
+    (tmp_path / "fan.py").write_text(
+        """
+def a():
+    pass
+
+
+def b():
+    pass
+
+
+def run():
+    return (a(), b())
+""",
+        encoding="utf-8",
+    )
+
+    health = _build_health(tmp_path)
+
+    assert health.site_fanout[1] == 2
+    assert health.site_fanout[2] == 0
+
+
+def test_a_virtual_dispatch_site_reports_its_real_fanout(tmp_path):
+    """One site with several possible targets must be counted once, at k."""
+    (tmp_path / "poly.py").write_text(
+        """
+class Base:
+    def run(self):
+        self.hook()
+
+    def hook(self):
+        pass
+
+
+class First(Base):
+    def hook(self):
+        pass
+
+
+class Second(Base):
+    def hook(self):
+        pass
+""",
+        encoding="utf-8",
+    )
+
+    health = _build_health(tmp_path)
+
+    # Base.hook plus two overrides, all from the single self.hook() site.
+    assert health.site_fanout[3] == 1
+
+
+def test_super_resolves_by_c3_not_by_unioning_bases(tmp_path):
+    """Python picks one target; unioning the bases invents the others.
+
+    ``Mixed(Left, Right)`` linearizes to ``Mixed, Left, Right, Base``, so
+    ``super().run()`` inside ``Mixed`` reaches ``Left.run`` and nothing else.
+    Walking the lexical bases reports both ``Left.run`` and ``Right.run``, and
+    one of those edges describes a call that never happens.
+    """
+    (tmp_path / "mro.py").write_text(
+        """
+class Base:
+    def run(self):
+        pass
+
+
+class Left(Base):
+    def run(self):
+        super().run()
+
+
+class Right(Base):
+    def run(self):
+        super().run()
+
+
+class Mixed(Left, Right):
+    def run(self):
+        super().run()
+""",
+        encoding="utf-8",
+    )
+
+    _nodes, edges = _build_call_graph(tmp_path)
+
+    supers = [
+        edge
+        for edge in edges
+        if edge.caller == "mro.Mixed.run" and edge.relation == "super_method"
+    ]
+    assert len(supers) == 1
+    assert supers[0].callee == "mro.Left.run"
+
+
+def test_cooperative_super_reaches_a_sibling_through_a_subclass_mro(tmp_path):
+    """``self`` inside ``Left`` need not be a ``Left``.
+
+    When ``Mixed(Left, Right)`` exists, C3 threads ``super()`` inside ``Left``
+    *sideways* into ``Right`` rather than up into ``Base``. No walk of ``Left``'s
+    own bases can see that, and it is a real dispatch the interpreter makes.
+    """
+    (tmp_path / "coop.py").write_text(
+        """
+class Base:
+    def run(self):
+        pass
+
+
+class Left(Base):
+    def run(self):
+        super().run()
+
+
+class Right(Base):
+    def run(self):
+        pass
+
+
+class Mixed(Left, Right):
+    pass
+""",
+        encoding="utf-8",
+    )
+
+    _nodes, edges = _build_call_graph(tmp_path)
+
+    assert _edge_exists(edges, "coop.Left.run", "coop.Right.run", "cooperative_super")
+    # Labelled separately from super_method: which subclass is instantiated is
+    # genuinely unknown, so this is over-approximation and must be weightable.
+    assert _edge_exists(edges, "coop.Left.run", "coop.Base.run", "super_method")
+
+
+def test_explicit_super_argument_selects_the_starting_class(tmp_path):
+    """``super(Other, self)`` starts the search after ``Other``, not the enclosing class."""
+    (tmp_path / "expl.py").write_text(
+        """
+class A:
+    def run(self):
+        pass
+
+
+class B(A):
+    def run(self):
+        pass
+
+
+class C(B):
+    def run(self):
+        super(B, self).run()
+""",
+        encoding="utf-8",
+    )
+
+    _nodes, edges = _build_call_graph(tmp_path)
+
+    assert _edge_exists(edges, "expl.C.run", "expl.A.run", "super_method")
+    assert not _edge_exists(edges, "expl.C.run", "expl.B.run", "super_method")
+
+
+def test_a_cyclic_hierarchy_does_not_abort_the_run(tmp_path):
+    """Linearization must never raise into a pass.
+
+    Alias canonicalization can collapse two classes onto one ID and produce a
+    hierarchy Python would reject. An exception escaping here would lose a whole
+    run's edges over one malformed base list, so it falls back instead.
+    """
+    (tmp_path / "cyc.py").write_text(
+        """
+class A(B):
+    def run(self):
+        super().run()
+
+
+class B(A):
+    def run(self):
+        pass
+""",
+        encoding="utf-8",
+    )
+
+    _nodes, edges = _build_call_graph(tmp_path)
+
+    assert any(edge.caller == "cyc.A.run" for edge in edges)
+
+
+def test_a_certain_call_and_a_guess_are_not_labelled_the_same(tmp_path):
+    """Two edges can share a relation while differing completely in certainty.
+
+    ``a.func()`` has one possible target and is right. ``c.func()`` on a class
+    with several candidate definitions is one guess among them. Before
+    confidence, both arrived downstream as ``inferred_type`` at weight 1.0, and a
+    guess pulled two unrelated classes together exactly as hard as a fact.
+    """
+    (tmp_path / "conf.py").write_text(
+        """
+class Handler:
+    def run(self):
+        pass
+
+
+class Base:
+    def go(self):
+        self.hook()
+
+    def hook(self):
+        pass
+
+
+class One(Base):
+    def hook(self):
+        pass
+
+
+class Two(Base):
+    def hook(self):
+        pass
+
+
+class Three(Base):
+    def hook(self):
+        pass
+
+
+def certain():
+    handler = Handler()
+    handler.run()
+""",
+        encoding="utf-8",
+    )
+
+    _nodes, edges = _build_call_graph(tmp_path)
+
+    certain = [e for e in edges if e.caller == "conf.certain" and e.callee == "conf.Handler.run"]
+    assert len(certain) == 1
+    assert certain[0].confidence == "high"
+
+    # One site, four possible targets: Base.hook plus three overrides.
+    guesses = [e for e in edges if e.caller == "conf.Base.go"]
+    assert len(guesses) == 4
+    assert {e.confidence for e in guesses} == {"medium"}
+
+
+def test_confidence_grades_by_fanout_not_by_relation(tmp_path):
+    """A two-target site stays ``high``: fan-out is not monotone with wrongness.
+
+    Measured on climlab, sites with two targets confirmed as often as or better
+    than sites with one. Demoting everything above a single target would punish
+    a bucket the evidence says is reliable.
+    """
+    (tmp_path / "two.py").write_text(
+        """
+class Base:
+    def go(self):
+        self.hook()
+
+    def hook(self):
+        pass
+
+
+class Only(Base):
+    def hook(self):
+        pass
+""",
+        encoding="utf-8",
+    )
+
+    _nodes, edges = _build_call_graph(tmp_path)
+
+    site = [e for e in edges if e.caller == "two.Base.go"]
+    assert len(site) == 2
+    assert {e.confidence for e in site} == {"high"}
+
+
+def test_a_function_passed_as_an_argument_resolves_inside_the_callee(tmp_path):
+    """The review's picture 1: a value that *is* code.
+
+    ``Crypto.apply`` calls whatever it was handed. The abstract domain was a set
+    of class ids, so there was no way to write down "``func`` holds
+    ``cryptops.encrypt``" -- the fact was not lost through a bug, it was
+    inexpressible, and the edge simply never existed.
+    """
+    (tmp_path / "cryptops.py").write_text(
+        """
+def encrypt(key, msg):
+    pass
+
+
+def decrypt(key, msg):
+    pass
+""",
+        encoding="utf-8",
+    )
+    (tmp_path / "app.py").write_text(
+        """
+import cryptops
+
+
+class Crypto:
+    def __init__(self, key):
+        self.key = key
+
+    def apply(self, msg, func):
+        return func(self.key, msg)
+
+
+crp = Crypto("secretkey")
+encrypted = crp.apply("hello world", cryptops.encrypt)
+decrypted = crp.apply(encrypted, cryptops.decrypt)
+""",
+        encoding="utf-8",
+    )
+
+    _nodes, edges = _build_call_graph(tmp_path)
+
+    assert _edge_exists(
+        edges, "app.Crypto.apply", "cryptops.encrypt", "inferred_callable"
+    )
+    assert _edge_exists(
+        edges, "app.Crypto.apply", "cryptops.decrypt", "inferred_callable"
+    )
+
+
+def test_a_callable_stored_on_self_resolves_when_invoked(tmp_path):
+    """``self.handler = fn`` then ``self.handler()`` -- callback registration."""
+    (tmp_path / "cb.py").write_text(
+        """
+def on_event():
+    pass
+
+
+class Emitter:
+    def __init__(self):
+        self.handler = on_event
+
+    def fire(self):
+        self.handler()
+""",
+        encoding="utf-8",
+    )
+
+    _nodes, edges = _build_call_graph(tmp_path)
+
+    assert _edge_exists(edges, "cb.Emitter.fire", "cb.on_event", "inferred_callable")
+
+
+def test_a_dispatch_table_resolves_its_entries(tmp_path):
+    """``SOLVERS[name]()`` -- the config-driven dispatch idiom."""
+    (tmp_path / "disp.py").write_text(
+        """
+def conjugate_gradient():
+    pass
+
+
+def gauss_seidel():
+    pass
+
+
+SOLVERS = {"cg": conjugate_gradient, "gs": gauss_seidel}
+
+
+def solve(name):
+    solver = SOLVERS[name]
+    return solver()
+""",
+        encoding="utf-8",
+    )
+
+    _nodes, edges = _build_call_graph(tmp_path)
+
+    assert _edge_exists(
+        edges, "disp.solve", "disp.conjugate_gradient", "inferred_callable"
+    )
+    assert _edge_exists(edges, "disp.solve", "disp.gauss_seidel", "inferred_callable")
+
+
+def test_a_functor_resolves_through_dunder_call(tmp_path):
+    """``model(x)`` where ``model`` is an instance, not a function."""
+    (tmp_path / "functor.py").write_text(
+        """
+class Model:
+    def __call__(self, x):
+        pass
+
+
+def run():
+    model = Model()
+    return model(1)
+""",
+        encoding="utf-8",
+    )
+
+    _nodes, edges = _build_call_graph(tmp_path)
+
+    assert _edge_exists(edges, "functor.run", "functor.Model.__call__", "dunder_call")
+
+
+def test_functools_partial_resolves_to_the_wrapped_function(tmp_path):
+    """``partial(f, x)`` evaluates to ``f`` with arguments pre-bound."""
+    (tmp_path / "part.py").write_text(
+        """
+from functools import partial
+
+
+def worker(a, b):
+    pass
+
+
+def run():
+    bound = partial(worker, 1)
+    return bound(2)
+""",
+        encoding="utf-8",
+    )
+
+    _nodes, edges = _build_call_graph(tmp_path)
+
+    assert _edge_exists(edges, "part.run", "part.worker", "inferred_callable")
+
+
+def test_a_lambda_body_is_attributed_to_the_lambda(tmp_path):
+    """A call inside a lambda belongs to the lambda, as the interpreter reports it.
+
+    The ID is CPython's own ``co_qualname`` spelling so the runtime tracer and
+    the static pass keep agreeing by construction.
+    """
+    (tmp_path / "lam.py").write_text(
+        """
+def helper():
+    pass
+
+
+def run():
+    fn = lambda: helper()
+    return fn()
+""",
+        encoding="utf-8",
+    )
+
+    nodes, edges = _build_call_graph(tmp_path)
+
+    assert "lam.run.<locals>.<lambda>" in nodes
+    assert _edge_exists(edges, "lam.run.<locals>.<lambda>", "lam.helper", "direct")
+    assert _edge_exists(
+        edges, "lam.run", "lam.run.<locals>.<lambda>", "inferred_callable"
+    )

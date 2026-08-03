@@ -93,10 +93,17 @@ def iter_python_files(
 
     Hidden directories are always ignored. Include patterns form an allow-list
     when supplied; exclude patterns are then applied as a deny-list.
+
+    "Hidden" is judged *below the scan root*, not on the absolute path. Testing
+    the whole path makes the scan depend on where the tree happens to live: a
+    checkout under ``~/.local/src`` would yield nothing, and a package inside a
+    virtualenv -- which is where ``iter_summary_only_files`` always looks -- would
+    yield nothing every time, since ``.venv`` is itself a hidden directory.
     """
+    root = root.resolve()
     project_root = project_root.resolve() if project_root is not None else infer_project_root(root)
     for path in sorted(root.rglob("*.py")):
-        if any(part.startswith(".") for part in path.parts):
+        if any(part.startswith(".") for part in path.resolve().relative_to(root).parts):
             continue
         if include_globs and not _matches_any(path, include_globs, root, project_root):
             continue
@@ -231,4 +238,48 @@ def iter_analysis_files_for_source_roots(
                 continue
             seen.add(analysis_file.path)
             files.append(analysis_file)
+    return files
+
+
+def iter_summary_only_files(packages: Sequence[str]) -> List[AnalysisFile]:
+    """Locate an installed package's sources, for facts rather than for edges.
+
+    A framework's registration method usually lives in the framework, not in the
+    project using it: ``nn.Module.add_module`` stores into ``self._modules`` in
+    torch's own source. The evidence that makes a call site a registration is
+    therefore unreachable unless that source is read, which is why these files
+    exist as a separate list rather than being folded into the analysis set --
+    everything downstream must be able to tell them apart and exclude them.
+
+    Located by import rather than by path so the version actually installed is
+    the one analyzed. A package that is not installed, or that ships no Python
+    source, is skipped: the graph is then missing rules it might have had, which
+    is a smaller failure than refusing to build one at all.
+    """
+    import importlib.util
+
+    files: List[AnalysisFile] = []
+    seen: Set[Path] = set()
+    for package in packages:
+        try:
+            spec = importlib.util.find_spec(package)
+        except (ImportError, ValueError):
+            continue
+        if spec is None or not spec.submodule_search_locations:
+            continue
+        for location in spec.submodule_search_locations:
+            root = Path(location)
+            if not root.is_dir():
+                continue
+            for path in iter_python_files(root, project_root=root):
+                resolved = path.resolve()
+                if resolved in seen:
+                    continue
+                seen.add(resolved)
+                files.append(
+                    AnalysisFile(
+                        path=resolved,
+                        module=path_to_module(path, root, module_prefix=package),
+                    )
+                )
     return files

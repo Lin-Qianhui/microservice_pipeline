@@ -40,10 +40,10 @@ from .models import FunctionReturnSummary, add_indexed_types
 
 
 # ``FunctionReturnSummary`` fields holding a flat ``Set[str]`` ...
-FLAT_RETURN_FIELDS = frozenset({"class_types", "element_types"})
+FLAT_RETURN_FIELDS = frozenset({"class_types", "element_types", "callable_ids"})
 
 # ... versus those holding ``Dict[int, Set[str]]`` keyed by tuple/list position.
-SLOT_RETURN_FIELDS = frozenset({"slot_types", "slot_element_types"})
+SLOT_RETURN_FIELDS = frozenset({"slot_types", "slot_element_types", "slot_callable_ids"})
 
 
 @dataclass(frozen=True)

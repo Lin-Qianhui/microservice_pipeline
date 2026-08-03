@@ -98,7 +98,8 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -124,6 +125,7 @@ from .discovery import (
     iter_analysis_files,
     iter_analysis_files_for_source_roots,
     iter_python_files,
+    iter_summary_only_files,
     module_callable_id,
     module_for_analysis_file,
     path_to_module,
@@ -133,15 +135,25 @@ from .summary_collectors import ReturnSummaryCollector, TypeSummaryCollector
 from .models import (
     MODULE_CALLABLE_QUALNAME,
     AnalysisFile,
+    CallGraphHealth,
     CallableDef,
     Edge,
+    FunctionEscapeSummary,
     FunctionParamSummary,
     FunctionReturnSummary,
     ModuleIndex,
+    RegistryFacts,
 )
 from .project_index import ProjectIndex
+from .registration import (
+    RegistrationRule,
+    build_registration_rules,
+    registration_child_exprs,
+    registration_slot,
+)
 from .passes import (
     SourceCallResolver,
+    TypeSummaries,
     build_return_summaries,
     build_return_summaries_from_analysis_files,
     build_type_summaries,
@@ -163,9 +175,11 @@ __all__ = [
     "AnalysisFile",
     "CallableDef",
     "Edge",
+    "FunctionEscapeSummary",
     "FunctionParamSummary",
     "FunctionReturnSummary",
     "ModuleIndex",
+    "RegistryFacts",
     "MODULE_CALLABLE_QUALNAME",
     # AST helpers
     "ParsedFileCache",
@@ -178,6 +192,7 @@ __all__ = [
     "iter_analysis_files",
     "iter_analysis_files_for_source_roots",
     "iter_python_files",
+    "iter_summary_only_files",
     "module_callable_id",
     "module_for_analysis_file",
     "path_to_module",
@@ -189,7 +204,13 @@ __all__ = [
     "TypeSummaryCollector",
     # Whole-project facts
     "ProjectIndex",
+    # Registry coupling
+    "RegistrationRule",
+    "build_registration_rules",
+    "registration_child_exprs",
+    "registration_slot",
     # Passes
+    "TypeSummaries",
     "build_indices",
     "build_indices_from_analysis_files",
     "build_return_summaries",
@@ -200,6 +221,8 @@ __all__ = [
     "collect_edges_from_analysis_files",
     "merge_module_index",
     # Orchestration and CLI
+    "CallGraphAnalysis",
+    "analyze_analysis_files",
     "build_call_graph_from_analysis_files",
     "main",
     "parse_args",
@@ -207,27 +230,69 @@ __all__ = [
 ]
 
 
-def build_call_graph_from_analysis_files(
+@dataclass(frozen=True)
+class CallGraphAnalysis:
+    """Everything the analysis passes learn, before any graph is emitted.
+
+    Split out from graph construction because the facts have a second consumer:
+    the data-access stage derives its registration lineage from
+    ``registration_rules``, and needs ``project_index`` to resolve a call onto
+    them. Recomputing here rather than reading an artifact keeps the two stages
+    independently runnable and makes a stale hand-off impossible.
+    """
+    cache: ParsedFileCache
+    nodes: Dict[str, CallableDef]
+    module_map: Dict[str, ModuleIndex]
+    known_classes: Dict[str, str]
+    project_index: ProjectIndex
+    return_summaries: Dict[str, FunctionReturnSummary]
+    summaries: TypeSummaries
+    registration_rules: Dict[str, RegistrationRule]
+    summary_only_modules: Set[str]
+
+    def project_nodes(self) -> Dict[str, CallableDef]:
+        """``nodes`` without the summary-only packages.
+
+        Those definitions are indexed so calls into a framework can resolve, but
+        they belong to someone else's codebase. Anything emitted -- graph nodes,
+        the data-access callable list -- must use this rather than ``nodes``.
+        """
+        if not self.summary_only_modules:
+            return self.nodes
+        return {
+            node_id: node
+            for node_id, node in self.nodes.items()
+            if node.module not in self.summary_only_modules
+        }
+
+
+def analyze_analysis_files(
     analysis_files: Sequence[AnalysisFile],
     *,
-    include_external: bool = False,
-    package_prefix: Optional[str] | Sequence[str] = None,
-) -> Tuple[Dict[str, CallableDef], List[Edge]]:
-    """Run all analysis passes for an already selected set of files.
+    summary_packages: Sequence[str] = (),
+) -> CallGraphAnalysis:
+    """Run every fact-gathering pass over an already selected set of files.
 
     One ``ParsedFileCache`` is shared by every pass, so each file is read and
-    parsed exactly once for the whole run instead of once per pass per loop
-    iteration. The cache is discarded when this function returns.
+    parsed exactly once instead of once per pass per loop iteration.
 
     One ``ProjectIndex`` is shared the same way. It holds the whole-project class
     hierarchy and callable facts, which the definition pass has already settled
     by this point and which no later pass changes -- so building it once here
     replaces one rebuild per collector, of which there is one per file per
     fixpoint iteration.
+
+    ``summary_packages`` names installed third-party packages to read for
+    registry evidence only. Their definitions join the index so a call into them
+    can resolve, but callers must exclude them from anything they emit; the
+    module names are returned for exactly that.
     """
     cache = ParsedFileCache()
+    summary_only_files = list(iter_summary_only_files(summary_packages))
+    every_file = [*analysis_files, *summary_only_files]
+
     nodes, module_map, known_classes = build_indices_from_analysis_files(
-        analysis_files,
+        every_file,
         cache=cache,
     )
     project_index = ProjectIndex(module_map, known_classes, set(nodes.keys()))
@@ -239,7 +304,7 @@ def build_call_graph_from_analysis_files(
         cache=cache,
         project_index=project_index,
     )
-    param_summaries, class_attr_types = build_type_summaries_from_analysis_files(
+    summaries = build_type_summaries_from_analysis_files(
         analysis_files,
         callable_map=nodes,
         module_map=module_map,
@@ -247,25 +312,144 @@ def build_call_graph_from_analysis_files(
         return_summaries=return_summaries,
         cache=cache,
         project_index=project_index,
+        summary_only_files=summary_only_files,
     )
+    return CallGraphAnalysis(
+        cache=cache,
+        nodes=nodes,
+        module_map=module_map,
+        known_classes=known_classes,
+        project_index=project_index,
+        return_summaries=return_summaries,
+        summaries=summaries,
+        registration_rules=build_registration_rules(
+            summaries.escapes, summaries.registry, project_index
+        ),
+        summary_only_modules={analysis.module for analysis in summary_only_files},
+    )
+
+
+def build_call_graph_from_analysis_files(
+    analysis_files: Sequence[AnalysisFile],
+    *,
+    include_external: bool = False,
+    package_prefix: Optional[str] | Sequence[str] = None,
+    summary_packages: Sequence[str] = (),
+    analysis: Optional[CallGraphAnalysis] = None,
+    health: Optional[CallGraphHealth] = None,
+) -> Tuple[Dict[str, CallableDef], List[Edge]]:
+    """Turn the analysis facts into graph nodes and edges.
+
+    ``analysis`` lets a caller that already ran ``analyze_analysis_files`` reuse
+    it rather than pay for the passes twice.
+    """
+    analysis = analysis or analyze_analysis_files(
+        analysis_files, summary_packages=summary_packages
+    )
+    nodes = analysis.nodes
+    summaries = analysis.summaries
+
     edges = collect_edges_from_analysis_files(
         analysis_files,
         callable_map=nodes,
-        module_map=module_map,
-        known_classes=known_classes,
+        module_map=analysis.module_map,
+        known_classes=analysis.known_classes,
         include_external=include_external,
         package_prefix=package_prefix,
-        return_summaries=return_summaries,
-        param_summaries=param_summaries,
-        class_attr_types=class_attr_types,
-        cache=cache,
-        project_index=project_index,
+        return_summaries=analysis.return_summaries,
+        param_summaries=summaries.params,
+        class_attr_types=summaries.class_attrs,
+        cache=analysis.cache,
+        project_index=analysis.project_index,
+        registry_facts=summaries.registry,
+        registration_rules=analysis.registration_rules,
+        health=health,
     )
+    # Definitions from the summary-only packages were indexed so calls into them
+    # could resolve; they are not part of this project and must not appear in the
+    # graph. Edges are filtered as well as nodes: indexing a framework makes
+    # calls into it resolvable that used to be external, and an edge pointing at
+    # a node that does not exist is worse than the unresolved call it replaced.
+    if analysis.summary_only_modules:
+        nodes = analysis.project_nodes()
+        edges = [
+            edge
+            for edge in edges
+            if edge.caller in nodes and (edge.callee in nodes or not edge.resolved)
+        ]
     return nodes, edges
 
 
-def run_from_extraction_config(config: ExtractionConfig, *, outdir: Optional[Path] = None) -> Tuple[int, int, int]:
-    """Build/write a configured graph and return node/edge/resolved counts."""
+# Relations that can only ever name a callable inside the analyzed project. An
+# unresolved edge carrying one of these is a resolver failure on visible code,
+# unlike an unresolved ``imported`` or ``direct``, which is usually just numpy.
+INTRA_PROJECT_RELATIONS = frozenset(
+    {"self_method", "super_method", "virtual_override", "inferred_type"}
+)
+
+
+def summarize_health(health: CallGraphHealth, *, top_n: int = 4) -> List[str]:
+    """Console lines describing what the resolver could not do.
+
+    Replaces ``Edges: N (resolved: N, unresolved: 0)``. That line looked like a
+    perfect score and was a tautology: with ``include_external`` off, an
+    unresolved edge is dropped before it can be counted, so the second number was
+    structurally always zero. These counts are taken where the loss happens.
+
+    Intra-project drops are called out separately from third-party ones because
+    only the first kind is a defect -- an unresolved ``numpy`` call is the
+    configuration working, an unresolved ``self_method`` is the analyzer failing
+    on code it can see.
+    """
+    lines: List[str] = []
+    unresolved = health.dropped_unresolved
+    if unresolved:
+        total = sum(unresolved.values())
+        top = ", ".join(
+            f"{relation} {count}" for relation, count in unresolved.most_common(top_n)
+        )
+        lines.append(f"Unresolved calls dropped: {total} ({top})")
+        internal = {
+            relation: count
+            for relation, count in unresolved.items()
+            if relation in INTRA_PROJECT_RELATIONS
+        }
+        if internal:
+            detail = ", ".join(
+                f"{relation} {count}" for relation, count in sorted(internal.items())
+            )
+            lines.append(
+                f"  of which intra-project (a resolver gap, not third-party): {detail}"
+            )
+    if health.dropped_external:
+        lines.append(
+            f"External calls dropped by package prefix: "
+            f"{sum(health.dropped_external.values())}"
+        )
+    if health.unresolvable_calls:
+        shapes = ", ".join(
+            f"{shape} {count}"
+            for shape, count in health.unresolvable_calls.most_common(top_n)
+        )
+        lines.append(
+            f"Calls with no candidate at all: "
+            f"{sum(health.unresolvable_calls.values())} ({shapes})"
+        )
+    sites = sum(health.site_fanout.values())
+    if sites:
+        ambiguous = sum(count for k, count in health.site_fanout.items() if k > 1)
+        mean = sum(k * n for k, n in health.site_fanout.items()) / sites
+        lines.append(
+            f"Resolved call sites: {sites} "
+            f"({ambiguous} with more than one target, mean fan-out {mean:.2f})"
+        )
+    return lines
+
+
+def run_from_extraction_config(
+    config: ExtractionConfig, *, outdir: Optional[Path] = None
+) -> Tuple[int, int, CallGraphHealth]:
+    """Build/write a configured graph and return node/edge counts plus health."""
     analysis_files = iter_analysis_files_for_source_roots(
         config.source_roots,
         entrypoints=config.entrypoints,
@@ -273,15 +457,17 @@ def run_from_extraction_config(config: ExtractionConfig, *, outdir: Optional[Pat
         include_globs=config.include_globs,
         exclude_globs=config.exclude_globs,
     )
+    health = CallGraphHealth()
     nodes, edges = build_call_graph_from_analysis_files(
         analysis_files,
         include_external=config.call_graph.include_external,
         package_prefix=config.package_prefixes,
+        summary_packages=config.call_graph.summary_packages,
+        health=health,
     )
     output_dir = (outdir or config.call_graph.outdir).resolve()
-    write_outputs(outdir=output_dir, nodes=nodes, edges=edges)
-    resolved_edges = sum(1 for e in edges if e.resolved)
-    return len(nodes), len(edges), resolved_edges
+    write_outputs(outdir=output_dir, nodes=nodes, edges=edges, health=health)
+    return len(nodes), len(edges), health
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
@@ -319,14 +505,16 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     args = parse_args(argv)
     if args.config:
         config = load_extraction_config(args.config)
-        node_count, edge_count, resolved_edges = run_from_extraction_config(
+        node_count, edge_count, health = run_from_extraction_config(
             config,
             outdir=Path(args.outdir).resolve() if args.outdir else None,
         )
         output_dir = Path(args.outdir).resolve() if args.outdir else config.call_graph.outdir
         print(f"Call graph generated in {output_dir}")
         print(f"Nodes: {node_count}")
-        print(f"Edges: {edge_count} (resolved: {resolved_edges}, unresolved: {edge_count - resolved_edges})")
+        print(f"Edges: {edge_count}")
+        for line in summarize_health(health):
+            print(line)
         return
 
     if not args.root:
@@ -345,18 +533,21 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             entrypoints=entrypoints,
         )
     )
+    health = CallGraphHealth()
     nodes, edges = build_call_graph_from_analysis_files(
         analysis_files,
         include_external=args.include_external,
         package_prefix=args.package,
+        health=health,
     )
 
-    write_outputs(outdir=outdir, nodes=nodes, edges=edges)
+    write_outputs(outdir=outdir, nodes=nodes, edges=edges, health=health)
 
-    resolved_edges = sum(1 for e in edges if e.resolved)
     print(f"Call graph generated in {outdir}")
     print(f"Nodes: {len(nodes)}")
-    print(f"Edges: {len(edges)} (resolved: {resolved_edges}, unresolved: {len(edges) - resolved_edges})")
+    print(f"Edges: {len(edges)}")
+    for line in summarize_health(health):
+        print(line)
 
 
 if __name__ == "__main__":

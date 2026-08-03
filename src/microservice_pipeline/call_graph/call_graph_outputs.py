@@ -17,6 +17,12 @@ those objects into CSV rows and JSON, then write the following files:
     One row per caller-to-callee relationship.
 ``call_graph.json``
     Both collections in one document, preserving native JSON booleans.
+``call_graph_health.json``
+    What the resolver could not do: calls dropped as unresolved or external,
+    calls it produced no candidate for at all, and the fan-out of the sites it
+    did resolve. Written only when the caller asks for it. The other files can
+    describe only the edges that exist, which is why a count taken from them
+    can never report a failure.
 
 Rows are sorted before writing. Deterministic output makes generated artifacts
 easy to diff in code review and prevents filesystem traversal order from
@@ -26,7 +32,7 @@ causing unrelated changes.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING, Dict, List
+from typing import TYPE_CHECKING, Dict, List, Optional
 
 try:
     from microservice_pipeline.artifact_io import ensure_dir, write_csv_rows, write_json
@@ -37,7 +43,11 @@ if TYPE_CHECKING:
     # These imports are needed only by static type checkers. Importing them at
     # runtime would create a cycle: the analyzer imports ``write_outputs`` from
     # this module, while this module would import the analyzer's data classes.
-    from microservice_pipeline.call_graph.generate_call_graph_ast import CallableDef, Edge
+    from microservice_pipeline.call_graph.generate_call_graph_ast import (
+        CallableDef,
+        CallGraphHealth,
+        Edge,
+    )
 
 
 # Column order is declared explicitly instead of relying on dictionary order.
@@ -52,7 +62,8 @@ if TYPE_CHECKING:
 #   class (``Order.submit``), and nested functions include ``<locals>``.
 # - ``file``: Path of the Python source file in which the callable is defined.
 # - ``lineno``: One-based source line on which its definition begins.
-# - ``kind``: Definition category: ``module``, ``function``, or ``method``.
+# - ``kind``: Definition category: ``module``, ``function``, ``method``, or
+#   ``class_body`` for a class whose body itself runs code.
 # - ``class_name``: Name of the containing class for a method; empty for
 #   module-level code and functions that do not belong to a class.
 NODE_FIELDS = ["id", "module", "qualname", "file", "lineno", "kind", "class_name"]
@@ -62,12 +73,30 @@ NODE_FIELDS = ["id", "module", "qualname", "file", "lineno", "kind", "class_name
 # - ``callee``: Callable ID (or best inferred external name) being invoked.
 # - ``file``: Path of the source file containing the call expression.
 # - ``lineno``: One-based line on which the call or implicit operation occurs.
+# - ``col_offset``: Zero-based UTF-8 byte column of the same expression, or
+#   ``-1`` when the edge has no single call expression behind it. Line and
+#   column together identify the call *site*; a line alone does not, because
+#   distinct calls routinely share one.
 # - ``resolved``: Whether ``callee`` was matched to a callable indexed from the
 #   analyzed project. CSV encodes this boolean as ``1`` (yes) or ``0`` (no).
+# - ``confidence``: How sure the analyzer is the call really happens --
+#   ``high``, ``medium``, ``low``, or ``unknown``. Graded by how many targets the
+#   call site resolved to, and deliberately separate from ``relation``: two edges
+#   can share a relation while one is the only possibility and the other is one
+#   guess among five.
 # - ``relation``: How the analyzer found the relationship, such as ``direct``,
 #   ``imported``, ``constructor``, ``self_method``, ``property_getter``, or a
 #   ``dunder_*`` relation for an implicit Python operation.
-EDGE_FIELDS = ["caller", "callee", "file", "lineno", "resolved", "relation"]
+EDGE_FIELDS = [
+    "caller",
+    "callee",
+    "file",
+    "lineno",
+    "col_offset",
+    "resolved",
+    "relation",
+    "confidence",
+]
 
 
 def node_rows(nodes: Dict[str, CallableDef]) -> list[dict]:
@@ -103,18 +132,32 @@ def edge_rows(edges: List[Edge]) -> list[dict]:
             "callee": edge.callee,
             "file": edge.file,
             "lineno": edge.lineno,
+            "col_offset": edge.col_offset,
             "resolved": int(edge.resolved),
             "relation": edge.relation,
+            "confidence": edge.confidence,
         }
-        for edge in sorted(edges, key=lambda item: (item.caller, item.callee, item.lineno))
+        for edge in sorted(
+            edges,
+            key=lambda item: (item.caller, item.callee, item.lineno, item.col_offset),
+        )
     ]
 
 
-def write_outputs(outdir: Path, nodes: Dict[str, CallableDef], edges: List[Edge]) -> None:
+def write_outputs(
+    outdir: Path,
+    nodes: Dict[str, CallableDef],
+    edges: List[Edge],
+    health: Optional[CallGraphHealth] = None,
+) -> None:
     """Write all call-graph artifacts beneath ``outdir``.
 
-    The directory is created when needed. Existing files with the three known
-    output names are replaced by the shared artifact-writing helpers.
+    The directory is created when needed. Existing files with the known output
+    names are replaced by the shared artifact-writing helpers.
+
+    ``health`` writes ``call_graph_health.json``, which is the only artifact
+    reporting what the resolver *failed* to do. The other files can only
+    describe edges that exist.
     """
     ensure_dir(outdir)
 
@@ -131,3 +174,6 @@ def write_outputs(outdir: Path, nodes: Dict[str, CallableDef], edges: List[Edge]
             "edges": [edge.__dict__ for edge in sorted(edges, key=lambda item: (item.caller, item.callee, item.lineno))],
         },
     )
+
+    if health is not None:
+        write_json(outdir / "call_graph_health.json", health.as_dict())

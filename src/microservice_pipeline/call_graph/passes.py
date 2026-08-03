@@ -15,6 +15,7 @@ to in-memory snippets such as notebook cells, which have no file on disk.
 from __future__ import annotations
 
 import warnings
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
@@ -25,17 +26,38 @@ from .definitions import DefinitionCollector, merge_module_index
 from .discovery import iter_analysis_files
 from .models import (
     AnalysisFile,
+    CallGraphHealth,
     ClassAttrTypes,
     CallableDef,
     Edge,
+    FunctionEscapeSummary,
     FunctionParamSummary,
     FunctionReturnSummary,
     ModuleIndex,
+    RegistryFacts,
     copy_class_attr_types,
+    copy_escape_summaries,
     copy_param_summaries,
+    copy_registry_facts,
+    resolvable_callable_ids,
 )
 from .project_index import ProjectIndex
+from .registration import RegistrationRule
 from .return_links import ReturnLinkTable, resolve_return_links
+
+
+@dataclass(frozen=True)
+class TypeSummaries:
+    """Everything the type-propagation fixed point learns.
+
+    Grouped rather than returned as a four-tuple because the registry facts
+    joined out of ``escapes`` and ``registry`` travel with the type facts through
+    every caller, and widening the tuple would have meant editing each one.
+    """
+    params: Dict[str, FunctionParamSummary] = field(default_factory=dict)
+    class_attrs: ClassAttrTypes = field(default_factory=ClassAttrTypes)
+    escapes: Dict[str, FunctionEscapeSummary] = field(default_factory=dict)
+    registry: RegistryFacts = field(default_factory=RegistryFacts)
 
 
 def build_return_summaries_from_analysis_files(
@@ -66,7 +88,7 @@ def build_return_summaries_from_analysis_files(
     cache = cache if cache is not None else ParsedFileCache()
     summaries: Dict[str, FunctionReturnSummary] = {}
     links = ReturnLinkTable()
-    callable_ids = set(callable_map.keys())
+    callable_ids = resolvable_callable_ids(callable_map)
     project_index = project_index or ProjectIndex(
         module_map, known_classes, callable_ids
     )
@@ -149,21 +171,34 @@ def build_type_summaries_from_analysis_files(
     *,
     cache: Optional[ParsedFileCache] = None,
     project_index: Optional[ProjectIndex] = None,
-) -> Tuple[Dict[str, FunctionParamSummary], ClassAttrTypes]:
-    """Propagate parameter and class-attribute types until facts stabilize."""
+    summary_only_files: Sequence[AnalysisFile] = (),
+) -> TypeSummaries:
+    """Propagate parameter and class-attribute types until facts stabilize.
+
+    ``summary_only_files`` are read for their facts and nothing else. A framework
+    installed as a third-party package defines the method that registers a child
+    -- ``nn.Module.add_module`` and friends -- so without reading it the escape
+    that makes a call site a registration is invisible, and generalising past
+    codebases that define their own wiring method would be impossible. Those
+    files never reach edge collection, so no external callable can become a node.
+    """
     cache = cache if cache is not None else ParsedFileCache()
-    param_summaries: Dict[str, FunctionParamSummary] = {}
-    class_attr_types = ClassAttrTypes()
-    callable_ids = set(callable_map.keys())
+    summaries = TypeSummaries()
+    callable_ids = resolvable_callable_ids(callable_map)
     project_index = project_index or ProjectIndex(
         module_map, known_classes, callable_ids
     )
+    every_file = [*analysis_files, *summary_only_files]
 
     for _ in range(max_iterations):
-        next_param_summaries = copy_param_summaries(param_summaries)
-        next_class_attr_types = copy_class_attr_types(class_attr_types)
+        pending = TypeSummaries(
+            params=copy_param_summaries(summaries.params),
+            class_attrs=copy_class_attr_types(summaries.class_attrs),
+            escapes=copy_escape_summaries(summaries.escapes),
+            registry=copy_registry_facts(summaries.registry),
+        )
 
-        for analysis_file in analysis_files:
+        for analysis_file in every_file:
             py_file = analysis_file.path
             module = analysis_file.module
             tree = cache.get(py_file)
@@ -175,19 +210,17 @@ def build_type_summaries_from_analysis_files(
                 module_map=module_map,
                 known_classes=known_classes,
                 return_summaries=return_summaries,
-                param_summaries=next_param_summaries,
-                class_attr_types=next_class_attr_types,
+                param_summaries=pending.params,
+                class_attr_types=pending.class_attrs,
                 project_index=project_index,
+                escape_summaries=pending.escapes,
+                registry_facts=pending.registry,
             )
             collector.visit(tree)
 
-        if (
-            next_param_summaries == param_summaries
-            and next_class_attr_types == class_attr_types
-        ):
+        if pending == summaries:
             break
-        param_summaries = next_param_summaries
-        class_attr_types = next_class_attr_types
+        summaries = pending
     else:
         # As above: report a truncated result rather than passing it off as a
         # settled one.
@@ -197,7 +230,7 @@ def build_type_summaries_from_analysis_files(
             stacklevel=2,
         )
 
-    return param_summaries, class_attr_types
+    return summaries
 
 
 def build_type_summaries(
@@ -212,7 +245,7 @@ def build_type_summaries(
     include_globs: Sequence[str] = (),
     exclude_globs: Sequence[str] = (),
     max_iterations: int = 5,
-) -> Tuple[Dict[str, FunctionParamSummary], ClassAttrTypes]:
+) -> TypeSummaries:
     return build_type_summaries_from_analysis_files(
         list(
             iter_analysis_files(
@@ -245,11 +278,19 @@ def collect_edges_from_analysis_files(
     *,
     cache: Optional[ParsedFileCache] = None,
     project_index: Optional[ProjectIndex] = None,
+    registry_facts: Optional[RegistryFacts] = None,
+    registration_rules: Optional[Dict[str, RegistrationRule]] = None,
+    health: Optional[CallGraphHealth] = None,
 ) -> List[Edge]:
-    """Run the final, fully informed edge-collection pass over every file."""
+    """Run the final, fully informed edge-collection pass over every file.
+
+    ``health`` is an optional accumulator rather than a second return value so
+    the many existing callers keep working unchanged; pass one to learn what the
+    pass could not resolve as well as what it could.
+    """
     cache = cache if cache is not None else ParsedFileCache()
     edges: List[Edge] = []
-    callable_ids = set(callable_map.keys())
+    callable_ids = resolvable_callable_ids(callable_map)
     project_index = project_index or ProjectIndex(
         module_map, known_classes, callable_ids
     )
@@ -271,9 +312,13 @@ def collect_edges_from_analysis_files(
             param_summaries=param_summaries,
             class_attr_types=class_attr_types,
             project_index=project_index,
+            registry_facts=registry_facts,
+            registration_rules=registration_rules,
         )
         collector.visit(tree)
         edges.extend(collector.edges)
+        if health is not None:
+            health.merge(collector.health)
 
     return edges
 
@@ -293,6 +338,8 @@ def collect_edges(
     return_summaries: Optional[Dict[str, FunctionReturnSummary]] = None,
     param_summaries: Optional[Dict[str, FunctionParamSummary]] = None,
     class_attr_types: Optional[ClassAttrTypes] = None,
+    registry_facts: Optional[RegistryFacts] = None,
+    registration_rules: Optional[Dict[str, RegistrationRule]] = None,
 ) -> List[Edge]:
     return collect_edges_from_analysis_files(
         list(
@@ -313,6 +360,8 @@ def collect_edges(
         return_summaries=return_summaries,
         param_summaries=param_summaries,
         class_attr_types=class_attr_types,
+        registry_facts=registry_facts,
+        registration_rules=registration_rules,
     )
 
 
@@ -347,7 +396,7 @@ class SourceCallResolver:
             module=module,
             file=file,
             module_index=self.module_index,
-            callable_ids=set(callable_map.keys()),
+            callable_ids=resolvable_callable_ids(callable_map),
             module_map=self.module_map,
             known_classes=known_classes,
             include_external=include_external,

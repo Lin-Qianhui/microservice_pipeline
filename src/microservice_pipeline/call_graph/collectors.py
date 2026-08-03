@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Dict, Generator, Iterable, List, Optional, Sequence, Set, Tuple
 
 from .ast_utils import attribute_to_name, unwrap_passthrough
+from .definitions import class_body_expressions, signature_expressions
 from .discovery import module_callable_id
 from .dunders import (
     AUGASSIGN_DUNDER_METHODS,
@@ -35,14 +36,66 @@ from .dunders import (
 )
 from .project_index import ProjectIndex, unique
 from .return_links import ReturnLink, ReturnLinkTable
-from .type_env import TypeEnv, TypeState, VarSource
+from .type_env import (
+    Origin,
+    TypeEnv,
+    TypeState,
+    VarSource,
+    attr_container_origin,
+    attr_element_origin,
+    param_element_origin,
+    param_origin,
+)
 from .models import (
+    CONFIDENCE_HIGH,
+    CONFIDENCE_UNKNOWN,
+    NO_SOURCE_SITE,
+    CallGraphHealth,
+    ClassAttr,
     ClassAttrTypes,
     Edge,
+    FunctionEscapeSummary,
     FunctionParamSummary,
     FunctionReturnSummary,
     ModuleIndex,
+    RegistryFacts,
+    confidence_for_fanout,
+    keyword_only_param_key,
+    param_key,
 )
+from .registration import RegistrationRule, registration_child_exprs
+
+
+# ``functools.partial(f, ...)`` evaluates to ``f`` with arguments pre-bound, so
+# calling the result calls ``f``. Matched by source-level name, like the
+# decorator names in ``definitions``, because importing to check would execute
+# the analyzed project.
+_PARTIAL_NAMES = frozenset({"partial", "functools.partial"})
+
+# Element callables are keyed under the variable's name plus this suffix in the
+# same scope map. A separate stack for one level of nesting would double the
+# scope machinery for a dimension that is only ever read here, and the suffix
+# cannot collide with a Python identifier.
+_ELEMENT_SUFFIX = "[]"
+
+
+def _callee_shape(func: ast.AST) -> str:
+    """The syntactic form of a callee, for bucketing calls nothing resolved.
+
+    Names the *shape* rather than the expression so the counts say which
+    language feature is costing edges: ``call_result`` is a higher-order return,
+    ``subscript`` a dispatch table, ``lambda`` an inline function.
+    """
+    shapes = {
+        ast.Name: "name",
+        ast.Attribute: "attribute",
+        ast.Call: "call_result",
+        ast.Subscript: "subscript",
+        ast.Lambda: "lambda",
+        ast.IfExp: "conditional",
+        ast.BoolOp: "boolean",
+    }
+    return shapes.get(type(func), type(func).__name__.lower())
 
 try:
     from microservice_pipeline.import_resolution import (
@@ -50,19 +103,11 @@ try:
         resolve_import_from_module,
         resolve_import_from_target,
     )
-    from microservice_pipeline.subprocess_coupling import (
-        add_subprocess_child_expr,
-        is_add_subprocess_call,
-    )
 except ImportError:  # pragma: no cover - supports direct script execution
     from import_resolution import (  # type: ignore
         is_package_file,
         resolve_import_from_module,
         resolve_import_from_target,
-    )
-    from subprocess_coupling import (  # type: ignore
-        add_subprocess_child_expr,
-        is_add_subprocess_call,
     )
 
 
@@ -92,6 +137,9 @@ class CallCollector(ast.NodeVisitor):
         class_attr_types: Optional[ClassAttrTypes] = None,
         return_links: Optional[ReturnLinkTable] = None,
         project_index: Optional[ProjectIndex] = None,
+        escape_summaries: Optional[Dict[str, FunctionEscapeSummary]] = None,
+        registry_facts: Optional[RegistryFacts] = None,
+        registration_rules: Optional[Dict[str, RegistrationRule]] = None,
     ):
         self.module = module
         self.file = file
@@ -108,6 +156,20 @@ class CallCollector(ast.NodeVisitor):
         self.class_attr_types = (
             class_attr_types if class_attr_types is not None else ClassAttrTypes()
         )
+        # Registry evidence, held by reference like the summaries above so the
+        # pass driver decides when a fact becomes visible. Only
+        # ``TypeSummaryCollector`` writes to these; every collector reads them,
+        # since re-projection needs the delegation facts during the edge pass.
+        self.escape_summaries = (
+            escape_summaries if escape_summaries is not None else {}
+        )
+        self.registry_facts = (
+            registry_facts if registry_facts is not None else RegistryFacts()
+        )
+        # Populated only for the final edge pass, once escape and invoke facts
+        # have been joined. Empty everywhere else, which is what keeps the
+        # summary passes from emitting edges.
+        self.registration_rules = registration_rules or {}
         # Whole-project class facts. Shared across every file and every pass of a
         # run when the caller supplies one; built here only for callers that have
         # no run to share (tests, one-off use).
@@ -126,9 +188,15 @@ class CallCollector(ast.NodeVisitor):
 
         self.current_callable: Optional[str] = None
         self.current_class: Optional[str] = None
+        # Lexical *function* nesting, which is what decides a nested callable's
+        # ID. Tracked apart from ``current_callable`` because a class body is a
+        # callable that edges are attributed to but that never prefixes the name
+        # of a method defined inside it -- ``C.method``, never ``C.<locals>.method``.
+        self.enclosing_function: Optional[str] = None
         self.callable_stack: List[str] = []
         self.types = TypeEnv()
         self.edges: List[Edge] = []
+        self.health = CallGraphHealth()
 
     @contextmanager
     def _recording_return_links(
@@ -395,6 +463,202 @@ class CallCollector(ast.NodeVisitor):
         for base_type in self._attribute_owner_types(container):
             self.class_attr_types.add_element_types((base_type, container.attr), values)
 
+    # -- value origins ---------------------------------------------------------
+    #
+    # Tracking which *value* a name currently holds, as opposed to which type.
+    # A registration is an identity fact -- "the thing you passed is the thing
+    # that got stored" -- and types cannot express it: two unrelated parameters
+    # of the same class are indistinguishable by type and completely different
+    # by identity. Only ``TypeSummaryCollector`` turns the resulting facts into
+    # summaries; the others compute origins and discard them, which costs a few
+    # dictionary lookups and keeps one implementation of the store shapes.
+
+    records_registry_facts = False
+
+    def set_var_origins(self, var: str, origins: Set[Origin]) -> None:
+        self.types.set_var_origins(var, origins)
+
+    def get_var_origins(self, var: str) -> Set[Origin]:
+        return self.types.get_var_origins(var)
+
+    def _self_attr_keys(self, target: ast.AST) -> Set[ClassAttr]:
+        """The ``(class, attribute)`` pairs an attribute expression names."""
+        if not isinstance(target, ast.Attribute):
+            return set()
+        return {
+            (owner, target.attr) for owner in self._attribute_owner_types(target)
+        }
+
+    def _value_origins(self, value: ast.AST) -> Set[Origin]:
+        """Where the value of an expression came from.
+
+        Only the forms that can carry a value through unchanged are followed. An
+        arbitrary call or a computed expression produces a new value, so it has
+        no origin and correctly stops the propagation.
+        """
+        value = unwrap_passthrough(value)
+        if isinstance(value, ast.Name):
+            return self.get_var_origins(value.id)
+        if isinstance(value, ast.Starred):
+            return self._value_origins(value.value)
+        # ``x if flag else y`` yields one of its arms, so it carries both.
+        if isinstance(value, ast.IfExp):
+            return self._value_origins(value.body) | self._value_origins(value.orelse)
+        # ``artists = self.get_children()`` -- an ordinary call, but one already
+        # known to hand back the contents of an attribute. The value is the
+        # collection, so it carries a container origin rather than an element
+        # one; iterating it later is what recovers the elements.
+        if isinstance(value, ast.Call):
+            return {
+                attr_container_origin(key)
+                for key in self._returned_attrs_for_call(value)
+            }
+        return set()
+
+    def _returned_attrs_for_call(self, value: ast.Call) -> Set[ClassAttr]:
+        """Attributes whose contents a call is known to give back."""
+        if not self.registry_facts.returned_attrs:
+            return set()
+        attrs: Set[ClassAttr] = set()
+        for callee, _relation, is_resolved in self._resolve_callees(value.func):
+            if is_resolved:
+                attrs |= self.registry_facts.returned_attrs.get(callee, set())
+        return attrs
+
+    def _element_origins(self, value: ast.AST) -> Set[Origin]:
+        """Where the *elements* of an expression came from.
+
+        Three shapes matter. A literal collection holds whatever was written into
+        it -- and for a dict that means the values, since the keys are labels;
+        this is what makes ``self.children.update({name: child})`` a registration.
+        Reading an attribute yields elements belonging to that attribute, which
+        is how a value relayed from one registry into another stays traceable.
+        A parameter yields elements *of* that parameter, which is the
+        ``Pipeline(steps=[...])`` shape where the children arrive in bulk.
+        """
+        value = unwrap_passthrough(value)
+
+        if isinstance(value, ast.Dict):
+            origins: Set[Origin] = set()
+            for item in value.values:
+                origins |= self._value_origins(item)
+            return origins
+        if isinstance(value, (ast.List, ast.Set, ast.Tuple)):
+            origins = set()
+            for item in value.elts:
+                # ``[*self._children, *self.spines.values()]`` splices two
+                # collections in, so this literal's elements are *their*
+                # elements. Taking the starred expression as one item would
+                # lose every registry a framework merges on the way out.
+                if isinstance(item, ast.Starred):
+                    origins |= self._element_origins(item.value)
+                else:
+                    origins |= self._value_origins(item)
+            return origins
+
+        # ``self.registry``, ``self.registry[key]``, ``self.registry.values()``
+        # and ``self.registry.items()`` all read out of the same attribute. The
+        # subscript and the accessor call are peeled off because what matters is
+        # which attribute the elements belong to, not the shape of the read.
+        if isinstance(value, ast.Call) and isinstance(value.func, ast.Attribute):
+            if value.func.attr in {"values", "items", "keys"}:
+                value = value.func.value
+        if isinstance(value, ast.Subscript):
+            value = value.value
+
+        origins = {attr_element_origin(key) for key in self._self_attr_keys(value)}
+        for kind, payload in self._value_origins(value):
+            if kind == "param":
+                origins.add(param_element_origin(payload))
+            # Taking an item out of a collection that came from an attribute is
+            # taking an item out of that attribute. This is the hop that lets a
+            # registry survive being handed out of the class that owns it.
+            elif kind == "attr_container":
+                origins.add(attr_element_origin(payload))
+        return origins
+
+    def _note_attribute_store(
+        self,
+        container: ast.AST,
+        origins: Set[Origin],
+        *,
+        is_container: bool,
+        key: Optional[ast.AST] = None,
+    ) -> None:
+        """Record that values with these origins were stored on an attribute.
+
+        A parameter landing here is an escape -- the caller's value is retained.
+        An element of another attribute landing here is a relay between two
+        registries, which is what lets the attribute registered into differ from
+        the one invoked.
+
+        ``key`` is the expression a keyed store filed the value under. When it is
+        itself a parameter, the caller named this relationship and that name is
+        worth keeping; see ``FunctionEscapeSummary.key_params``.
+        """
+        if not self.records_registry_facts or not origins:
+            return
+        targets = self._self_attr_keys(container)
+        if not targets:
+            return
+
+        slots = {(attr, is_container) for _, attr in targets}
+        for kind, payload in origins:
+            if kind in {"param", "param_element"}:
+                if self.current_callable is None:
+                    continue
+                summary = self.escape_summaries.setdefault(
+                    self.current_callable, FunctionEscapeSummary()
+                )
+                if kind == "param":
+                    summary.add(payload, slots)
+                else:
+                    summary.add_element(payload, slots)
+                self._note_key_param(key)
+            elif kind == "attr_element" and is_container:
+                for target in targets:
+                    self.registry_facts.add_element_flow(payload, target)
+
+    def _note_key_param(self, key: Optional[ast.AST]) -> None:
+        if key is None or self.current_callable is None:
+            return
+        for kind, payload in self._value_origins(key):
+            if kind == "param":
+                self.escape_summaries.setdefault(
+                    self.current_callable, FunctionEscapeSummary()
+                ).add_key_param(payload)
+
+    def _note_receiver_invocation(self, func: ast.AST) -> None:
+        """Record a method called on a value read out of a registry attribute.
+
+        This is the evidence that a registry is *executed* rather than merely
+        held, and it is what stops every ``self.config = config`` from looking
+        like a registration.
+        """
+        if not self.records_registry_facts or not isinstance(func, ast.Attribute):
+            return
+        if self.current_callable is None:
+            return
+
+        if isinstance(func.value, ast.Name):
+            origins = self.get_var_origins(func.value.id)
+        else:
+            origins = set()
+        for kind, payload in origins:
+            if kind == "attr_element":
+                self.registry_facts.add_invocation(
+                    payload, func.attr, self.current_callable
+                )
+
+        # ``self.hook()`` is what a template method does; the re-projection in
+        # ``_registration_hook`` needs to know which hooks a base delegates to.
+        if (
+            isinstance(func.value, ast.Name)
+            and func.value.id in {"self", "cls"}
+            and self.current_class
+        ):
+            self.registry_facts.add_self_delegation(self.current_callable, func.attr)
+
     def current_class_id(self) -> Optional[str]:
         if self.current_class:
             return f"{self.module}.{self.current_class}"
@@ -441,23 +705,46 @@ class CallCollector(ast.NodeVisitor):
         )
 
     def _add_edge(
-        self, callee: str, relation: str, is_resolved: bool, lineno: int
+        self,
+        callee: str,
+        relation: str,
+        is_resolved: bool,
+        lineno: int,
+        col_offset: int = NO_SOURCE_SITE,
+        confidence: str = CONFIDENCE_HIGH,
     ) -> None:
-        """Append an edge after applying unresolved/external filtering policy."""
+        """Append an edge after applying unresolved/external filtering policy.
+
+        ``col_offset`` completes the source *site*, which a line alone does not
+        identify -- on climlab 30% of call expressions share a line with another
+        call. It stays ``NO_SOURCE_SITE`` for edges whose position is not a call
+        the interpreter makes at that spot, so they can be excluded from any
+        site-level comparison instead of being matched against the wrong call.
+        """
         if self.current_callable is None:
+            self.health.dropped_no_caller += 1
             return
+        # Tallied *before* the filter that drops it. Counting only what survives
+        # is what made "unresolved: 0" a tautology rather than a measurement:
+        # with include_external off, an unresolved edge cannot reach the list, so
+        # the reported unresolved count was structurally always zero.
         if not is_resolved and not self.include_external:
+            self.health.dropped_unresolved[relation] += 1
             return
         if is_resolved and not self._is_internal_callee(callee):
+            self.health.dropped_external[relation] += 1
             return
+        self.health.emitted[relation] += 1
         self.edges.append(
             Edge(
                 caller=self.current_callable,
                 callee=callee,
                 file=str(self.file),
                 lineno=lineno,
+                col_offset=col_offset,
                 resolved=is_resolved,
                 relation=relation,
+                confidence=confidence if is_resolved else CONFIDENCE_UNKNOWN,
             )
         )
 
@@ -497,20 +784,42 @@ class CallCollector(ast.NodeVisitor):
             return 1
         if relation == "class_method":
             return 1 if callee in self.project_index.class_method_ids else 0
-        if relation in {"self_method", "super_method", "inferred_type"}:
+        # ``virtual_override`` belongs here for the same reason ``self_method``
+        # does: both arise from ``self.hook(...)`` and both name a bound method of
+        # a known class, so argument 0 is the first *real* parameter. Omitting it
+        # does not drop the fact, it files it one slot early -- argument 0's type
+        # lands in the ``self`` slot of ``positional_types`` and is read back by
+        # ``_seed_param_types``. Worse for the registry passes, which restrict
+        # themselves to ``self``/``cls`` calls and so see little else.
+        if relation in {
+            "self_method",
+            "super_method",
+            "inferred_type",
+            "virtual_override",
+        }:
             if self._callable_belongs_to_known_class(callee):
                 return 1
         return 0
 
     def _add_dunder_edges(
-        self, receiver: ast.AST, method_name: str, relation: str, lineno: int
+        self,
+        receiver: ast.AST,
+        method_name: str,
+        relation: str,
+        lineno: int,
+        col_offset: int = NO_SOURCE_SITE,
+        confidence: str = CONFIDENCE_HIGH,
     ) -> None:
-        for callee, edge_relation, is_resolved in self._resolve_method_callees_for_expr(
-            receiver, method_name, relation
-        ):
-            self._add_edge(callee, edge_relation, is_resolved, lineno)
+        results = self._resolve_method_callees_for_expr(receiver, method_name, relation)
+        confidence = confidence_for_fanout(sum(1 for result in results if result[2]))
+        for callee, edge_relation, is_resolved in results:
+            self._add_edge(
+                callee, edge_relation, is_resolved, lineno, col_offset, confidence
+            )
 
-    def _add_membership_edges(self, container: ast.AST, lineno: int) -> None:
+    def _add_membership_edges(
+        self, container: ast.AST, lineno: int, col_offset: int = NO_SOURCE_SITE
+    ) -> None:
         """Model ``x in container`` as ``__contains__`` or iteration fallback."""
         targets: List[Tuple[str, str, bool]] = []
         for receiver_type in sorted(self._receiver_types_for_expr(container)):
@@ -532,10 +841,30 @@ class CallCollector(ast.NodeVisitor):
                     (f"{receiver_type}.__contains__", "dunder_contains", False)
                 )
 
-        for callee, relation, is_resolved in self._unique_callee_results(targets):
-            self._add_edge(callee, relation, is_resolved, lineno)
+        results = self._unique_callee_results(targets)
+        confidence = confidence_for_fanout(sum(1 for result in results if result[2]))
+        for callee, relation, is_resolved in results:
+            self._add_edge(
+                callee, relation, is_resolved, lineno, col_offset, confidence
+            )
 
-    def _subprocess_parent_types(self, receiver: ast.AST) -> Set[str]:
+    def _registration_parent_types(
+        self, node: ast.Call, callee: str, relation: str
+    ) -> Set[str]:
+        """Which object this call registers a child *into*.
+
+        Usually the receiver: ``parent.attach(child)``. For a constructor it is
+        the class being built, since ``Pipeline(steps=[...])`` registers into the
+        instance the call is producing and there is no receiver expression to
+        read it from.
+        """
+        if relation == "constructor":
+            owner = callee.rsplit(".", 1)[0]
+            return {owner} if self._is_known_class(owner) else set()
+
+        if not isinstance(node.func, ast.Attribute):
+            return set()
+        receiver = node.func.value
         if (
             isinstance(receiver, ast.Name)
             and receiver.id in {"self", "cls"}
@@ -545,48 +874,122 @@ class CallCollector(ast.NodeVisitor):
             return {class_id} if class_id else set()
         return self._receiver_types_for_expr(receiver)
 
-    def _subprocess_child_types(self, child_expr: ast.AST) -> Set[str]:
+    def _registration_child_types(self, child_expr: ast.AST) -> Set[str]:
         if isinstance(child_expr, ast.Call):
             return self._infer_class_types_from_call(child_expr)
         if isinstance(child_expr, (ast.Name, ast.Attribute)):
             return self.get_expr_types(child_expr)
         return set()
 
-    def _add_subprocess_compute_edge(self, node: ast.Call) -> None:
-        """Add the framework-specific parent/child ``_compute`` dependency.
+    def _registration_hook(self, parent_type: str, child_type: str, method: str) -> str:
+        """Pick the method to link, re-projecting through a template method.
 
-        ``add_subprocess(child)`` establishes execution coupling that is not an
-        ordinary source-level call from one ``_compute`` method to the other.
-        The edge is emitted only when both sides resolve unambiguously.
+        The registry is usually invoked through a method the framework's base
+        class defines and nobody overrides -- climlab calls ``proc.compute()``,
+        which resolves to ``TimeDependentProcess.compute`` for every process in
+        the tree. An edge between two copies of that node says nothing, and hub
+        policy discards it downstream anyway.
+
+        So when the invoked method resolves to the same definition for parent and
+        child, follow that definition's delegation one hop and look for the hook
+        it hands off to that subclasses actually override -- the Template Method
+        shape. ``compute`` delegates to ``_compute_type``, ``_compute`` and
+        ``_build_process_type_list``; only ``_compute`` is overridden anywhere, so
+        only ``_compute`` carries information about which process this is.
+
+        Returns the method name to link, or ``""`` when re-projection is needed
+        but does not resolve to exactly one hook.
         """
-        if not is_add_subprocess_call(node):
-            return
-        child_expr = add_subprocess_child_expr(node)
-        if child_expr is None or not isinstance(node.func, ast.Attribute):
+        parent_targets = self._resolve_method_targets(parent_type, method)
+        child_targets = self._resolve_method_targets(child_type, method)
+        if len(parent_targets) != 1 or len(child_targets) != 1:
+            return ""
+        if parent_targets[0] != child_targets[0]:
+            # Parent and child give the invoked method different bodies, so it
+            # already distinguishes them and needs no re-projection.
+            return method
+
+        shared = parent_targets[0]
+        hooks = [
+            hook
+            for hook in sorted(self.registry_facts.self_delegations.get(shared, ()))
+            if self._is_overridden_hook(shared, hook)
+        ]
+        # More than one candidate means the base delegates to several genuine
+        # hooks and nothing here says which one carries the coupling. Guessing
+        # would fabricate edges, so decline.
+        return hooks[0] if len(hooks) == 1 else ""
+
+    def _is_overridden_hook(self, base_callable: str, method: str) -> bool:
+        owner = base_callable.rsplit(".", 1)[0]
+        return bool(self._resolve_subclass_override_targets(owner, method))
+
+    def _add_registration_edges(self, node: ast.Call) -> None:
+        """Emit parent/child coupling for a call that registers one into the other.
+
+        Registering a child establishes execution coupling that is not an
+        ordinary source-level call from one hook to the other, so no amount of
+        call resolution finds it. What makes this call a registration is derived
+        rather than recognised by name: some parameter of the callee is known to
+        escape into an attribute of ``self``, and elements of that attribute are
+        known to be invoked. See ``registration``.
+
+        The edge is emitted only when both sides resolve unambiguously. That
+        precision is the whole value of doing this at the call site -- the
+        attribute itself has lost which parent each child belongs to.
+        """
+        if not self.registration_rules:
             return
 
-        parent_types = sorted(self._subprocess_parent_types(node.func.value))
-        child_types = sorted(self._subprocess_child_types(child_expr))
-        if len(parent_types) != 1 or len(child_types) != 1:
-            return
+        for callee, relation, is_resolved in self._resolve_callees(node.func):
+            if not is_resolved:
+                continue
+            rule = self.registration_rules.get(callee)
+            if rule is None:
+                continue
 
-        parent_compute = self._resolve_method_targets(parent_types[0], "_compute")
-        child_compute = self._resolve_method_targets(child_types[0], "_compute")
-        if len(parent_compute) != 1 or len(child_compute) != 1:
-            return
-
-        if not self._is_internal_callee(parent_compute[0]) or not self._is_internal_callee(child_compute[0]):
-            return
-        self.edges.append(
-            Edge(
-                caller=parent_compute[0],
-                callee=child_compute[0],
-                file=str(self.file),
-                lineno=node.lineno,
-                resolved=True,
-                relation="subprocess_compute",
+            offset = self._implicit_receiver_arg_offset(callee, relation)
+            parent_types = sorted(
+                self._registration_parent_types(node, callee, relation)
             )
-        )
+            if len(parent_types) != 1:
+                continue
+
+            for child_expr in registration_child_exprs(node, rule, offset):
+                child_types = sorted(self._registration_child_types(child_expr))
+                if len(child_types) != 1:
+                    continue
+
+                hook = self._registration_hook(
+                    parent_types[0], child_types[0], rule.invoked_method
+                )
+                if not hook:
+                    continue
+
+                parent_hook = self._resolve_method_targets(parent_types[0], hook)
+                child_hook = self._resolve_method_targets(child_types[0], hook)
+                if len(parent_hook) != 1 or len(child_hook) != 1:
+                    continue
+                if not self._is_internal_callee(parent_hook[0]):
+                    continue
+
+                # Emitted against the parent's hook rather than the enclosing
+                # callable: the coupling belongs to the two objects, not to
+                # whichever function happened to wire them together.
+                caller = self.current_callable
+                self.current_callable = parent_hook[0]
+                try:
+                    # No ``col_offset`` on purpose. Rebinding the caller above
+                    # leaves the position pointing at the registration call,
+                    # which sits in a different callable, so ``(caller, line,
+                    # col)`` would not name a site inside ``parent_hook`` at all.
+                    # NO_SOURCE_SITE keeps it out of any site-level comparison
+                    # rather than matching it against an unrelated call.
+                    self._add_edge(
+                        child_hook[0], "registered_invoke", True, node.lineno
+                    )
+                finally:
+                    self.current_callable = caller
 
     def _visit_call_children(self, node: ast.Call) -> None:
         if isinstance(node.func, ast.Attribute):
@@ -644,17 +1047,37 @@ class CallCollector(ast.NodeVisitor):
             # is known about ``value`` yet, so an empty inference above is
             # exactly when this matters most.
             self.set_var_source(target.id, value, slot)
+            # A destructured position holds one element of the value, not the
+            # value; ``for name, proc in registry.items()`` is the shape that
+            # matters and it is handled where the loop is visited.
+            if slot is None:
+                self.set_var_origins(target.id, self._value_origins(value))
             return
 
         if isinstance(target, ast.Attribute):
             self.set_attribute_types(target, class_types)
             self.set_attribute_element_types(target, container_types)
+            # ``self.parent = parent`` retains a single value rather than
+            # collecting one, so it is recorded as a non-container escape and
+            # will not on its own make the callable a registrar.
+            self._note_attribute_store(
+                target, self._value_origins(value), is_container=False
+            )
+            self._note_attribute_store(
+                target, self._element_origins(value), is_container=True
+            )
             return
 
         # ``self.registry[key] = value``: the assignment target is a subscript
         # of an attribute, so the value becomes an element of that attribute.
         if isinstance(target, ast.Subscript):
             self.record_attribute_container_store(target.value, class_types)
+            self._note_attribute_store(
+                target.value,
+                self._value_origins(value),
+                is_container=True,
+                key=target.slice,
+            )
 
     def visit_Module(self, node: ast.Module) -> None:
         """Treat top-level statements as the body of the synthetic module node."""
@@ -668,16 +1091,20 @@ class CallCollector(ast.NodeVisitor):
         self.callable_stack.pop()
         self.current_callable = prev_callable
 
-    def _add_import_edge(self, module_name: str, lineno: int) -> None:
+    def _add_import_edge(
+        self, module_name: str, lineno: int, col_offset: int = NO_SOURCE_SITE
+    ) -> None:
         imported_module_callable = module_callable_id(module_name)
         if imported_module_callable in self.callable_ids:
-            self._add_edge(imported_module_callable, "import", True, lineno)
+            self._add_edge(
+                imported_module_callable, "import", True, lineno, col_offset
+            )
         else:
-            self._add_edge(module_name, "import", False, lineno)
+            self._add_edge(module_name, "import", False, lineno, col_offset)
 
     def visit_Import(self, node: ast.Import) -> None:
         for alias in node.names:
-            self._add_import_edge(alias.name, node.lineno)
+            self._add_import_edge(alias.name, node.lineno, node.col_offset)
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
         imported_module = resolve_import_from_module(
@@ -689,7 +1116,7 @@ class CallCollector(ast.NodeVisitor):
         if imported_module is None:
             return
         if node.module:
-            self._add_import_edge(imported_module, node.lineno)
+            self._add_import_edge(imported_module, node.lineno, node.col_offset)
             return
         for alias in node.names:
             target = resolve_import_from_target(
@@ -700,24 +1127,54 @@ class CallCollector(ast.NodeVisitor):
                 current_is_package=is_package_file(self.file),
             )
             if target:
-                self._add_import_edge(target, node.lineno)
+                self._add_import_edge(target, node.lineno, node.col_offset)
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
-        prev = self.current_class
+        """Visit a class body, attributing what it evaluates to the class itself.
+
+        The class body is a code object that runs once, when the ``class``
+        statement executes, so a computed default argument belongs to the class
+        and not to the method whose signature it is written in. The interpreter
+        agrees: it reports the caller of ``make_slabatm_axis()`` as
+        ``SlabAtmosphere``, not ``SlabAtmosphere.__init__``.
+        """
+        prev_class = self.current_class
+        prev_callable = self.current_callable
         self.current_class = node.name
-        self.generic_visit(node)
-        self.current_class = prev
+
+        # ``class_bodies``, not ``callable_ids`` -- a class body is a valid edge
+        # caller but never a callee, so it is deliberately absent from the
+        # resolution universe. See models.resolvable_callable_ids.
+        class_id = f"{self.module}.{node.name}"
+        if class_id in self.module_index.class_bodies:
+            self.current_callable = class_id
+
+        # Everything the class statement evaluates, attributed to the class...
+        for expression in class_body_expressions(node):
+            self.visit(expression)
+
+        # ...and then each method, entered in its own scope with the signature
+        # already accounted for above.
+        self.current_callable = prev_callable
+        for statement in node.body:
+            if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                self._enter_callable(statement, statement.name)
+
+        self.current_class = prev_class
+        self.current_callable = prev_callable
 
     def _enter_callable(self, node: ast.AST, name: str) -> None:
         """Enter a function scope, seed parameter types, visit it, and restore state."""
         prev_callable = self.current_callable
-        if prev_callable is not None and prev_callable != self.module_callable:
-            self.current_callable = f"{prev_callable}.<locals>.{name}"
+        prev_enclosing = self.enclosing_function
+        if self.enclosing_function is not None:
+            self.current_callable = f"{self.enclosing_function}.<locals>.{name}"
         elif self.current_class:
             self.current_callable = f"{self.module}.{self.current_class}.{name}"
         else:
             self.current_callable = f"{self.module}.{name}"
 
+        self.enclosing_function = self.current_callable
         self.callable_stack.append(self.current_callable)
         self.push_scope()
 
@@ -733,15 +1190,21 @@ class CallCollector(ast.NodeVisitor):
             positional_args = [*node.args.posonlyargs, *node.args.args]
             for index, arg in enumerate(positional_args):
                 self._seed_param_types(param_summary, index, arg)
+                self._seed_param_origin(index, arg, is_receiver=index == 0)
             for index, arg in enumerate(
                 node.args.kwonlyargs, start=len(positional_args)
             ):
                 self._seed_param_types(param_summary, index, arg)
+                self._seed_param_origin(index, arg, keyword_only=True)
 
-        self.generic_visit(node)
+        # Only the body. Decorators, defaults and annotations were visited by the
+        # enclosing scope, which is where the interpreter evaluates them.
+        for statement in getattr(node, "body", []):
+            self.visit(statement)
         self.pop_scope()
         self.callable_stack.pop()
         self.current_callable = prev_callable
+        self.enclosing_function = prev_enclosing
 
     # Typing constructs that wrap the type actually of interest. ``Optional[X]``
     # and ``Union[X, None]`` still denote an ``X``; the container forms denote a
@@ -842,6 +1305,48 @@ class CallCollector(ast.NodeVisitor):
         if element_types:
             self.set_container_types(arg.arg, element_types)
 
+        # The callable dimension of the same fact. This is what makes
+        # ``def apply(self, msg, func): return func(...)`` resolvable: the
+        # callable arrived at a call site and has to be carried into the callee.
+        param_callables = set(param_summary.positional_callables.get(index, set()))
+        param_callables.update(param_summary.named_callables.get(arg.arg, set()))
+        if param_callables:
+            self.types.set_var_callables(arg.arg, param_callables)
+
+    def _seed_param_origin(
+        self,
+        index: int,
+        arg: ast.arg,
+        *,
+        is_receiver: bool = False,
+        keyword_only: bool = False,
+    ) -> None:
+        """Mark a parameter name as holding the value its caller passed.
+
+        The receiver is skipped. ``self`` is not something a caller registers --
+        it is the thing being registered *into*, and treating it as a parameter
+        would read every ``self.x = ...`` in a method as an escape of ``self``.
+        """
+        if is_receiver and self.current_class and arg.arg in {"self", "cls"}:
+            return
+        key = (
+            keyword_only_param_key(arg.arg)
+            if keyword_only
+            else param_key(index, arg.arg)
+        )
+        origins = {param_origin(key)}
+        # A parameter that callers fill with the contents of a registry keeps
+        # that provenance inside the callee, so ``for a in artists: a.draw()``
+        # in a free function still counts as invoking the registry.
+        if self.current_callable is not None:
+            origins.update(
+                attr_container_origin(attr)
+                for attr in self.registry_facts.attrs_for_param(
+                    self.current_callable, index, arg.arg
+                )
+            )
+        self.set_var_origins(arg.arg, origins)
+
     def _resolve_enclosing_local_callable(self, name: str) -> Optional[str]:
         for scope_callable in reversed(self.callable_stack):
             candidate = f"{scope_callable}.<locals>.{name}"
@@ -850,10 +1355,47 @@ class CallCollector(ast.NodeVisitor):
         return None
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self._visit_signature(node)
         self._enter_callable(node, node.name)
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self._visit_signature(node)
         self._enter_callable(node, node.name)
+
+    def _visit_signature(
+        self, node: ast.FunctionDef | ast.AsyncFunctionDef
+    ) -> None:
+        """Visit a ``def``'s decorators, defaults and annotations where they run.
+
+        ``visit_ClassDef`` handles methods itself, so this only fires for module
+        level and nested functions, whose enclosing scope is already current.
+        """
+        for expression in signature_expressions(node):
+            self.visit(expression)
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        """Enter a lambda body as its own callable scope.
+
+        Without this a call inside a lambda body is attributed to the enclosing
+        function, while the tracer reports it under ``<locals>.<lambda>`` -- the
+        two graphs disagree about who made the call.
+        """
+        lambda_id = self._lambda_id(node)
+        if lambda_id not in self.callable_ids:
+            self.generic_visit(node)
+            return
+
+        prev_callable = self.current_callable
+        prev_enclosing = self.enclosing_function
+        self.current_callable = lambda_id
+        self.enclosing_function = lambda_id
+        self.callable_stack.append(lambda_id)
+        self.push_scope()
+        self.visit(node.body)
+        self.pop_scope()
+        self.callable_stack.pop()
+        self.current_callable = prev_callable
+        self.enclosing_function = prev_enclosing
 
     def visit_If(self, node: ast.If) -> None:
         """Analyze both branches independently and keep the union of their facts.
@@ -883,7 +1425,36 @@ class CallCollector(ast.NodeVisitor):
         container_types = self._infer_container_element_types(node.value)
         for target in node.targets:
             self._assign_target_types(target, class_types, container_types, node.value)
+            self._assign_target_callables(target, node.value)
         self.generic_visit(node)
+
+    def _assign_target_callables(self, target: ast.AST, value: ast.AST) -> None:
+        """Record callables an assignment binds, for locals and ``self.<attr>``.
+
+        Runs beside the class-type assignment rather than inside it: the two
+        dimensions are independent, and ``handler = self.process`` produces a
+        callable fact and no type fact at all.
+        """
+        callables = self._infer_callable_ids_from_value(value)
+        elements = self._infer_container_callable_ids(value)
+        if not callables and not elements:
+            return
+
+        if isinstance(target, ast.Name):
+            self.types.add_var_callables(target.id, callables)
+            self.types.add_var_callables(f"{target.id}{_ELEMENT_SUFFIX}", elements)
+            return
+
+        if (
+            isinstance(target, ast.Attribute)
+            and isinstance(target.value, ast.Name)
+            and target.value.id in {"self", "cls"}
+        ):
+            class_id = self.current_class_id()
+            if class_id:
+                key = (class_id, target.attr)
+                self.class_attr_types.add_callable_types(key, callables)
+                self.class_attr_types.add_element_callable_types(key, elements)
 
     def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
         # The annotation is a fact in its own right, so ``self.grid: Grid`` is
@@ -925,19 +1496,21 @@ class CallCollector(ast.NodeVisitor):
         method_name = AUGASSIGN_DUNDER_METHODS.get(type(node.op))
         if method_name:
             self._add_dunder_edges(
-                node.target, method_name, "dunder_operator", node.lineno
+                node.target, method_name, "dunder_operator", node.lineno, node.col_offset
             )
         self.visit(node.target)
         self.visit(node.value)
 
     def _visit_for_like(self, node: ast.For | ast.AsyncFor) -> None:
         """Model iteration and propagate known collection element types."""
-        self._add_dunder_edges(node.iter, "__iter__", "dunder_iter", node.lineno)
+        self._add_dunder_edges(node.iter, "__iter__", "dunder_iter", node.lineno, node.col_offset)
         self.visit(node.iter)
+        element_origins = self._element_origins(node.iter)
         if isinstance(node.target, ast.Name):
             element_types = self._infer_container_element_types(node.iter)
             if element_types:
                 self.set_var_types(node.target.id, element_types)
+            self.set_var_origins(node.target.id, element_origins)
         elif isinstance(node.target, (ast.Tuple, ast.List)):
             # ``for name, proc in registry.items()``: each loop variable takes
             # one slot of the element, so bind them position by position.
@@ -947,6 +1520,15 @@ class CallCollector(ast.NodeVisitor):
                 slot_types = self._infer_sequence_slot_class_types(node.iter, index)
                 if slot_types:
                     self.set_var_types(item.id, slot_types)
+                # Destructuring a mapping's items gives keys at slot 0 and the
+                # stored values at slot 1. Only the values are the registry's
+                # elements; the keys are the labels they were filed under.
+                self.set_var_origins(
+                    item.id,
+                    element_origins
+                    if index == 1 and self._is_dict_items_call(node.iter)
+                    else set(),
+                )
         for stmt in node.body:
             self.visit(stmt)
         for stmt in node.orelse:
@@ -975,6 +1557,39 @@ class CallCollector(ast.NodeVisitor):
             return self._infer_container_element_types(node.args[0])
         return set()
 
+    def _container_mutation_value_origins(self, node: ast.Call) -> Set[Origin]:
+        """Origins a mutating container call stores, mirroring the type rule.
+
+        The same append/extend split applies: ``append`` stores the argument
+        itself, ``update`` stores the argument's contents. Keeping the two rules
+        in step is what makes ``self.children.update({name: child})`` register
+        ``child`` rather than the dict wrapped around it.
+        """
+        if not node.args or not isinstance(node.func, ast.Attribute):
+            return set()
+        if node.func.attr in {"append", "add"}:
+            return self._value_origins(node.args[0])
+        if node.func.attr in {"extend", "update"}:
+            return self._element_origins(node.args[0])
+        return set()
+
+    def _container_mutation_key(self, node: ast.Call) -> Optional[ast.AST]:
+        """The key a mutating call filed its value under, when there is one.
+
+        Only ``update`` with a single-entry dict literal names a key -- which is
+        the registration idiom, ``self.children.update({name: child})``. Appending
+        to a list files nothing under a name, and a multi-entry literal would make
+        the pairing ambiguous.
+        """
+        if not node.args or not isinstance(node.func, ast.Attribute):
+            return None
+        if node.func.attr != "update":
+            return None
+        argument = unwrap_passthrough(node.args[0])
+        if isinstance(argument, ast.Dict) and len(argument.keys) == 1:
+            return argument.keys[0]
+        return None
+
     def _record_container_mutation(self, node: ast.Call) -> None:
         """Learn element types introduced by mutating container calls.
 
@@ -986,10 +1601,6 @@ class CallCollector(ast.NodeVisitor):
         if not isinstance(node.func, ast.Attribute):
             return
 
-        element_types = self._container_mutation_element_types(node)
-        if not element_types:
-            return
-
         container = node.func.value
         # ``self.buckets[key].append(x)`` -- a container nested one level inside
         # an attribute. The nesting level is deliberately flattened away: what
@@ -999,6 +1610,22 @@ class CallCollector(ast.NodeVisitor):
         # bins subprocesses into ``self.process_types[time_type]`` lists.
         if isinstance(container, ast.Subscript):
             container = container.value
+
+        # Recorded before the type facts and independently of them. Which value
+        # was stored is knowable on the first pass; what type it has may take
+        # several, and gating the escape on a type would lose the fact entirely
+        # for a parameter whose callers are not yet resolved.
+        if isinstance(container, ast.Attribute):
+            self._note_attribute_store(
+                container,
+                self._container_mutation_value_origins(node),
+                is_container=True,
+                key=self._container_mutation_key(node),
+            )
+
+        element_types = self._container_mutation_element_types(node)
+        if not element_types:
+            return
 
         if isinstance(container, ast.Name):
             self.add_container_types(container.id, element_types)
@@ -1041,6 +1668,154 @@ class CallCollector(ast.NodeVisitor):
             return types
         finally:
             self.types.replaying.discard(name)
+
+    def _infer_callable_ids_from_value(
+        self, value: ast.AST, *, resolve_names: bool = True
+    ) -> Set[str]:
+        """Callables an expression may evaluate to, mirroring class inference.
+
+        The counterpart of ``_infer_class_types_from_value`` for values that
+        *are* code. Written as a separate walk rather than an extra branch there
+        because the two answers must never mix: a class id and a callable id are
+        both dotted strings, and every consumer of a type set assumes the former.
+
+        ``resolve_names`` distinguishes the two contexts this is asked from. As a
+        *value* -- ``handler = helper``, or ``f(helper)`` -- a bare name should
+        resolve to the function it refers to. As a *callee* it must not: ordinary
+        name resolution already handles ``helper()`` and gives it the more
+        specific relation, so resolving it here too would relabel every plain
+        call as ``inferred_callable``.
+        """
+        value = unwrap_passthrough(value)
+
+        if isinstance(value, ast.Name):
+            known = self.types.get_var_callables(value.id)
+            if known:
+                return set(known)
+            if not resolve_names:
+                return set()
+            resolved = self._resolve_callee_definition(value)
+            return {resolved} if resolved else set()
+
+        if isinstance(value, ast.Attribute):
+            callables = self._class_attr_callable_types(value)
+            if callables:
+                return callables
+            if not resolve_names:
+                return set()
+            resolved = self._resolve_callee_definition(value)
+            return {resolved} if resolved else set()
+
+        if isinstance(value, ast.Lambda):
+            lambda_id = self._lambda_id(value)
+            return {lambda_id} if lambda_id in self.callable_ids else set()
+
+        if isinstance(value, ast.Call):
+            return self._infer_callable_ids_from_call(value)
+
+        # Same recursion as the class walk: these evaluate to one of their
+        # sub-expressions, and the answer is knowable for each.
+        if isinstance(value, ast.IfExp):
+            return self._infer_callable_ids_from_value(
+                value.body
+            ) | self._infer_callable_ids_from_value(value.orelse)
+        if isinstance(value, ast.BoolOp):
+            callables: Set[str] = set()
+            for operand in value.values:
+                callables.update(self._infer_callable_ids_from_value(operand))
+            return callables
+
+        # ``SOLVERS[name]()`` -- a dispatch table, which is the dominant
+        # config-driven dispatch idiom in scientific code.
+        if isinstance(value, ast.Subscript) and not isinstance(value.slice, ast.Slice):
+            return self._infer_container_callable_ids(value.value)
+
+        return set()
+
+    def _infer_callable_ids_from_call(self, value: ast.Call) -> Set[str]:
+        """Callables produced *by* a call: ``partial(f, x)`` and factories."""
+        fn_name = attribute_to_name(value.func)
+        if fn_name in _PARTIAL_NAMES and value.args:
+            # ``partial(f, ...)`` is ``f`` with arguments pre-bound; calling the
+            # result calls ``f``.
+            return self._infer_callable_ids_from_value(value.args[0])
+
+        callables: Set[str] = set()
+        for callee, _relation, is_resolved in self._resolve_callees(value.func):
+            if not is_resolved:
+                continue
+            summary = self.return_summaries.get(callee)
+            if summary:
+                callables.update(summary.callable_ids)
+        return callables
+
+    def _infer_container_callable_ids(self, value: ast.AST) -> Set[str]:
+        """Callables held *inside* a collection, for dispatch tables."""
+        value = unwrap_passthrough(value)
+        if isinstance(value, ast.Name):
+            return set(self.types.get_var_callables(f"{value.id}{_ELEMENT_SUFFIX}"))
+        if isinstance(value, ast.Attribute):
+            return self._class_attr_element_callable_types(value)
+        if isinstance(value, (ast.List, ast.Tuple, ast.Set)):
+            callables: Set[str] = set()
+            for item in value.elts:
+                callables.update(self._infer_callable_ids_from_value(item))
+            return callables
+        if isinstance(value, ast.Dict):
+            callables = set()
+            for item in value.values:
+                callables.update(self._infer_callable_ids_from_value(item))
+            return callables
+        return set()
+
+    def _resolve_callee_definition(self, value: ast.AST) -> Optional[str]:
+        """Resolve a name/attribute to a project callable, or ``None``.
+
+        A *reference* to a function, not a call of it. Only fully resolved
+        project callables count -- an unresolved guess as a value would be a
+        fabricated callable id rather than a fabricated callee, which is worse.
+        """
+        resolved = self._resolve_callee(value)
+        if resolved and resolved[2] and resolved[0] in self.callable_ids:
+            return resolved[0]
+        return None
+
+    def _lambda_id(self, node: ast.Lambda) -> str:
+        """CPython's own name for a lambda's code object.
+
+        Spelled ``<enclosing>.<locals>.<lambda>`` to match ``co_qualname``, so
+        the runtime tracer's IDs keep agreeing with the static ones by
+        construction. CPython does not disambiguate sibling lambdas in one
+        scope and neither does this: inventing a disambiguator would buy
+        precision at the cost of that agreement.
+        """
+        if self.enclosing_function:
+            return f"{self.enclosing_function}.<locals>.<lambda>"
+        if self.current_class:
+            return f"{self.module}.{self.current_class}.<locals>.<lambda>"
+        return f"{self.module}.<lambda>"
+
+    def _class_attr_callable_types(self, value: ast.Attribute) -> Set[str]:
+        """Callables stored on ``self.<attr>``, looked up across the hierarchy."""
+        return self._attr_callables(value, self.class_attr_types.callable_types)
+
+    def _class_attr_element_callable_types(self, value: ast.AST) -> Set[str]:
+        if not isinstance(value, ast.Attribute):
+            return set()
+        return self._attr_callables(value, self.class_attr_types.element_callable_types)
+
+    def _attr_callables(
+        self, value: ast.Attribute, table: Dict[ClassAttr, Set[str]]
+    ) -> Set[str]:
+        if not (isinstance(value.value, ast.Name) and value.value.id in {"self", "cls"}):
+            return set()
+        class_id = self.current_class_id()
+        if not class_id:
+            return set()
+        found: Set[str] = set()
+        for ancestor in self.project_index.class_and_ancestors(class_id):
+            found.update(table.get((ancestor, value.attr), set()))
+        return found
 
     def _infer_class_types_from_value(self, value: ast.AST) -> Set[str]:
         value = unwrap_passthrough(value)
@@ -1239,38 +2014,86 @@ class CallCollector(ast.NodeVisitor):
             return inferred[0]
         return None
 
+    def _note_call_health(
+        self, node: ast.Call, results: Sequence[Tuple[str, str, bool]]
+    ) -> None:
+        """Record what this call site cost the resolver, whatever the outcome."""
+        if self.current_callable is None:
+            return
+
+        resolved = [result for result in results if result[2]]
+        if resolved:
+            self.health.site_fanout[len(resolved)] += 1
+            return
+
+        # Calls to a value the abstract domain cannot hold. Two shapes reach
+        # here: a bound local whose contents are a function (``callable_value``),
+        # and an expression the resolver produced no candidate for at all. Both
+        # are the same underlying gap -- the lattice is a set of class ids, so a
+        # value that *is* code is inexpressible rather than merely unknown.
+        if any(relation == "callable_value" for _callee, relation, _ in results):
+            self.health.unresolvable_calls[_callee_shape(node.func)] += 1
+            return
+
+        if results:
+            # A named but unmatched callee. Already counted by ``_add_edge``.
+            return
+
+        self.health.unresolvable_calls[_callee_shape(node.func)] += 1
+
     def visit_Call(self, node: ast.Call) -> None:
         """Resolve an explicit call, record its edge, then visit child expressions."""
         self._record_container_mutation(node)
+        self._note_receiver_invocation(node.func)
 
         dynamic_resolved = self._resolve_dynamic_getattr_callees(node.func)
         resolved_callees = dynamic_resolved or self._resolve_callees(node.func)
+        self._note_call_health(node, resolved_callees)
+        confidence = confidence_for_fanout(
+            sum(1 for result in resolved_callees if result[2])
+        )
         for callee, relation, is_resolved in resolved_callees:
-            self._add_edge(callee, relation, is_resolved, node.lineno)
-        self._add_subprocess_compute_edge(node)
+            self._add_edge(
+                callee,
+                relation,
+                is_resolved,
+                node.lineno,
+                node.col_offset,
+                confidence,
+            )
+        self._add_registration_edges(node)
 
         self.generic_visit(node)
 
     def visit_Attribute(self, node: ast.Attribute) -> None:
         """Turn a loaded property access into its implicit getter call."""
         if isinstance(node.ctx, ast.Load):
-            for callee in self._resolve_property_getter_targets(node):
-                self._add_edge(callee, "property_getter", True, node.lineno)
+            targets = self._resolve_property_getter_targets(node)
+            confidence = confidence_for_fanout(len(targets))
+            for callee in targets:
+                self._add_edge(
+                    callee,
+                    "property_getter",
+                    True,
+                    node.lineno,
+                    node.col_offset,
+                    confidence,
+                )
         self.visit(node.value)
 
     def visit_Subscript(self, node: ast.Subscript) -> None:
         """Model ``obj[key]`` load/store/delete through the relevant dunder method."""
         if isinstance(node.ctx, ast.Store):
             self._add_dunder_edges(
-                node.value, "__setitem__", "dunder_setitem", node.lineno
+                node.value, "__setitem__", "dunder_setitem", node.lineno, node.col_offset
             )
         elif isinstance(node.ctx, ast.Del):
             self._add_dunder_edges(
-                node.value, "__delitem__", "dunder_delitem", node.lineno
+                node.value, "__delitem__", "dunder_delitem", node.lineno, node.col_offset
             )
         else:
             self._add_dunder_edges(
-                node.value, "__getitem__", "dunder_getitem", node.lineno
+                node.value, "__getitem__", "dunder_getitem", node.lineno, node.col_offset
             )
         self.visit(node.value)
         self.visit(node.slice)
@@ -1279,12 +2102,12 @@ class CallCollector(ast.NodeVisitor):
         method_name = BINOP_DUNDER_METHODS.get(type(node.op))
         if method_name:
             self._add_dunder_edges(
-                node.left, method_name, "dunder_operator", node.lineno
+                node.left, method_name, "dunder_operator", node.lineno, node.col_offset
             )
         reverse_method_name = REVERSE_BINOP_DUNDER_METHODS.get(type(node.op))
         if reverse_method_name:
             self._add_dunder_edges(
-                node.right, reverse_method_name, "dunder_operator", node.lineno
+                node.right, reverse_method_name, "dunder_operator", node.lineno, node.col_offset
             )
         self.visit(node.left)
         self.visit(node.right)
@@ -1294,12 +2117,12 @@ class CallCollector(ast.NodeVisitor):
         self.visit(left)
         for op, comparator in zip(node.ops, node.comparators):
             if isinstance(op, (ast.In, ast.NotIn)):
-                self._add_membership_edges(comparator, node.lineno)
+                self._add_membership_edges(comparator, node.lineno, node.col_offset)
             else:
                 method_name = COMPARE_DUNDER_METHODS.get(type(op))
                 if method_name:
                     self._add_dunder_edges(
-                        left, method_name, "dunder_operator", node.lineno
+                        left, method_name, "dunder_operator", node.lineno, node.col_offset
                     )
             self.visit(comparator)
             left = comparator
@@ -1308,7 +2131,7 @@ class CallCollector(ast.NodeVisitor):
         method_name = UNARY_DUNDER_METHODS.get(type(node.op))
         if method_name:
             self._add_dunder_edges(
-                node.operand, method_name, "dunder_operator", node.lineno
+                node.operand, method_name, "dunder_operator", node.lineno, node.col_offset
             )
         self.visit(node.operand)
 
@@ -1366,9 +2189,21 @@ class CallCollector(ast.NodeVisitor):
                 return []
 
             if self._is_super_call(func.value):
-                targets = self._resolve_super_method_targets(func.attr)
-                if targets:
-                    return [(target, "super_method", True) for target in targets]
+                super_class_id = self._super_class_id(func.value)
+                targets = self.project_index.resolve_super_method_targets(
+                    super_class_id, func.attr
+                )
+                cooperative = self.project_index.resolve_cooperative_super_targets(
+                    super_class_id, func.attr
+                )
+                if targets or cooperative:
+                    return [
+                        *((target, "super_method", True) for target in targets),
+                        *(
+                            (target, "cooperative_super", True)
+                            for target in cooperative
+                        ),
+                    ]
 
             if (
                 isinstance(func.value, ast.Name)
@@ -1396,6 +2231,20 @@ class CallCollector(ast.NodeVisitor):
                         return [
                             *((target, "self_method", True) for target in targets),
                             *((target, "virtual_override", True) for target in overrides),
+                        ]
+                    # No method of that name anywhere in the hierarchy. Before
+                    # giving up, ask whether the attribute holds a *callable*:
+                    # ``self.handler = on_event`` then ``self.handler()`` is a
+                    # stored callback, not a method, and the class-id domain had
+                    # no way to represent it.
+                    stored = sorted(
+                        target
+                        for target in self._class_attr_callable_types(func)
+                        if target in self.callable_ids
+                    )
+                    if stored:
+                        return [
+                            (target, "inferred_callable", True) for target in stored
                         ]
                     return [(f"{class_id}.{func.attr}", "self_method", False)]
 
@@ -1445,10 +2294,78 @@ class CallCollector(ast.NodeVisitor):
                             for target in self._unique(targets)
                         ]
 
+        # ``cls(...)`` inside a classmethod constructs an instance of the class
+        # the method belongs to. Resolved here rather than left to the bare-name
+        # fallback, which cannot see that ``cls`` is bound at all and reported it
+        # as a call to an unresolvable value.
+        if isinstance(func, ast.Name) and func.id == "cls" and self.current_class:
+            class_id = self.current_class_id()
+            if class_id:
+                targets = self._resolve_constructor_targets(class_id)
+                if targets:
+                    return [(target, "constructor", True) for target in targets]
+
+        # The callable-value rung. Placed after every class-based rule, so a
+        # receiver whose type is known still resolves as a method call, and
+        # before the single-target fallback, which can only guess a bare name.
+        callable_targets = sorted(
+            target
+            for target in self._infer_callable_ids_from_value(func, resolve_names=False)
+            if target in self.callable_ids
+        )
+        if callable_targets:
+            return [(target, "inferred_callable", True) for target in callable_targets]
+
+        # ``model(x)`` where ``model`` is an instance of a class defining
+        # ``__call__``. Cheap, and independent of everything above: the receiver
+        # has an ordinary class type, it is the *call* that is implicit.
+        dunder_call_targets: List[str] = []
+        for receiver_type in sorted(self._callee_expression_types(func)):
+            dunder_call_targets.extend(
+                self._resolve_method_targets(receiver_type, "__call__")
+            )
+        if dunder_call_targets:
+            return [
+                (target, "dunder_call", True)
+                for target in self._unique(dunder_call_targets)
+            ]
+
         resolved = self._resolve_callee(func)
         if resolved:
             return [resolved]
         return []
+
+    def _callee_expression_types(self, func: ast.AST) -> Set[str]:
+        """Class types of the thing being called, for the ``__call__`` rung.
+
+        ``cls`` is excluded. It is seeded with its class id like ``self``, but it
+        denotes the *class object*, so ``cls(...)`` constructs an instance and
+        does not invoke ``__call__`` on one. Treating the two alike turns every
+        alternative constructor in a class that also defines ``__call__`` into an
+        edge to the wrong method.
+        """
+        if isinstance(func, ast.Name):
+            if func.id == "cls":
+                return set()
+            return self.get_var_types(func.id)
+        if isinstance(func, ast.Attribute):
+            with self._resolving_receiver():
+                return self._infer_class_types_from_value(func)
+        return set()
+
+    def _super_class_id(self, node: ast.AST) -> Optional[str]:
+        """Which class a ``super()`` call starts its MRO search after.
+
+        Usually the enclosing class, but ``super(Other, self)`` names it
+        explicitly and means something different. That distinction was harmless
+        while resolution unioned over bases; under C3 the starting point decides
+        the answer, so the argument has to be read.
+        """
+        if isinstance(node, ast.Call) and node.args:
+            named = self._resolve_class_reference_name(attribute_to_name(node.args[0]) or "")
+            if named:
+                return named[0]
+        return self.current_class_id()
 
     def _is_super_call(self, node: ast.AST) -> bool:
         return (
@@ -1488,8 +2405,11 @@ class CallCollector(ast.NodeVisitor):
 
             imported = self.module_index.imports.get(name)
             if imported:
-                is_known = imported in self.callable_ids
-                return (imported, "imported", is_known)
+                # Through the alias map first: a callable imported from a package
+                # is recorded under the package path, not the defining module.
+                canonical = self.project_index.canonical_callable_id(imported)
+                is_known = canonical in self.callable_ids
+                return (canonical if is_known else imported, "imported", is_known)
 
             star_import_targets = self._resolve_star_import_targets(name)
             star_import_matches = [
@@ -1516,6 +2436,14 @@ class CallCollector(ast.NodeVisitor):
                     False,
                 )
 
+            if self.types.is_bound_local(name):
+                # The name resolved; what it holds is the problem. ``handler(x)``
+                # where ``handler`` is a parameter or a local is a call to a
+                # value, and the abstract domain is a set of *class* ids with no
+                # way to say "this variable holds that function". Distinguished
+                # from an ordinary unresolved name so the health report can
+                # count the gap instead of burying it among third-party calls.
+                return (name, "callable_value", False)
             return (name, "direct", False)
 
         if isinstance(func, ast.Attribute):
