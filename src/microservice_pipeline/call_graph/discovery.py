@@ -227,12 +227,18 @@ def iter_analysis_files_for_source_roots(
             files.append(analysis_file)
 
     if entrypoints:
+        # iter_analysis_files always walks its source root before yielding the
+        # entrypoints, so this second pass must repeat the same globs. Without
+        # them it re-walks unfiltered and re-admits every excluded file, since
+        # `seen` only holds files the filtered pass already accepted.
         first_root = source_roots[0]
         for analysis_file in iter_analysis_files(
             first_root.path,
             module_prefix=first_root.module_prefix,
             entrypoints=entrypoints,
             project_root=resolved_project_root,
+            include_globs=include_globs,
+            exclude_globs=exclude_globs,
         ):
             if analysis_file.path in seen:
                 continue
