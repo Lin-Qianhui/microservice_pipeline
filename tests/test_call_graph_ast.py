@@ -3053,3 +3053,85 @@ def run():
     assert _edge_exists(
         edges, "lam.run", "lam.run.<locals>.<lambda>", "inferred_callable"
     )
+
+
+# ---------------------------------------------------------------------------
+# Structural guards on the CallCollector mixin split.
+#
+# CallCollector's body lives in one module per concern (see
+# call_graph/modularisation_plan.md). The mixins are slices of one object, so
+# nothing about that is enforced by the type system -- these tests are what
+# keeps the arrangement honest. The failure they exist to catch is silent: a
+# visitor lost or shadowed during a move shows up only as a quiet drop in edge
+# count, and no behavioural test would name it.
+# ---------------------------------------------------------------------------
+
+import ast as _ast
+
+from microservice_pipeline.call_graph.collector.collector import CallCollector
+from microservice_pipeline.call_graph.collector.state import CollectorState
+
+_MIXINS = [base for base in CallCollector.__bases__ if base is not CollectorState]
+
+# The visitors CallCollector had before the split, taken from the pre-split
+# collectors.py. Adding a visitor is a real change and should update this list;
+# losing one silently is the bug.
+_EXPECTED_VISITORS = {
+    "visit_AnnAssign", "visit_Assign", "visit_AsyncFor", "visit_AsyncFunctionDef",
+    "visit_Attribute", "visit_AugAssign", "visit_BinOp", "visit_Call",
+    "visit_ClassDef", "visit_Compare", "visit_For", "visit_FunctionDef",
+    "visit_If", "visit_Import", "visit_ImportFrom", "visit_Lambda",
+    "visit_Module", "visit_Subscript", "visit_UnaryOp",
+}
+
+
+def _own_names(cls):
+    return {name for name in vars(cls) if not name.startswith("__")}
+
+
+def test_collector_mixins_inherit_only_collector_state():
+    """Rule 1: a mixin never inherits another mixin, so the MRO stays a single diamond."""
+    assert _MIXINS, "CallCollector should be composed from mixins"
+    for mixin in _MIXINS:
+        assert mixin.__bases__ == (CollectorState,), (
+            f"{mixin.__name__} must inherit CollectorState and nothing else, "
+            f"got {mixin.__bases__}"
+        )
+
+
+def test_collector_state_is_last_in_the_mro():
+    """Rule 2: CollectorState last, so C3 can linearise at all."""
+    assert CallCollector.__mro__[-3:] == (CollectorState, _ast.NodeVisitor, object)
+
+
+def test_no_collector_method_is_defined_twice():
+    """Rule 3: nothing is overridden, which is what makes the mixin order inert."""
+    owners = {}
+    collisions = {}
+    for cls in (*_MIXINS, CollectorState):
+        for name in _own_names(cls):
+            if name in owners:
+                collisions.setdefault(name, [owners[name]]).append(cls.__name__)
+            else:
+                owners[name] = cls.__name__
+    assert not collisions, (
+        "these names are defined in more than one mixin, so the order in "
+        f"collector.py silently decides which wins: {collisions}"
+    )
+
+
+def test_every_visitor_survived_the_split():
+    """A visitor lost during a move is invisible except as missing edges."""
+    found = {name for name in dir(CallCollector) if name.startswith("visit_")}
+    assert found == _EXPECTED_VISITORS
+
+
+def test_visit_call_children_is_still_reachable():
+    """Subclass API with no in-package caller -- deleting it fails at runtime, not import."""
+    assert hasattr(CallCollector, "_visit_call_children")
+
+
+def test_records_registry_facts_is_a_class_attribute():
+    """An instance attribute here would silently shadow TypeSummaryCollector's override."""
+    assert "records_registry_facts" in vars(CollectorState)
+    assert CollectorState.records_registry_facts is False

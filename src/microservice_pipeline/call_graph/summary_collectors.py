@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Dict, Optional, Set
 
 from .ast_utils import unwrap_passthrough
-from .collectors import CallCollector
+from .collector import CallCollector
 from .models import (
     KEYWORD_ONLY_POSITION,
     AttrSlot,
@@ -143,7 +143,7 @@ class ReturnSummaryCollector(CallCollector):
             return
         self.types.replaying.add(name)
         try:
-            for source, slot in self.get_var_sources(name):
+            for source, slot in self.types.get_var_sources(name):
                 # A destructured binding is one position, not a whole shape.
                 if slot is not None:
                     continue

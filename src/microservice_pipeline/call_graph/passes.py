@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from .ast_utils import ParsedFileCache, attach_parents, parse_python_source
-from .collectors import CallCollector
+from .collector import CallCollector
 from .summary_collectors import ReturnSummaryCollector, TypeSummaryCollector
 from .definitions import DefinitionCollector, merge_module_index
 from .discovery import iter_analysis_files
@@ -407,7 +407,7 @@ class SourceCallResolver:
         )
         self.collector.current_callable = self.collector.module_callable
         self.collector.callable_stack.append(self.collector.module_callable)
-        self.collector.push_scope()
+        self.collector.types.push_scope()
 
     def resolve_source(self, source: str, filename: str | None = None) -> List[Edge]:
         """Analyze one snippet and return only edges newly produced by it.

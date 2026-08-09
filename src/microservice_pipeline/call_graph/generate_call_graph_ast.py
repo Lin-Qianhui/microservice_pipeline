@@ -54,11 +54,13 @@ it:
 ``type_env``
     ``TypeEnv``: the scoped variable/container/attribute type state a single
     collector accumulates as it walks one file.
-``collectors``
+``collector``
     ``CallCollector`` -- the AST visitor together with the type inference and
-    callee resolution it drives. These stay in one module because they are
+    callee resolution it drives. These stay in one *object* because they are
     mutually recursive: resolving ``build().submit()`` needs the inferred type
-    of ``build()``, and inferring that type needs to resolve ``build``.
+    of ``build()``, and inferring that type needs to resolve ``build``. The
+    object's body is assembled from one mixin per concern; see
+    ``modularisation_plan.md``.
 ``summary_collectors``
     ``ReturnSummaryCollector`` and ``TypeSummaryCollector``, the two edge-free
     passes built on ``CallCollector``.
@@ -130,7 +132,7 @@ from .discovery import (
     module_for_analysis_file,
     path_to_module,
 )
-from .collectors import CallCollector
+from .collector import CallCollector
 from .summary_collectors import ReturnSummaryCollector, TypeSummaryCollector
 from .models import (
     MODULE_CALLABLE_QUALNAME,
