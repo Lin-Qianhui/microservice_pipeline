@@ -260,6 +260,29 @@ class ResolutionMixin(CollectorState):
                 return named[0]
         return self.current_class_id()
 
+    def _resolve_module_alias_target(
+        self, imported_base: str, attr: str
+    ) -> Tuple[str, str, bool]:
+        """Resolve ``alias.attr`` where ``alias`` is an imported module.
+
+        The attribute path is only the *spelling*: ``import parcels._sgrid as
+        sgrid`` followed by ``sgrid.get_n_faces()`` names
+        ``parcels._sgrid.get_n_faces``, but the function is defined in
+        ``parcels._sgrid.core`` and merely re-exported by the package
+        ``__init__``. Only the defining path is a known callable, so without the
+        same alias canonicalization the ``ast.Name`` branch already does, the
+        target looks external and the edge is dropped.
+        """
+        target = f"{imported_base}.{attr}"
+        if self.project_index.is_known_class(target):
+            class_id = self.project_index.known_class_id(target)
+            init_targets = self.project_index.resolve_constructor_targets(class_id)
+            if init_targets:
+                return (init_targets[0], "constructor", True)
+        canonical = self.project_index.canonical_callable_id(target)
+        is_known = canonical in self.callable_ids
+        return (canonical if is_known else target, "imported", is_known)
+
     def _resolve_callee(self, func: ast.AST) -> Optional[Tuple[str, str, bool]]:
         """Resolve a simple name or dotted attribute to one best target.
 
@@ -349,31 +372,18 @@ class ResolutionMixin(CollectorState):
                 # imported module alias call: alias.fn()
                 imported_base = self.module_index.imports.get(func.value.id)
                 if imported_base:
-                    target = f"{imported_base}.{func.attr}"
-                    if self.project_index.is_known_class(target):
-                        class_id = self.project_index.known_class_id(target)
-                        init_targets = self.project_index.resolve_constructor_targets(class_id)
-                        if init_targets:
-                            return (init_targets[0], "constructor", True)
-                    is_known = target in self.callable_ids
-                    return (target, "imported", is_known)
+                    return self._resolve_module_alias_target(imported_base, func.attr)
 
             # nested imported alias: alias.sub.fn()
             if "." in full:
                 base, attr = full.split(".", 1)
                 imported_base = self.module_index.imports.get(base)
                 if imported_base:
-                    target = f"{imported_base}.{attr}"
-                    if self.project_index.is_known_class(target):
-                        class_id = self.project_index.known_class_id(target)
-                        init_targets = self.project_index.resolve_constructor_targets(class_id)
-                        if init_targets:
-                            return (init_targets[0], "constructor", True)
-                    is_known = target in self.callable_ids
-                    return (target, "imported", is_known)
+                    return self._resolve_module_alias_target(imported_base, attr)
 
             # maybe fully qualified local reference
-            is_known = full in self.callable_ids
-            return (full, "attribute", is_known)
+            canonical = self.project_index.canonical_callable_id(full)
+            is_known = canonical in self.callable_ids
+            return (canonical if is_known else full, "attribute", is_known)
 
         return None
