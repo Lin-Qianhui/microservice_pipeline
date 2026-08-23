@@ -159,6 +159,7 @@ except ImportError:  # pragma: no cover - supports direct script execution
 try:
     from microservice_pipeline.call_graph.generate_call_graph_ast import (
         CallGraphAnalysis,
+        ParsedFileCache,
         ProjectIndex,
         RegistrationRule,
         analyze_analysis_files,
@@ -193,6 +194,7 @@ try:
 except ImportError:  # pragma: no cover - supports direct script execution
     from microservice_pipeline.call_graph.generate_call_graph_ast import (  # type: ignore
         CallGraphAnalysis,
+        ParsedFileCache,
         ProjectIndex,
         RegistrationRule,
         analyze_analysis_files,
@@ -783,12 +785,15 @@ def collect_pyright_families_from_analysis_files(
     project_root: Path,
     analysis_files: Sequence[AnalysisFile],
     pyright_bin: str,
+    *,
+    cache: Optional[ParsedFileCache] = None,
 ) -> Dict[str, str]:
+    resolved_cache = cache if cache is not None else ParsedFileCache()
     targets: List[PyrightProbeTarget] = []
     for analysis_file in analysis_files:
         py_file = analysis_file.path
         module = analysis_file.module
-        tree = parse_python_file(py_file)
+        tree = resolved_cache.get(py_file)
         targets.extend(collect_pyright_probe_targets(tree, module, py_file))
     return probe_pyright_targets(project_root, targets, pyright_bin)
 
@@ -931,6 +936,31 @@ class DataAccessCollector(RegisteredStateLineageMixin, ast.NodeVisitor):
         return set(self.known_classes) | set(self.attrdict_classes)
 
     def _resolve_class_reference_name(self, name: str) -> Set[str]:
+        """Every project class a class-reference expression could name.
+
+        Two resolvers unioned rather than one replacing the other.
+        ``ProjectIndex`` is strictly better on the four axes that matter --
+        it canonicalizes re-export aliases, follows star imports, indexes
+        classes that define no methods, and sees imports nested inside
+        functions and ``try`` blocks -- but it is built from the call graph's
+        class index, which has no notion of an attrdict class. The local
+        resolver is the only thing that resolves those, so dropping it would
+        silently lose resolutions, and the registration-lineage gates are
+        ``len(...) != 1``: a loss produces no edge and no warning, which is
+        indistinguishable from the defect this fixes.
+        """
+        matches = self._local_class_reference_matches(name)
+        if name and self.project_index is not None:
+            module_index = self.project_index.module_map.get(self.module)
+            if module_index is not None:
+                matches.update(
+                    self.project_index.resolve_class_reference_name(
+                        self.module, module_index, name
+                    )
+                )
+        return matches
+
+    def _local_class_reference_matches(self, name: str) -> Set[str]:
         if not name:
             return set()
         known_classes = self._known_class_ids()
@@ -1553,6 +1583,41 @@ class DataAccessCollector(RegisteredStateLineageMixin, ast.NodeVisitor):
             return f"{self.module}.{self.current_class}.{name}"
         return f"{self.module}.{name}"
 
+    def _canonical_callable_id(self, candidate: str) -> Optional[str]:
+        """The defining path of a re-export alias, when that path is a known callable.
+
+        The attribute path a call is spelled with is only the *spelling*:
+        ``import parcels._sgrid as sgrid`` followed by ``sgrid.get_n_faces()``
+        names ``parcels._sgrid.get_n_faces``, but the function is defined in
+        ``parcels._sgrid.core`` and merely re-exported by the package
+        ``__init__``. Only the defining path is a key in ``callable_map``, so
+        without this the call resolves to nothing at all -- and unlike the call
+        graph, where that costs an edge, here it costs the object too.
+
+        Mirrors ``call_graph.collector.resolution._resolve_module_alias_target``.
+        Returns ``None`` when there is nothing to add, so callers append rather
+        than substitute and today's candidate order is preserved.
+        """
+        if self.project_index is None:
+            return None
+        canonical = self.project_index.canonical_callable_id(candidate)
+        if canonical != candidate and canonical in self.callable_map:
+            return canonical
+        return None
+
+    def _append_candidate(self, candidates: List[str], candidate: str) -> None:
+        """Record a candidate, followed by its canonical form when one exists.
+
+        Appended rather than substituted: ``_return_ref_from_call`` takes the
+        first candidate that hits a map, so keeping the raw spelling first means
+        every resolution that works today still wins, and the canonical entry
+        only fires where nothing resolved before.
+        """
+        candidates.append(candidate)
+        canonical = self._canonical_callable_id(candidate)
+        if canonical is not None:
+            candidates.append(canonical)
+
     def _candidate_callable_ids_for_call(self, node: ast.Call) -> List[str]:
         dynamic_candidates = self._dynamic_getattr_callable_ids(node.func)
         if dynamic_candidates:
@@ -1565,11 +1630,11 @@ class DataAccessCollector(RegisteredStateLineageMixin, ast.NodeVisitor):
         if call_name in self.callable_map:
             candidates.append(call_name)
         if call_name in self.module_imports:
-            candidates.append(self.module_imports[call_name])
+            self._append_candidate(candidates, self.module_imports[call_name])
         if "." in call_name:
             prefix, _, suffix = call_name.partition(".")
             if prefix in self.module_imports:
-                candidates.append(f"{self.module_imports[prefix]}.{suffix}")
+                self._append_candidate(candidates, f"{self.module_imports[prefix]}.{suffix}")
         if "." not in call_name:
             for imported_module in self.star_imports:
                 candidates.append(f"{imported_module}.{call_name}")
@@ -1580,7 +1645,7 @@ class DataAccessCollector(RegisteredStateLineageMixin, ast.NodeVisitor):
             method = call_name.split(".", 1)[1]
             candidates.append(f"{self.module}.{self.current_class}.{method}")
         else:
-            candidates.append(call_name)
+            self._append_candidate(candidates, call_name)
             candidates.append(f"{self.module}.{call_name}")
         known_ids = set(self.callable_map) | set(self.callable_params) | set(self.return_summaries) | set(self.return_tuple_summaries)
         expanded: List[str] = []
@@ -1611,7 +1676,12 @@ class DataAccessCollector(RegisteredStateLineageMixin, ast.NodeVisitor):
         known_ids = set(self.callable_map) | set(self.callable_params) | set(self.return_summaries) | set(self.return_tuple_summaries)
         if isinstance(attr_arg, ast.Constant) and isinstance(attr_arg.value, str):
             target = f"{imported_base}.{attr_arg.value}"
-            return [target] if target in known_ids else []
+            if target in known_ids:
+                return [target]
+            # Same alias canonicalization as the direct-call path: the attribute
+            # a package re-exports is not the path the callable is defined at.
+            canonical = self._canonical_callable_id(target)
+            return [canonical] if canonical is not None else []
 
         prefix = f"{imported_base}."
         return sorted(callable_id for callable_id in known_ids if callable_id.startswith(prefix))
@@ -2715,6 +2785,7 @@ def collect_data_access_from_analysis_files(
     pyright_families: Optional[Dict[str, str]] = None,
     registration_rules: Optional[Dict[str, RegistrationRule]] = None,
     project_index: Optional[ProjectIndex] = None,
+    cache: Optional[ParsedFileCache] = None,
 ) -> Tuple[Dict[str, DataObject], List[AccessEdge], List[LineageEdge]]:
     objects: Dict[str, DataObject] = {}
     edges: List[AccessEdge] = []
@@ -2722,6 +2793,12 @@ def collect_data_access_from_analysis_files(
     analysis_files = list(analysis_files)
     if not analysis_files:
         return objects, edges, lineage_edges
+    # One tree per file for the whole stage. The caller normally hands in the
+    # cache the call-graph passes already populated -- by the time
+    # ``analyze_analysis_files`` returns it holds every file, parsed once, with
+    # ``attach_parents`` applied -- but a local one still collapses the four to
+    # ten parses per file this stage used to perform down to one.
+    resolved_cache = cache if cache is not None else ParsedFileCache()
     resolved_pyright_families = (
         pyright_families
         if pyright_families is not None
@@ -2729,12 +2806,15 @@ def collect_data_access_from_analysis_files(
             project_root or discover_project_root(analysis_files[0].path),
             analysis_files,
             pyright_bin,
+            cache=resolved_cache,
         )
     )
     return_summaries: Dict[str, ExprRef] = {}
     return_tuple_summaries: Dict[str, Tuple[Optional[ExprRef], ...]] = {}
     callable_params: Dict[str, Tuple[str, ...]] = {}
-    attrdict_classes = collect_attrdict_classes_from_analysis_files(analysis_files)
+    attrdict_classes = collect_attrdict_classes_from_analysis_files(
+        analysis_files, cache=resolved_cache
+    )
 
     # Iterate to a small fixpoint so return summaries can propagate through
     # shallow call chains even when files are not processed in dependency order.
@@ -2744,7 +2824,7 @@ def collect_data_access_from_analysis_files(
         for analysis_file in analysis_files:
             py_file = analysis_file.path
             module = analysis_file.module
-            tree = parse_python_file(py_file)
+            tree = resolved_cache.get(py_file)
             collect_data_access_from_tree(
                 tree=tree,
                 module=module,
@@ -2767,7 +2847,7 @@ def collect_data_access_from_analysis_files(
     for analysis_file in analysis_files:
         py_file = analysis_file.path
         module = analysis_file.module
-        tree = parse_python_file(py_file)
+        tree = resolved_cache.get(py_file)
         module_lineage_edges: List[LineageEdge] = []
         module_objects, module_edges, module_lineage_edges = collect_data_access_from_tree(
             tree=tree,
@@ -2814,6 +2894,7 @@ def collect_data_access(
     exclude_globs: Sequence[str] = (),
     registration_rules: Optional[Dict[str, RegistrationRule]] = None,
     project_index: Optional[ProjectIndex] = None,
+    cache: Optional[ParsedFileCache] = None,
 ) -> Tuple[Dict[str, DataObject], List[AccessEdge], List[LineageEdge]]:
     analysis_files = list(
         iter_analysis_files(
@@ -2833,12 +2914,15 @@ def collect_data_access(
         pyright_families=pyright_families,
         registration_rules=registration_rules,
         project_index=project_index,
+        cache=cache,
     )
 
 
 def _pyright_families_for_config(
     config: ExtractionConfig,
     analysis_files: Sequence[AnalysisFile],
+    *,
+    cache: Optional[ParsedFileCache] = None,
 ) -> Optional[Dict[str, str]]:
     if not config.data_access.pyright.enabled:
         return {}
@@ -2849,6 +2933,7 @@ def _pyright_families_for_config(
             config.project_root,
             analysis_files,
             config.data_access.pyright.bin,
+            cache=cache,
         )
     except RuntimeError as exc:
         print(f"Pyright failed; continuing with unknown families: {exc}", file=sys.stderr)
@@ -2876,7 +2961,13 @@ def run_from_extraction_config(config: ExtractionConfig, *, outdir: Optional[Pat
         analysis_files, summary_packages=config.call_graph.summary_packages
     )
     callable_map = analysis.project_nodes()
-    pyright_families = _pyright_families_for_config(config, analysis_files)
+    # ``analysis.cache`` already holds every file, parsed once, with parents
+    # attached. Re-parsing here is not a missed optimization but a discarded
+    # value: the cache is the first field of ``CallGraphAnalysis`` precisely
+    # because this stage is its second consumer.
+    pyright_families = _pyright_families_for_config(
+        config, analysis_files, cache=analysis.cache
+    )
     objects, edges, lineage_edges = collect_data_access_from_analysis_files(
         analysis_files,
         callable_map,
@@ -2885,6 +2976,7 @@ def run_from_extraction_config(config: ExtractionConfig, *, outdir: Optional[Pat
         pyright_families=pyright_families,
         registration_rules=analysis.registration_rules,
         project_index=analysis.project_index,
+        cache=analysis.cache,
     )
     output_dir = (outdir or config.data_access.outdir).resolve()
     write_outputs(output_dir, callable_map, objects, edges, lineage_edges)
@@ -3011,6 +3103,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         entrypoints=entrypoints,
         registration_rules=analysis.registration_rules,
         project_index=analysis.project_index,
+        cache=analysis.cache,
     )
     write_outputs(outdir, callable_map, objects, edges, lineage_edges)
 

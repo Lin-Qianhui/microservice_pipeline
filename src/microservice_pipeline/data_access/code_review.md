@@ -880,6 +880,17 @@ count on climlab is recorded before and after — §5.2 predicts it rises, and i
 not, that hypothesis is dead and §2.7 is the whole explanation. Do this first because
 it is also the cleanest test of whether the two packages can share resolution at all.
 
+> **DONE (2026-08-23) — see [`step0_adopt_call_graph_fixes.md`](step0_adopt_call_graph_fixes.md).**
+> Registration lineage on climlab went **3 → 13**, so the §5.2 hypothesis survived and
+> §2.7's `state=` gate is *not* the whole explanation. Objects +12, access edges +18,
+> lineage edges +21, **nothing lost**; parses per file 4 → 1, or 0 with the shared cache.
+> Two departures from the wording above, both explained there: §5.2 became a *union* with
+> the local resolver rather than a replacement (`ProjectIndex` does not know attrdict
+> classes), and §3.1's `known_ids` hoist was deliberately left for Step 6 because those
+> sets are mutated mid-traversal. Note also that the new lineage moved 22 derived
+> `alias_of` / `access_path` fields via §1.3 and §1.4 — further evidence for doing Step 2
+> before anything judged by artifact diff.
+
 **Step 1 — Build the data-access oracle (§6).** Nothing after this can be shown to
 help until it exists, and the call-graph history is that the instrument found defects
 nobody had listed. Acceptance: a per-object-kind recall report against a traced run of

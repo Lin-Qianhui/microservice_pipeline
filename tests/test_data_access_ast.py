@@ -1649,3 +1649,231 @@ def ignored():
         obj.owner == "docs.run_example.<module>" and obj.display_name == "config"
         for obj in objects.values()
     )
+
+
+# --- Step 0: fixes adopted from call_graph (code_review.md 5.1, 5.2, 5.3) ---
+
+
+def _write_reexport_package(tmp_path: Path) -> None:
+    """A package whose ``__init__`` re-exports from the module that defines it.
+
+    The spelling ``pkg.build_index`` is not the defining path
+    ``pkg.core.build_index``, so nothing is keyed on it. This is the shape that
+    made the call graph drop 55 of its 110 missing edges before Step 3b.
+    """
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text(
+        """
+from .core import build_index
+""",
+        encoding="utf-8",
+    )
+    (pkg / "core.py").write_text(
+        """
+def build_index(rows):
+    index = {}
+    for row in rows:
+        index[row] = 1
+    return index
+""",
+        encoding="utf-8",
+    )
+
+
+def test_module_alias_reexport_call_still_tracks_the_returned_container(tmp_path):
+    """5.1: the value flowing out of an aliased re-export call keeps its type.
+
+    Before the canonicalization, ``_return_ref_from_call`` returned ``None`` for
+    this call, so the local it binds was never tracked as a container -- the
+    object vanished, not merely a relation.
+    """
+    _write_reexport_package(tmp_path)
+    (tmp_path / "consumer.py").write_text(
+        """
+import pkg as p
+
+
+def lookup(rows):
+    index = p.build_index(rows)
+    return index['alpha']
+""",
+        encoding="utf-8",
+    )
+
+    objects, edges, _lineage = _collect_with_registration(tmp_path)
+
+    # The local now exists at all, and carries the callee's container family.
+    assert "local_exposed:consumer.lookup:index" in objects
+    assert objects["local_exposed:consumer.lookup:index"].inferred_type == "dict"
+    # ...and the key read is attributed, rooted at the container the callee built.
+    assert "dict_key:pkg.core.build_index:index:alpha" in objects
+    assert _edge_exists(
+        edges, "dict_key:pkg.core.build_index:index:alpha", access="read"
+    )
+
+
+def test_module_alias_reexport_call_records_arg_to_param_lineage(tmp_path):
+    """5.1: the second victim -- no candidate meant no ``arg_to_param`` edge."""
+    _write_reexport_package(tmp_path)
+    (tmp_path / "consumer.py").write_text(
+        """
+import pkg as p
+
+
+def lookup(rows):
+    return p.build_index(rows)
+""",
+        encoding="utf-8",
+    )
+
+    _objects, _edges, lineage = _collect_with_registration(tmp_path)
+
+    assert any(
+        edge.relation == "arg_to_param"
+        and edge.dst_object_id == "param:pkg.core.build_index:rows"
+        and edge.src_object_id == "param:consumer.lookup:rows"
+        for edge in lineage
+    )
+
+
+def test_registration_child_reached_through_reexport_records_state_lineage(tmp_path):
+    """5.2: the climlab shape -- a subprocess class reached through a re-export.
+
+    ``p.Child`` resolves through ``module_imports`` to ``pkg.Child``, which is
+    not where the class is defined and so is not a known class. ``child_types``
+    came back empty, the ``len(child_types) != 1`` gate declined, and
+    registration lineage produced nothing: no edge, no warning, no diagnostic.
+
+    This is the ``EBM.add_subprocess('LW', climlab.radiation.AplusBT(...))``
+    shape, and swapping in ``ProjectIndex`` took climlab from 3 such edges to 13.
+    """
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text(
+        """
+from .child import Child
+""",
+        encoding="utf-8",
+    )
+    (pkg / "child.py").write_text(
+        """
+class Child:
+    def __init__(self, state):
+        self.state = state
+
+    def run(self):
+        pass
+""",
+        encoding="utf-8",
+    )
+    (tmp_path / "model.py").write_text(
+        """
+import pkg as p
+
+
+class Model:
+    def __init__(self):
+        self.state = {}
+        self.children = {}
+        self.wire_up("child", p.Child(state=self.state))
+
+    def wire_up(self, name, proc):
+        self.children.update({name: proc})
+
+    def run(self):
+        for name, proc in self.children.items():
+            proc.run()
+""",
+        encoding="utf-8",
+    )
+
+    _objects, _edges, lineage = _collect_with_registration(tmp_path)
+
+    assert any(
+        edge.relation == "state_assign"
+        and edge.src_object_id == "class_state:pkg.child.Child"
+        and edge.dst_object_id == "class_state:model.Model"
+        for edge in lineage
+    ), [(e.relation, e.src_object_id, e.dst_object_id) for e in lineage]
+
+
+def test_attrdict_class_resolution_survives_the_project_index_union(tmp_path):
+    """5.2: the union must not cost what only the local resolver could resolve.
+
+    ``ProjectIndex`` is built from the call graph's class index and has no
+    notion of an attrdict class, so replacing the local resolver rather than
+    unioning with it would drop this silently.
+    """
+    (tmp_path / "sample.py").write_text(
+        """
+class Box:
+    def __init__(self, data):
+        self._data = data
+
+    def __getattr__(self, key):
+        return self._data[key]
+
+
+def use():
+    box = Box({'alpha': 1})
+    return box.alpha
+""",
+        encoding="utf-8",
+    )
+
+    objects, _edges, _lineage = _collect_with_registration(tmp_path)
+
+    assert any(
+        obj.kind == "dict_key" and obj.field == "alpha" for obj in objects.values()
+    ), sorted(objects)
+
+
+def test_data_access_parses_each_file_once(tmp_path, monkeypatch):
+    """5.3 / 3.3: four parses per file became one, or none with a shared cache."""
+    from microservice_pipeline.call_graph import ast_utils
+
+    _write_reexport_package(tmp_path)
+    (tmp_path / "consumer.py").write_text(
+        """
+import pkg as p
+
+
+def lookup(rows):
+    return p.build_index(rows)
+""",
+        encoding="utf-8",
+    )
+
+    analysis_files = list(iter_analysis_files(tmp_path))
+    analysis = analyze_analysis_files(analysis_files)
+
+    parsed = []
+    real_parse = ast_utils.parse_python_file
+    monkeypatch.setattr(
+        ast_utils,
+        "parse_python_file",
+        lambda py_file: (parsed.append(py_file), real_parse(py_file))[1],
+    )
+
+    collect_data_access_from_analysis_files(
+        analysis_files,
+        analysis.project_nodes(),
+        project_root=tmp_path,
+        pyright_families={},
+        registration_rules=analysis.registration_rules,
+        project_index=analysis.project_index,
+    )
+    assert sorted(parsed) == sorted(f.path for f in analysis_files)
+
+    parsed.clear()
+    collect_data_access_from_analysis_files(
+        analysis_files,
+        analysis.project_nodes(),
+        project_root=tmp_path,
+        pyright_families={},
+        registration_rules=analysis.registration_rules,
+        project_index=analysis.project_index,
+        cache=analysis.cache,
+    )
+    assert parsed == []

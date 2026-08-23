@@ -4,14 +4,14 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
-from typing import Dict, List, Sequence, Set
+from typing import Dict, List, Optional, Sequence, Set
 
 from microservice_pipeline.import_resolution import (
     is_package_file,
     resolve_import_from_module,
     resolve_import_from_target,
 )
-from microservice_pipeline.call_graph.generate_call_graph_ast import parse_python_file
+from microservice_pipeline.call_graph.generate_call_graph_ast import ParsedFileCache
 from microservice_pipeline.data_access.rules import _attribute_path, _slice_value
 
 
@@ -113,10 +113,15 @@ def collect_attrdict_classes(tree: ast.Module, module: str, file: Path) -> Set[s
     return attrdict_classes
 
 
-def collect_attrdict_classes_from_analysis_files(analysis_files: Sequence[object]) -> Set[str]:
+def collect_attrdict_classes_from_analysis_files(
+    analysis_files: Sequence[object],
+    *,
+    cache: Optional[ParsedFileCache] = None,
+) -> Set[str]:
+    resolved_cache = cache if cache is not None else ParsedFileCache()
     attrdict_classes: Set[str] = set()
     for analysis_file in analysis_files:
         path = analysis_file.path
-        tree = parse_python_file(path)
+        tree = resolved_cache.get(path)
         attrdict_classes.update(collect_attrdict_classes(tree, analysis_file.module, path))
     return attrdict_classes
