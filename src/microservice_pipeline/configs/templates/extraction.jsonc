@@ -45,6 +45,40 @@
 
     // Raw call graph artifacts: call_graph.json, nodes.csv, and edges.csv.
     "outdir": "artifacts/call_graph",
+
+    // Installed third-party packages to read for registry evidence only, e.g.
+    // ["torch", "sklearn"]. Frameworks couple objects by taking one and
+    // invoking it later -- add_module, register, Pipeline(steps=[...]) --
+    // and the method that does it lives in the framework, not here. Reading it
+    // is what lets those calls become `registered_invoke` edges without anyone
+    // naming the method. Nothing from these packages becomes a node or an edge;
+    // only the facts are kept. Costs one extra parse of each package per run,
+    // so list only frameworks whose objects this project actually registers.
+    "summary_packages": [],
+
+    // Optional runtime ground truth for `trace-runtime` and `compare-graphs`.
+    // Each driver runs inside the pipeline process, because sys.monitoring
+    // cannot observe a subprocess. Leave every list empty to skip tracing.
+    "trace": {
+      // Arguments passed to an in-process pytest run, e.g.
+      // ["tests", "-m", "fast", "-q"]. Test failures are tolerated: a failing
+      // test still contributes the edges it reached.
+      "pytest_args": [],
+
+      // Notebook globs, relative to project_root, e.g. ["courseware/*.ipynb"].
+      // Code cells run one at a time in a shared namespace and a failing cell
+      // does not abort the rest.
+      "notebook_globs": [],
+
+      // Plain Python scripts to execute as additional drivers.
+      "scripts": [],
+
+      // Consecutive hits at one call site without revealing a new callee
+      // before that site stops being monitored. Higher costs more time but is
+      // safer for highly polymorphic dispatch; 1 would report only the first
+      // callee at every site.
+      "disable_after": 20,
+    },
   },
 
   "data_access": {

@@ -20,6 +20,11 @@ clustering = [
 test = [
   "pytest",
 ]
+# Drivers for `trace-runtime`. The tracer itself needs only the stdlib
+# (sys.monitoring, Python 3.12+); these are what drive the analyzed project.
+trace = [
+  "pytest",
+]
 
 [project.scripts]
 microservice-pipeline = "microservice_pipeline.cli.main:main"

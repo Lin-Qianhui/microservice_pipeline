@@ -8,7 +8,9 @@ from typing import Callable, Sequence
 
 
 def _commands() -> dict[str, Callable[[Sequence[str] | None], None]]:
+    from microservice_pipeline.call_graph.dynamic_trace import main as trace_runtime_main
     from microservice_pipeline.call_graph.generate_call_graph_ast import main as call_graph_main
+    from microservice_pipeline.call_graph.graph_comparison import main as compare_graphs_main
     from microservice_pipeline.cli.init_config import main as init_config_main
     from microservice_pipeline.cluster_call_graph import main as call_cluster_main
     from microservice_pipeline.cluster_structural_graph import main as structural_cluster_main
@@ -23,6 +25,7 @@ def _commands() -> dict[str, Callable[[Sequence[str] | None], None]]:
     return {
         "call-graph": call_graph_main,
         "call-cluster": call_cluster_main,
+        "compare-graphs": compare_graphs_main,
         "data-access": data_access_main,
         "evaluate": evaluate_main,
         "infer-shared-containers": infer_shared_containers_main,
@@ -30,6 +33,7 @@ def _commands() -> dict[str, Callable[[Sequence[str] | None], None]]:
         "notebook-tasks": notebook_tasks_main,
         "structural-graph": structural_graph_main,
         "structural-cluster": structural_cluster_main,
+        "trace-runtime": trace_runtime_main,
     }
 
 

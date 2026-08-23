@@ -145,6 +145,59 @@ Important artifacts:
 Set `call_graph.include_external` to `true` when unresolved or external calls
 should remain visible as edges.
 
+#### Optional: measure the call graph against runtime ground truth
+
+The extractors never execute the analyzed project, so a call the interpreter
+resolves at runtime through a registry, a base class, or a container can be
+invisible to them. When the analyzed project *can* be run, `trace-runtime`
+records the calls it really dispatches, using `sys.monitoring` (PEP 669,
+requires Python 3.12+), and `compare-graphs` reports what the static pass
+missed:
+
+```bash
+microservice-pipeline trace-runtime \
+  --config configs/microservice_pipeline/extraction.jsonc
+
+microservice-pipeline compare-graphs \
+  --config configs/microservice_pipeline/extraction.jsonc
+```
+
+Drivers are declared under `call_graph.trace` (`pytest_args`,
+`notebook_globs`, `scripts`) and all run **inside** the pipeline process,
+because `sys.monitoring` cannot observe a subprocess. Failing tests and failing
+notebook cells are tolerated: each still contributes the edges it reached.
+
+| Artifact | Contents |
+| --- | --- |
+| `dynamic_edges.csv` | Caller-to-callee pairs actually dispatched at runtime |
+| `dynamic_trace.json` | Callables entered, driver problems, tracing statistics |
+| `graph_comparison.md` | Recall, missing edges grouped by owner, per-relation confirmation |
+
+Read the two directions differently. **Recall** — runtime edges the static pass
+never inferred — is the real measurement, and every miss is a genuine gap.
+**Unconfirmed static edges** are a weak signal: a static edge that never
+dispatched usually means the branch did not run, not that it is wrong. Edges the
+runtime cannot express are excluded from both directions, namely `import` edges
+(module bodies are executed by the import machinery in C) and unresolved edges
+(their callee is a name, not a project callable).
+
+#### Optional: cross-check against PyCG
+
+When the analyzed project *cannot* be run, there is no ground truth to measure
+against — but a second static extractor still catches mistakes the first one
+makes alone. [`scripts/`](scripts/README.md) runs
+[PyCG](https://github.com/vitsalis/PyCG), which uses a different technique
+(inter-procedural points-to analysis rather than an AST pass with targeted type
+inference), and reports the edges as `both` / `ours_only` / `pycg_only`.
+
+Read it as a cross-check, **not** as ground truth. Neither graph is authoritative,
+so disagreements are triaged by hand in both directions, and a clean result
+bounds nothing about what both tools missed together. Runtime tracing above is
+the stronger signal whenever the project can be executed.
+
+PyCG is unmaintained and needs its own Python 3.11 environment; see
+[`scripts/README.md`](scripts/README.md) for the setup and the pins it depends on.
+
 ### 2. Extract Raw Data Access
 
 Run the first data-access extraction without a shared-container mapping:

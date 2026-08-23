@@ -23,9 +23,36 @@ class PyrightConfig:
 
 
 @dataclass(frozen=True)
+class RuntimeTraceConfig:
+    """Drivers used to produce a runtime ground-truth call graph.
+
+    Every driver is executed inside the pipeline process, because
+    ``sys.monitoring`` cannot see across a process boundary. ``disable_after``
+    caps how long a call site keeps being monitored once it stops revealing new
+    callees; see ``call_graph.dynamic_trace.CallTracer``.
+    """
+    pytest_args: Tuple[str, ...] = ()
+    notebook_globs: Tuple[str, ...] = ()
+    scripts: Tuple[Path, ...] = ()
+    disable_after: int = 20
+
+
+@dataclass(frozen=True)
 class CallGraphExtractionConfig:
+    """How the static call graph is built.
+
+    ``summary_packages`` names installed third-party packages to read for
+    registry evidence only -- which parameters a framework's registration method
+    retains, and which retained values it later invokes. Those facts let the
+    analyzer recognise ``model.add_module(name, layer)`` as coupling without
+    being told the method name, and they live in the framework's own source
+    rather than in the project using it. Nothing from these packages becomes a
+    node or an edge; see ``call_graph.discovery.iter_summary_only_files``.
+    """
     include_external: bool = False
     outdir: Path = Path("artifacts/call_graph")
+    trace: RuntimeTraceConfig = RuntimeTraceConfig()
+    summary_packages: Tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -131,6 +158,21 @@ def _call_graph_config(payload: Mapping[str, Any], project_root: Path) -> CallGr
     return CallGraphExtractionConfig(
         include_external=_bool(payload.get("include_external"), False),
         outdir=resolve_project_path(project_root, payload.get("outdir")) or (project_root / "artifacts/call_graph"),
+        trace=_runtime_trace_config(_mapping(payload.get("trace"), "call_graph.trace"), project_root),
+        summary_packages=tuple(_string_list(payload.get("summary_packages", []))),
+    )
+
+
+def _runtime_trace_config(payload: Mapping[str, Any], project_root: Path) -> RuntimeTraceConfig:
+    raw_disable_after = payload.get("disable_after")
+    disable_after = int(raw_disable_after) if raw_disable_after is not None else 20
+    if disable_after < 1:
+        raise ValueError("call_graph.trace.disable_after must be at least 1")
+    return RuntimeTraceConfig(
+        pytest_args=tuple(_string_list(payload.get("pytest_args"))),
+        notebook_globs=tuple(_string_list(payload.get("notebook_globs", payload.get("notebooks", [])))),
+        scripts=_path_tuple(project_root, payload.get("scripts")),
+        disable_after=disable_after,
     )
 
 

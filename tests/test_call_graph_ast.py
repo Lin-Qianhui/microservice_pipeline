@@ -10,8 +10,10 @@ from microservice_pipeline.call_graph.generate_call_graph_ast import (
     build_type_summaries,
     collect_edges,
     iter_analysis_files,
+    iter_analysis_files_for_source_roots,
     iter_python_files,
 )
+from microservice_pipeline.config import SourceRootConfig
 
 
 def _edge_exists(edges, caller, callee, relation=None):
@@ -82,6 +84,47 @@ def test_source_excluded_files_are_config_driven(tmp_path):
     }
 
     assert scanned == {included.relative_to(src)}
+
+
+def test_exclude_globs_survive_entrypoints(tmp_path):
+    """Entry points must not re-admit excluded files.
+
+    The pass that adds entry points walks the source root again before yielding
+    them. When it did so without the configured globs, every excluded file came
+    back, because the `seen` set only holds files the filtered pass accepted.
+    Regression guard: excludes and entry points are each covered above, but the
+    bug only appeared when both were used together.
+    """
+    src = tmp_path / "src" / "pkg"
+    src.mkdir(parents=True)
+    (src / "__init__.py").write_text("", encoding="utf-8")
+    (src / "kept.py").write_text("def kept():\n    pass\n", encoding="utf-8")
+    (src / "dropped.py").write_text("def dropped():\n    pass\n", encoding="utf-8")
+
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    entrypoint = docs / "run_example.py"
+    entrypoint.write_text("from pkg.kept import kept\n\nkept()\n", encoding="utf-8")
+
+    def scan(entrypoints):
+        return {
+            analysis_file.path
+            for analysis_file in iter_analysis_files_for_source_roots(
+                [SourceRootConfig(path=src, module_prefix="pkg")],
+                entrypoints=entrypoints,
+                project_root=tmp_path,
+                exclude_globs=["src/pkg/dropped.py"],
+            )
+        }
+
+    without_entrypoint = scan(())
+    with_entrypoint = scan((entrypoint,))
+
+    assert src / "dropped.py" not in without_entrypoint
+    assert src / "dropped.py" not in with_entrypoint
+    assert src / "kept.py" in with_entrypoint
+    assert entrypoint in with_entrypoint
+    assert with_entrypoint == without_entrypoint | {entrypoint}
 
 
 def test_explicit_entrypoint_is_included_without_scanning_all_docs(tmp_path):
@@ -2084,6 +2127,115 @@ def run():
     _nodes, edges = _build_call_graph(tmp_path)
 
     assert _edge_exists(edges, "app.run", "outer.inner.impl.helper", "imported")
+
+
+def test_call_through_module_alias_resolves_reexported_callable(tmp_path):
+    """``import pkg as p`` then ``p.helper()`` must reach the definition.
+
+    The alias spells the target ``pkg.helper``, but a package that re-exports
+    from a submodule defines it at ``pkg.impl.helper``. The plain
+    ``from pkg import helper`` form was canonicalized through the callable alias
+    map; the module-alias attribute form was not, so every such call looked
+    external and its edge was dropped.
+    """
+    package = tmp_path / "pkg"
+    package.mkdir()
+    (package / "__init__.py").write_text(
+        "from .impl import Widget, helper\n", encoding="utf-8"
+    )
+    (package / "impl.py").write_text(
+        """
+def helper():
+    pass
+
+
+class Widget:
+    def __init__(self):
+        pass
+""",
+        encoding="utf-8",
+    )
+    (tmp_path / "app.py").write_text(
+        """
+import pkg as p
+
+
+def run():
+    p.helper()
+    return p.Widget()
+""",
+        encoding="utf-8",
+    )
+
+    _nodes, edges = _build_call_graph(tmp_path)
+
+    assert _edge_exists(edges, "app.run", "pkg.impl.helper", "imported")
+    assert _edge_exists(edges, "app.run", "pkg.impl.Widget.__init__", "constructor")
+
+
+def test_call_through_nested_module_alias_resolves_reexported_callable(tmp_path):
+    """``import pkg as p`` then ``p.sub.helper()`` takes the dotted-suffix path."""
+    package = tmp_path / "pkg"
+    sub = package / "sub"
+    sub.mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (sub / "__init__.py").write_text("from .impl import helper\n", encoding="utf-8")
+    (sub / "impl.py").write_text(
+        """
+def helper():
+    pass
+""",
+        encoding="utf-8",
+    )
+    (tmp_path / "app.py").write_text(
+        """
+import pkg as p
+
+
+def run():
+    p.sub.helper()
+""",
+        encoding="utf-8",
+    )
+
+    _nodes, edges = _build_call_graph(tmp_path)
+
+    assert _edge_exists(edges, "app.run", "pkg.sub.impl.helper", "imported")
+
+
+def test_plain_module_import_call_resolves_reexported_callable(tmp_path):
+    """The same, without ``as``: plain ``import pkg`` then ``pkg.helper()``.
+
+    ``import pkg`` binds the name to itself, so this takes the module-alias
+    path too -- the un-aliased spelling is the common case and was equally
+    broken.
+    """
+    package = tmp_path / "pkg"
+    package.mkdir()
+    (package / "__init__.py").write_text(
+        "from .impl import helper\n", encoding="utf-8"
+    )
+    (package / "impl.py").write_text(
+        """
+def helper():
+    pass
+""",
+        encoding="utf-8",
+    )
+    (tmp_path / "app.py").write_text(
+        """
+import pkg
+
+
+def run():
+    pkg.helper()
+""",
+        encoding="utf-8",
+    )
+
+    _nodes, edges = _build_call_graph(tmp_path)
+
+    assert _edge_exists(edges, "app.run", "pkg.impl.helper", "imported")
 
 
 def test_computed_default_argument_is_attributed_to_the_class_body(tmp_path):
