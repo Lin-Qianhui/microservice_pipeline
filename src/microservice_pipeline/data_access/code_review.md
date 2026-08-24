@@ -19,7 +19,7 @@ they do, not by where they live in the file.
 
 Nothing here is a measurement of *how often* these fire on a real codebase, because
 there is currently no instrument that could say. That gap is §6, and closing it is
-Step 1 of the plan for a reason.
+Step 1a of the plan for a reason.
 
 §5 is separate from the rest and answers a specific question: **which of these did
 your call-graph revision cause, and which does it now hand you the fix for?** Three
@@ -861,6 +861,45 @@ number means anything:
   This is the data-access analogue of the falsification instrument from Step 6, and
   worth the same effort.
 
+### 6.1 The two instruments are not equally ready — added 2026-08-23, after Step 0
+
+That second bullet draws a distinction this section then stops short of acting on. The
+access instrument and the identity instrument have **different prerequisites**, and
+building them together would hold the ready one hostage to the blocked one.
+
+**The access instrument is ready now.** Its unit is a
+`(callable, attribute-or-key, access-kind)` triple read off the *access site*. Step 0
+is the evidence that this is the stable half of the artifact: a change that added 12
+objects and 18 access edges removed **nothing**, and every field that did move was on an
+object rather than an edge. More to the point, the triple stays meaningful even where
+§1.2 shifts the object ID an edge points at, because the object ID is not part of it.
+
+**The identity instrument is blocked on Step 2.** What it scores is `alias_of` and the
+lineage graph — which is exactly what §1.3 (roots cached from inside a cycle) and §1.4
+(first-file-wins cross-file merge) make a function of file order rather than of the
+input. Step 0 measured that directly: a strictly additive change moved **22 derived
+fields** on climlab, 18 of them `alias_of`. An instrument calibrated against that today
+is calibrated against something that moves when the file order does, and its baseline
+would not be reproducible.
+
+So §6 splits into **Step 1a** and **Step 1b**, with Step 2 between them. See §7.
+
+**What the harness already provides** (checked 2026-08-23), which is why 1a is a smaller
+piece of work than this section makes it sound:
+
+| needed | status in `call_graph/dynamic_trace.py` |
+| --- | --- |
+| in-process execution under `sys.monitoring` | `CallTracer.__enter__` / `__exit__` |
+| runtime frame → static callable ID | `module_map_from_analysis_files`, `_code_id` |
+| bytecode offset → `(line, col_offset)` | `_position`, already using `co_positions()` |
+| drivers (pytest / notebook / script) | `run_pytest`, `run_notebook`, `run_script`, `trace_all` |
+| headless plotting, cwd handling | `_headless_matplotlib`, `_pushd` |
+| climlab drivers configured | `extraction.jsonc` → `trace.pytest_args` + `notebook_globs` |
+
+What is missing is the event set: it registers `events.CALL` only. 1a adds `INSTRUCTION`
+filtered to `LOAD_ATTR` / `STORE_ATTR` / `BINARY_SUBSCR` / `STORE_SUBSCR`, and a
+comparison module beside `graph_comparison.py`.
+
 ---
 
 ## 7. Plan
@@ -870,6 +909,30 @@ ordering: it moved alias canonicalization to the front, because those findings a
 already-solved problems whose fix is sitting on an object this package is handed, and
 because two of them make data access *silently emit nothing* rather than emit
 something wrong.
+
+**Execution order** (revised 2026-08-23, after Step 0):
+
+```
+0  ->  1a  ->  2  ->  1b  ->  3  ->  4  ->  5  ->  7  ->  8
+       |       |      |
+       |       |      +- identity oracle: needs Step 2's determinism to have a
+       |       |         reproducible baseline
+       |       +- the one gate that needs no oracle, so it can go early
+       +- access oracle: ready today, and everything after 3 needs it
+```
+
+Step numbers are unchanged from the original plan so existing references still resolve;
+what changed is that **Step 1 split into 1a and 1b with Step 2 between them** (§6.1),
+and **Step 6 left the sequence** — it is now opportunistic, see below.
+
+Two things Step 0 settled that this ordering now assumes:
+
+- **§2.7 is no longer the prime suspect** for climlab's low registration-lineage count.
+  Class-reference resolution was the larger cause (3 → 13 edges). Step 7 is still worth
+  doing; it is no longer the explanation for anything.
+- **Byte-identical artifact diff does not currently work as a verification method.**
+  That is Step 8's stated technique, so Step 8 is blocked on Step 2, not merely on the
+  oracle.
 
 **Step 0 — Adopt what the call graph already fixed: §5.1, §5.2, §5.3.** Cheapest work
 in this document and the only work that is already known-correct elsewhere. Route
@@ -891,10 +954,15 @@ it is also the cleanest test of whether the two packages can share resolution at
 > `alias_of` / `access_path` fields via §1.3 and §1.4 — further evidence for doing Step 2
 > before anything judged by artifact diff.
 
-**Step 1 — Build the data-access oracle (§6).** Nothing after this can be shown to
-help until it exists, and the call-graph history is that the instrument found defects
-nobody had listed. Acceptance: a per-object-kind recall report against a traced run of
-climlab, plus a baseline recorded in this document.
+**Step 1a — The access oracle (§6, first half).** Observed
+`(callable, attribute-or-key, access-kind)` triples from a traced run, scored against
+`access_edges.csv`. Nothing after this can be shown to help until it exists, and the
+call-graph history is that the instrument found defects nobody had listed. Ready to
+build today — see §6.1 for what the harness already provides. Acceptance: a
+per-object-kind recall report against a traced run of climlab, plus a baseline recorded
+in this document. Keep the three transferred properties: the trace is a lower bound, an
+unconfirmed edge is not a false one, and inexpressible relations are excluded before
+scoring rather than counted as gaps. Score computed keys separately from literal ones.
 
 **Step 2 — Determinism and ID consistency: §1.2, §1.3, §1.4, §1.5.** These make the
 output a function of the input rather than of file order. Do them before anything that
@@ -902,8 +970,22 @@ would be evaluated by comparing artifacts, because until they land a diff cannot
 distinguish a real change from a reordering. Acceptance: two runs with shuffled file
 order produce byte-identical artifacts.
 
+> This is the **only** acceptance gate in this plan that needs no oracle, which is why
+> it can sit ahead of Step 1b rather than behind the whole of Step 1. Step 0 supplied
+> the evidence that it is needed early: a strictly additive change moved 22 derived
+> `alias_of` / `access_path` fields on climlab.
+
+**Step 1b — The object-identity oracle (§6, second half).** `id()` at the observed
+access, settling whether two static object IDs are one runtime object — which makes
+§1.3 and §1.7 measurable rather than arguable, and is the only thing that can judge
+whether §1.7's `file:path` collapse manufactures real coupling. Deliberately **after**
+Step 2: what it scores is `alias_of` and the lineage graph, the two things §1.3 and §1.4
+make order-dependent, so a baseline taken before Step 2 would not be reproducible.
+Acceptance: an alias precision/recall report, and a recorded count of static alias
+claims the trace contradicts.
+
 **Step 3 — Container families: §1.1, §2.1, §2.2, §2.4.** The single largest precision
-lever, and Step 1 makes it measurable. Acceptance: the share of objects with
+lever, and Step 1a makes it measurable. Acceptance: the share of objects with
 `inferred_type == unknown` falls, and per-kind recall rises with it. Add the
 probe-resolution assertion from §2.1 so a silent total failure can never look like a
 clean run again.
@@ -921,9 +1003,25 @@ will conclude the wrong thing. Add the `resolvable_callable_ids` filter (§5.4) 
 diamond-hierarchy registration fixture (§5.6) as regression guards rather than fixes —
 neither is broken today, and both are one upstream change away from breaking quietly.
 
-**Step 6 — Performance: §3.1, §3.2, §3.3.** Mostly discharged by Step 0's cache; what
-remains is hoisting the per-call-site sets and sharing one frozen index. Acceptance:
-parses per file drop to one, and the stage's wall clock on climlab is recorded here.
+**Step 6 — Performance: §3.1, §3.2, §3.3.** *No longer sequenced — do it opportunistically.*
+§3.3 is discharged: Step 0 took parses per file from 4 to 1, or 0 when `analysis.cache`
+is threaded, so this step's original acceptance criterion is already met. What remains is
+§3.1 and §3.2, and both are the same move: hoist the per-call-site sets into one frozen
+per-run index.
+
+Profiled on climlab 2026-08-23, `_candidate_callable_ids_for_call` is **0.555s of the
+stage's 2.126s of profiled self-time — 26%, the single largest self-cost**, essentially
+all of it the `known_ids` rebuild. So §3.1 is real. But the stage runs in 0.9s unprofiled
+on climlab, so fixing it saves ~0.2s that nobody is waiting for, and it produces no
+correctness signal, so it gates nothing.
+
+Two reasons to do it anyway, when convenient: the cost is O(corpus) per call site, so it
+grows badly at matplotlib scale (~9,400 callables); and the frozen index it needs is the
+same one **§1.2 needs in Step 2**. Folding it into Step 2 is the cheapest moment.
+
+Note that hoisting is *not* the one-liner it appears to be: `return_summaries` and
+`return_tuple_summaries` are mutated by the collector during its own traversal, so a
+per-collector snapshot would go stale mid-walk. This is why Step 0 left it alone.
 
 **Step 7 — Framework independence: §2.6, §2.7.** Derive the shared-state gate the way
 registration was derived. Judge with `evaluate` on a second codebase; climlab cannot
@@ -933,7 +1031,18 @@ validate a generalization it is the special case of.
 byte-identical artifacts, as the `collector/` split was. §5 is the argument for going
 further than a split here: three of the four regressions in that section exist because
 this package reimplements resolution that `call_graph` already owns. The split should
-end with data access *calling* `ProjectIndex` rather than paraphrasing it.
+end with data access *calling* `ProjectIndex` rather than paraphrasing it. Step 0
+removed two of the three paraphrases, so the remaining one is the callable-ID convention
+of §2.5.
+
+> **Blocked on Step 2, not merely on the oracle.** The verification method named above
+> does not work today. Step 0 added zero objects and removed zero, and 22 derived fields
+> still moved on climlab, because §1.3 and §1.4 make `alias_of` and `access_path` depend
+> on file processing order. A refactor that reorders anything therefore produces a diff
+> that cannot be read. Attempting this step before Step 2 means doing a ~1,700-line split
+> with no working regression gate — which is precisely the failure the call-graph history
+> records, where two rounds of modularisation preserved the `_resolve_callees` ↔
+> `_infer_class_types` cycle intact.
 
 Written 2026-08-23. Findings above are against the tree at that date; line numbers
 will drift.

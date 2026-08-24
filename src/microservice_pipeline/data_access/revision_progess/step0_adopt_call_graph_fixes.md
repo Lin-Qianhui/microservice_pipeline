@@ -340,6 +340,19 @@ identically before and after.
   not merely splitting this package up but having it **call** `ProjectIndex` instead of
   paraphrasing it. Two of the three paraphrases are now gone.
 
+It also changed the plan's shape in three places, all recorded in `code_review.md`:
+
+1. **Step 1 split into 1a and 1b** with Step 2 between them (§6.1). The access oracle is
+   ready today; the object-identity oracle scores `alias_of` and the lineage graph, which
+   the 22 moved fields in §3 above show is order-dependent until Step 2 lands. Execution
+   order is now `0 → 1a → 2 → 1b → 3 → 4 → 5 → 7 → 8`.
+2. **Step 6 left the sequence.** Its stated acceptance criterion is already met here. The
+   remainder (§3.1) profiles at 26% of the stage but saves ~0.2s on climlab, so it gates
+   nothing; it is best folded into Step 2, which needs the same frozen index for §1.2.
+3. **Step 8 is blocked on Step 2**, not merely on the oracle — its verification method is
+   byte-identical artifact diff, and §3's caveat above is a demonstration that this does
+   not currently work.
+
 The thing this step demonstrates, and the reason the review put it first: three of the four
 regressions in §5 existed because this package reimplemented resolution that `call_graph`
 already owned. Sharing the real thing was cheap, lost nothing, and moved the number the
