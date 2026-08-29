@@ -360,6 +360,47 @@ become **two separate edges**, each carrying its own weight. `write_report` coun
 them separately too. Whether the fix is dedup or suppressing one of the two, the two
 edges currently describe one syntactic fact.
 
+### 1.14 Default-argument expressions are attributed to the callee — CONFIRMED, found by Step 1a
+
+Added 2026-08-24. This was not in the original catalogue; the access oracle produced it as
+its only surviving falsified claim on climlab, and the source confirms it.
+
+`_enter_callable` sets `current_callable` to the function being defined and *then* visits
+the defaults:
+
+```python
+# Defaults can read module globals or outer-scope data.
+for default in list(node.args.defaults) + list(node.args.kw_defaults):
+    if default is not None:
+        self.visit(default)
+```
+
+Visiting them is right — they genuinely do read outer-scope data. Attributing them to the
+new callable is not. Python evaluates a default **once, in the enclosing scope, when the
+`def` statement executes**, so the reader is the module body (or the enclosing function),
+never the callee. climlab:
+
+```python
+# climlab/radiation/rrtm/rrtmg_sw.py:95, inside the __init__ signature
+def __init__(self, ..., bndsolvar = np.ones(nbndsw), **kwargs):
+```
+
+```
+static : climlab...RRTMG_SW.__init__  reads module_global nbndsw
+runtime: no LOAD_* of `nbndsw` exists anywhere in __init__'s bytecode;
+         the read is in climlab.radiation.rrtm.rrtmg_sw.<module>
+```
+
+The edge is attached to the wrong node, so a module-level constant looks like a
+per-constructor dependency. On a project that uses computed defaults heavily this
+misattributes an edge per default per callable, all pointing into the class rather than the
+module.
+
+Fix: visit defaults *before* entering the callable, while `current_callable` is still the
+definer — which is also where `visit_Lambda` will need them once §5.5 lands.
+
+Belongs with the rest of the cheap, local, independently testable fixes in **Step 4**.
+
 ---
 
 ## 2. Pyright probing
@@ -943,7 +984,7 @@ count on climlab is recorded before and after — §5.2 predicts it rises, and i
 not, that hypothesis is dead and §2.7 is the whole explanation. Do this first because
 it is also the cleanest test of whether the two packages can share resolution at all.
 
-> **DONE (2026-08-23) — see [`step0_adopt_call_graph_fixes.md`](step0_adopt_call_graph_fixes.md).**
+> **DONE (2026-08-23) — see [`step0_adopt_call_graph_fixes.md`](revision_progess/step0_adopt_call_graph_fixes.md).**
 > Registration lineage on climlab went **3 → 13**, so the §5.2 hypothesis survived and
 > §2.7's `state=` gate is *not* the whole explanation. Objects +12, access edges +18,
 > lineage edges +21, **nothing lost**; parses per file 4 → 1, or 0 with the shared cache.
@@ -963,6 +1004,33 @@ per-object-kind recall report against a traced run of climlab, plus a baseline r
 in this document. Keep the three transferred properties: the trace is a lower bound, an
 unconfirmed edge is not a false one, and inexpressible relations are excluded before
 scoring rather than counted as gaps. Score computed keys separately from literal ones.
+
+> **DONE (2026-08-24) — see [`step1a_access_oracle.md`](revision_progess/step1a_access_oracle.md).**
+> Baseline on climlab: **recall 69.0%** (1,598 of 2,317 observed accesses found),
+> **75.2% of static claims confirmed**, **1 falsified**. 98.0% of the artifact is scored
+> (4,156 of 4,239 rows); every exclusion is counted and printed, in both directions.
+> Literal keys 88.6%, computed keys **1.7%** — scored apart, as required. Trace runs in 9 s.
+>
+> Three departures from the wording above, all explained there. (i) `BINARY_SUBSCR` **does
+> not exist** on this repo's Python 3.14 — it is `BINARY_OP` with `NB_SUBSCR`. (ii) The four
+> opcodes named in §6 cover only ~36% of the artifact; `load` alone is 1,892 edges, 1,409 of
+> them on `param`, the largest object kind. A **name tier** (`LOAD_FAST`/`LOAD_NAME`/
+> `LOAD_GLOBAL`) was added, taking scoreable coverage to 98%. (iii) The comparison gains a
+> verdict the call-graph one cannot have: because a code object's full instruction set is
+> fixed at compile time, **falsified** is provable without coverage.
+>
+> The instrument found a defect listed in no section of this document: **default-argument
+> expressions are attributed to the callee rather than to the definer**
+> (`RRTMG_SW.__init__` claims a read of `nbndsw`, which Python evaluates in the module body
+> at `def` time). It also puts a number on §5.5 — 84 observed accesses in lambdas and
+> genexps that `access_edges.csv` has no row for.
+>
+> Note for anyone reading a future run: the first climlab pass reported **89** falsified
+> claims and all 89 were the *instrument's* fault — `LOAD_NAME`/`STORE_NAME` (module and
+> class bodies, 2,284 instructions) and `STORE_FAST_STORE_FAST` (tuple unpacking) were not
+> decoded at all. Hand-checking the falsified list against the source is what caught it, and
+> it is the reason this instrument reports named refutable claims rather than only a score.
+> No line of `generate_data_access_ast.py` was changed in this step.
 
 **Step 2 — Determinism and ID consistency: §1.2, §1.3, §1.4, §1.5.** These make the
 output a function of the input rather than of file order. Do them before anything that
@@ -990,8 +1058,9 @@ lever, and Step 1a makes it measurable. Acceptance: the share of objects with
 probe-resolution assertion from §2.1 so a silent total failure can never look like a
 clean run again.
 
-**Step 4 — Cheap correctness: §1.6, §1.7, §1.8, §1.9, §1.10, §1.11, §1.12, §1.13,
-plus §5.5.** Each is local and independently testable. §1.7 and §1.11 are the two that
+**Step 4 — Cheap correctness: §1.6, §1.7, §1.8, §1.9, §1.10, §1.11, §1.12, §1.13, §1.14,
+plus §5.5.** Each is local and independently testable. §1.14 is the one Step 1a's oracle
+found; it is also the cheapest, and the oracle will confirm the fix directly. §1.7 and §1.11 are the two that
 generate false coupling, so judge them with `evaluate` rather than with recall — the
 registry-coupling lesson from the call-graph roadmap applies unchanged. §5.5 (lambda
 callables) belongs here because the fix — entering a callable for a lambda, keyed the

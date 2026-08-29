@@ -14,6 +14,8 @@ def _commands() -> dict[str, Callable[[Sequence[str] | None], None]]:
     from microservice_pipeline.cli.init_config import main as init_config_main
     from microservice_pipeline.cluster_call_graph import main as call_cluster_main
     from microservice_pipeline.cluster_structural_graph import main as structural_cluster_main
+    from microservice_pipeline.data_access.access_comparison import main as compare_data_access_main
+    from microservice_pipeline.data_access.dynamic_access_trace import main as trace_data_access_main
     from microservice_pipeline.data_access.generate_data_access_ast import main as data_access_main
     from microservice_pipeline.data_access.infer_shared_containers import main as infer_shared_containers_main
     from microservice_pipeline.evaluation.evaluate_microservice_clustering import main as evaluate_main
@@ -25,6 +27,7 @@ def _commands() -> dict[str, Callable[[Sequence[str] | None], None]]:
     return {
         "call-graph": call_graph_main,
         "call-cluster": call_cluster_main,
+        "compare-data-access": compare_data_access_main,
         "compare-graphs": compare_graphs_main,
         "data-access": data_access_main,
         "evaluate": evaluate_main,
@@ -33,6 +36,7 @@ def _commands() -> dict[str, Callable[[Sequence[str] | None], None]]:
         "notebook-tasks": notebook_tasks_main,
         "structural-graph": structural_graph_main,
         "structural-cluster": structural_cluster_main,
+        "trace-data-access": trace_data_access_main,
         "trace-runtime": trace_runtime_main,
     }
 

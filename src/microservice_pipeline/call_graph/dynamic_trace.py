@@ -119,6 +119,60 @@ def module_map_from_analysis_files(analysis_files: Sequence[AnalysisFile]) -> Di
     return {str(analysis_file.path.resolve()): analysis_file.module for analysis_file in analysis_files}
 
 
+class CodeIdResolver:
+    """Turn a runtime code object into the callable ID the static passes emit.
+
+    Shared rather than copied. Every tracer in this pipeline compares its
+    observations against artifacts keyed by these strings, so a second
+    formulation of the rule would not fail loudly -- it would simply match
+    nothing, and a recall of zero looks exactly like a recall of zero. That is
+    the failure mode ``data_access/code_review.md`` 2.5 records against the three
+    existing copies of the *static* callable-ID convention; there is no reason to
+    open a fourth front on the runtime side.
+    """
+
+    def __init__(self, module_by_file: Mapping[str, str]):
+        self.module_by_file = module_by_file
+        # ``co_filename`` is a raw string that may be relative or contain
+        # symlinks, so it needs resolving before lookup. Resolution is a syscall
+        # and this runs on every unseen call site, hence the cache.
+        self._file_cache: Dict[str, Optional[str]] = {}
+
+    def module_for_filename(self, filename: str) -> Optional[str]:
+        cached = self._file_cache.get(filename, "\0")
+        if cached != "\0":
+            return cached  # type: ignore[return-value]
+
+        module = self.module_by_file.get(filename)
+        if module is None:
+            try:
+                module = self.module_by_file.get(str(Path(filename).resolve()))
+            except (OSError, ValueError):
+                module = None
+        self._file_cache[filename] = module
+        return module
+
+    def code_id(self, code: Any) -> Optional[str]:
+        """Build ``module.qualname`` for a code object, or ``None`` if external."""
+        module = self.module_for_filename(code.co_filename)
+        if module is None:
+            return None
+        return callable_id_for_qualname(module, code.co_qualname)
+
+
+def callable_id_for_qualname(module: str, qualname: str) -> str:
+    """Join a module and a ``co_qualname`` the way the static passes do.
+
+    Kept as a free function because the static bytecode index in
+    ``data_access.access_comparison`` needs the same rule for code objects it
+    compiled itself, where there is no tracer and no file-to-module cache.
+    """
+    if qualname == MODULE_CALLABLE_QUALNAME:
+        # Matches ``discovery.module_callable_id``: module scope is a node.
+        return f"{module}.{MODULE_CALLABLE_QUALNAME}" if module else MODULE_CALLABLE_QUALNAME
+    return f"{module}.{qualname}"
+
+
 class CallTracer:
     """Collect runtime call edges for code inside a known set of modules.
 
@@ -159,37 +213,16 @@ class CallTracer:
         self._disabled_positions: Set[Tuple[str, int, int]] = set()
         self._positions: Dict[Any, List[Tuple[Any, Any, Any, Any]]] = {}
         self._external_calls = 0
-        # ``co_filename`` is a raw string that may be relative or contain
-        # symlinks, so it needs resolving before lookup. Resolution is a syscall
-        # and this runs on every unseen call site, hence the cache.
-        self._file_cache: Dict[str, Optional[str]] = {}
+        self._ids = CodeIdResolver(module_by_file)
 
     # -- ID normalization ------------------------------------------------
 
     def _module_for_filename(self, filename: str) -> Optional[str]:
-        cached = self._file_cache.get(filename, "\0")
-        if cached != "\0":
-            return cached  # type: ignore[return-value]
-
-        module = self.module_by_file.get(filename)
-        if module is None:
-            try:
-                module = self.module_by_file.get(str(Path(filename).resolve()))
-            except (OSError, ValueError):
-                module = None
-        self._file_cache[filename] = module
-        return module
+        return self._ids.module_for_filename(filename)
 
     def _code_id(self, code: Any) -> Optional[str]:
         """Build ``module.qualname`` for a code object, or ``None`` if external."""
-        module = self._module_for_filename(code.co_filename)
-        if module is None:
-            return None
-        qualname = code.co_qualname
-        if qualname == MODULE_CALLABLE_QUALNAME:
-            # Matches ``discovery.module_callable_id``: module scope is a node.
-            return f"{module}.{MODULE_CALLABLE_QUALNAME}" if module else MODULE_CALLABLE_QUALNAME
-        return f"{module}.{qualname}"
+        return self._ids.code_id(code)
 
     def _callee_id(self, callable_: Any) -> Optional[Tuple[str, str]]:
         """Resolve a called object to ``(id, kind)``, or ``None`` if external.
