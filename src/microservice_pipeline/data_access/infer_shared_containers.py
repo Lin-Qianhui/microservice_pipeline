@@ -97,6 +97,48 @@ def _candidate_kind(object_kind: str) -> str:
     return "dataframe" if object_kind == "df_col" else "dict"
 
 
+def _lineage_root_ids_with_cycle_flag(
+    object_id: str,
+    incoming: Dict[str, Set[str]],
+    known_ids: Set[str],
+    cache: Dict[str, Set[str]],
+    seen: Set[str],
+) -> Tuple[Set[str], bool]:
+    """Reaching roots, and whether a live cycle truncated them.
+
+    The same function and the same defect as
+    ``generate_data_access_ast._lineage_roots``: the cycle guard's empty set is
+    correct only for the traversal that produced it, and caching a value
+    computed above one made every later answer depend on which node was asked
+    first. Fixed here as well as there, because a fix applied to one copy of a
+    duplicated function and not the other is how the two drift apart.
+    """
+    if object_id in cache:
+        return cache[object_id], False
+    if object_id in seen:
+        return set(), True
+    seen.add(object_id)
+
+    roots: Set[str] = set()
+    truncated = False
+    for parent_id in sorted(incoming.get(object_id, set())):
+        if parent_id == object_id:
+            continue
+        parent_roots, parent_truncated = _lineage_root_ids_with_cycle_flag(
+            parent_id, incoming, known_ids, cache, seen
+        )
+        truncated = truncated or parent_truncated
+        if parent_roots:
+            roots.update(parent_roots)
+        elif parent_id in known_ids:
+            roots.add(parent_id)
+
+    seen.remove(object_id)
+    if not truncated:
+        cache[object_id] = roots
+    return roots, truncated
+
+
 def _lineage_root_ids(
     object_id: str,
     incoming: Dict[str, Set[str]],
@@ -104,26 +146,9 @@ def _lineage_root_ids(
     cache: Dict[str, Set[str]],
     seen: Optional[Set[str]] = None,
 ) -> Set[str]:
-    if object_id in cache:
-        return cache[object_id]
-
-    local_seen = seen if seen is not None else set()
-    if object_id in local_seen:
-        return set()
-    local_seen.add(object_id)
-
-    roots: Set[str] = set()
-    for parent_id in incoming.get(object_id, set()):
-        if parent_id == object_id:
-            continue
-        parent_roots = _lineage_root_ids(parent_id, incoming, known_ids, cache, local_seen)
-        if parent_roots:
-            roots.update(parent_roots)
-        elif parent_id in known_ids:
-            roots.add(parent_id)
-
-    local_seen.remove(object_id)
-    cache[object_id] = roots
+    roots, _truncated = _lineage_root_ids_with_cycle_flag(
+        object_id, incoming, known_ids, cache, seen if seen is not None else set()
+    )
     return roots
 
 
@@ -143,7 +168,7 @@ def _lineage_roots_for_objects(data_access_payload: dict) -> Dict[str, Set[str]]
     cache: Dict[str, Set[str]] = {}
     roots: Dict[str, Set[str]] = {}
     known_ids = set(objects)
-    for object_id in objects:
+    for object_id in sorted(objects):
         roots[object_id] = {
             root_id
             for root_id in _lineage_root_ids(object_id, incoming, known_ids, cache)

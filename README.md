@@ -219,6 +219,10 @@ Important artifacts:
 | `callable_data_access.csv` | Denormalized review table |
 | `data_access_report.md` | Human-readable extraction guide and summary |
 
+For the exact vocabulary used by these artifacts—including data-object kinds,
+access operations, lineage relations, and internal resolver records—see the
+[data-access ontology](src/microservice_pipeline/data_access/ontology.md).
+
 The raw run intentionally keeps uncertain field containers local to their
 callables. This avoids collapsing unrelated dictionaries or dataframes merely
 because they use the same field name.

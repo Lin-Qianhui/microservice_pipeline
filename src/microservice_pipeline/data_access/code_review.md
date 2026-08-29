@@ -1043,6 +1043,53 @@ order produce byte-identical artifacts.
 > the evidence that it is needed early: a strictly additive change moved 22 derived
 > `alias_of` / `access_path` fields on climlab.
 
+> **DONE (2026-08-29) — see [`step2_determinism.md`](revision_progess/step2_determinism.md).**
+> The gate passes: shuffled climlab runs are byte-identical over five seeds, where before
+> the shuffle moved 2 objects and 6 access edges in or out of existence. Objects
+> 1870 → 1866 — five `class_state:X` nodes collapsed into the `class_attr_state:X:state`
+> nodes they had been duplicating, which is §1.2's stated cost being removed, not
+> information lost. Access edges and lineage edges **unchanged** (4239, 1175, every
+> relation kind); §4.6's `kind == unknown` counter **4 → 0**. The Step 1a oracle is
+> unmoved — recall 69.0%, confirmed 75.2%, falsified 1 — exactly as §6.1 predicted, since
+> the access triple never mentions an object ID.
+>
+> §3.1 and §3.2 were folded in as §7's Step 6 suggested, and **Step 6 is now fully
+> discharged**: stage time 0.904 s → 0.431 s. §3.1's fix is *not* the frozen index proposed
+> above — that would reintroduce the mid-traversal staleness Step 0 deferred it for. The set
+> is only used for membership tests, so testing the four dicts directly is equivalent and
+> cannot go stale.
+>
+> Three departures and two additions, all explained there. (i) The call graph was verified
+> order-stable **first**, so every difference found afterwards was known to be this package's;
+> `--check-inputs` keeps that test. (ii) §1.2's claim that `_class_attr_ref` is file-local is
+> not quite right — its owner is always a class in the file being walked. The real holes were
+> `registration_lineage._class_state_object_id_for_owner` and **nested classes**, which
+> `infer_split_class_owners` never saw because it walked `tree.body` only. (iii) §1.3 was fixed
+> by not caching a cycle-truncated answer rather than by computing SCCs; the same fix was applied
+> to the `infer_shared_containers` copy, which §4.3 predicts would otherwise drift.
+>
+> **The instrument found two defects in no section of this document.** The larger: the return
+> fixpoint was run *without* `project_index`, while the final pass has it — so the final pass
+> resolved calls the fixpoint could not, learned new return summaries **while running**, and
+> handed them only to the files it reached afterwards. Convergence was therefore meaningless: the
+> loop had settled on a smaller question. That is what made the last two objects order-dependent.
+> The smaller: two output sort keys omitted columns, and Python's stable sort kept tied rows in
+> file order — an artifact-layer difference with no analysis change behind it.
+>
+> Note also that `call_graph`'s own type-summary fixpoint hits `max_iterations=5` on climlab and
+> warns. Its outputs are still order-stable, so nothing here depends on it, but it belongs on that
+> package's list.
+>
+> **`check-data-access-determinism` is permanent, not scaffolding for this revision** — the
+> argument is in §9 of that document. Short version: order-independence is an invariant with no
+> finish line, it breaks silently, and Steps 3, 4, 7 and 8 are the most likely things to break it —
+> Step 8 in particular *depends* on it, so retiring the check when Step 8 ends would delete the
+> thing that made Step 8 checkable. The fixture test is a CI guard, not a replacement: a fixture
+> only holds shapes someone thought to write down, and both unlisted defects above were found on
+> climlab.
+
+> **UNBLOCKED (2026-08-29) by Step 2.** The baseline this needs is now reproducible.
+
 **Step 1b — The object-identity oracle (§6, second half).** `id()` at the observed
 access, settling whether two static object IDs are one runtime object — which makes
 §1.3 and §1.7 measurable rather than arguable, and is the only thing that can judge
@@ -1072,7 +1119,13 @@ will conclude the wrong thing. Add the `resolvable_callable_ids` filter (§5.4) 
 diamond-hierarchy registration fixture (§5.6) as regression guards rather than fixes —
 neither is broken today, and both are one upstream change away from breaking quietly.
 
-**Step 6 — Performance: §3.1, §3.2, §3.3.** *No longer sequenced — do it opportunistically.*
+**Step 6 — Performance: §3.1, §3.2, §3.3.** ***DONE — folded into Step 2, as suggested below.***
+§3.3 was discharged by Step 0; §3.1 and §3.2 landed with Step 2, taking the stage from 0.904 s to
+0.431 s on climlab. The paragraphs below are kept because their reasoning is what decided *where*
+the work went, and because the caveat in the last one is the reason §3.1's fix is a membership
+test rather than the hoist this section imagines. *Original text follows.*
+
+*No longer sequenced — do it opportunistically.*
 §3.3 is discharged: Step 0 took parses per file from 4 to 1, or 0 when `analysis.cache`
 is threaded, so this step's original acceptance criterion is already met. What remains is
 §3.1 and §3.2, and both are the same move: hoist the per-call-site sets into one frozen
@@ -1104,14 +1157,18 @@ end with data access *calling* `ProjectIndex` rather than paraphrasing it. Step 
 removed two of the three paraphrases, so the remaining one is the callable-ID convention
 of §2.5.
 
-> **Blocked on Step 2, not merely on the oracle.** The verification method named above
-> does not work today. Step 0 added zero objects and removed zero, and 22 derived fields
-> still moved on climlab, because §1.3 and §1.4 make `alias_of` and `access_path` depend
-> on file processing order. A refactor that reorders anything therefore produces a diff
-> that cannot be read. Attempting this step before Step 2 means doing a ~1,700-line split
-> with no working regression gate — which is precisely the failure the call-graph history
-> records, where two rounds of modularisation preserved the `_resolve_callees` ↔
+> **~~Blocked on Step 2, not merely on the oracle.~~ UNBLOCKED (2026-08-29).** The verification
+> method named above did not work before Step 2. Step 0 added zero objects and removed zero, and
+> 22 derived fields still moved on climlab, because §1.3 and §1.4 made `alias_of` and
+> `access_path` depend on file processing order. A refactor that reorders anything therefore
+> produced a diff that could not be read. Attempting this step before Step 2 would have meant a
+> ~1,700-line split with no working regression gate — precisely the failure the call-graph
+> history records, where two rounds of modularisation preserved the `_resolve_callees` ↔
 > `_infer_class_types` cycle intact.
+>
+> Step 2 closed that. Run `microservice-pipeline check-data-access-determinism --config <config>`
+> after each slice of the split; a byte-identical result now means the slice changed nothing,
+> which is what this step's verification method assumed all along.
 
 Written 2026-08-23. Findings above are against the tree at that date; line numbers
 will drift.

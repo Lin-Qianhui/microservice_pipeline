@@ -36,11 +36,24 @@ def _edges_payload(edges: Sequence[AccessEdge], objects: Dict[str, DataObject]) 
 
 
 def _lineage_payload(lineage_edges: Sequence[LineageEdge]) -> List[dict]:
+    # Every column is in the key. Python's sort is stable, so a key that leaves
+    # columns out lets tied rows keep insertion order -- which for lineage edges
+    # is the order files were processed, since two files can produce edges that
+    # agree on src, dst, relation, lineno and slot while differing in caller.
     return [
         edge.__dict__.copy()
         for edge in sorted(
             lineage_edges,
-            key=lambda x: (x.src_object_id, x.dst_object_id, x.relation, x.lineno, x.slot),
+            key=lambda x: (
+                x.src_object_id,
+                x.dst_object_id,
+                x.relation,
+                x.lineno,
+                x.slot,
+                x.file,
+                x.caller,
+                x.callee,
+            ),
         )
     ]
 
@@ -91,7 +104,12 @@ def write_outputs(
     )
 
     denormalized_rows = []
-    for edge in sorted(edges, key=lambda x: (x.callable, x.object_id, x.lineno, x.operation)):
+    # Same key as ``access_edges.csv`` -- these are the same edges denormalized,
+    # and two views of one list that order it differently is a trap for anyone
+    # diffing them against each other.
+    for edge in sorted(
+        edges, key=lambda x: (x.callable, x.object_id, x.access, x.lineno, x.operation)
+    ):
         obj = objects.get(edge.object_id)
         denormalized_rows.append(
             {

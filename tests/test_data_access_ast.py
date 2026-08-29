@@ -1877,3 +1877,424 @@ def lookup(rows):
         cache=analysis.cache,
     )
     assert parsed == []
+
+
+# ---------------------------------------------------------------------------
+# Step 2 -- determinism and ID consistency (code_review.md 1.2, 1.3, 1.4, 1.5)
+#
+# Every test below asserts a property that fails *silently* when it breaks: a
+# duplicate object identity, an alias that depends on which node was asked
+# first, a refinement discarded because another file was read first, a fixpoint
+# that stopped early. None of them produce an error today; they produce a
+# different answer, which is why the acceptance gate for this step is that two
+# runs with shuffled file order agree byte for byte.
+# ---------------------------------------------------------------------------
+
+
+def _coordinator_source(class_name):
+    """A class that clears the split-owner thresholds: 4 attrs, 3 methods, 2 containers."""
+    return f"""
+class {class_name}:
+    def __init__(self, state):
+        self.state = state
+        self.diagnostics = {{}}
+        self.subprocesses = {{}}
+        self.name = 'x'
+
+    def step(self):
+        self.state['t'] = 1
+        self.diagnostics['t'] = 2
+
+    def report(self):
+        return self.subprocesses, self.name
+"""
+
+
+def _shuffled_runs(tmp_path):
+    """Run the whole stage twice, second time with the file list reversed."""
+    analysis_files = list(iter_analysis_files(tmp_path))
+    assert len(analysis_files) > 1, "a one-file fixture cannot exercise file order"
+
+    def run(files):
+        analysis = analyze_analysis_files(list(files))
+        return collect_data_access_from_analysis_files(
+            list(files),
+            analysis.project_nodes(),
+            project_root=tmp_path,
+            pyright_families={},
+            registration_rules=analysis.registration_rules,
+            project_index=analysis.project_index,
+            cache=analysis.cache,
+        )
+
+    return run(analysis_files), run(list(reversed(analysis_files)))
+
+
+def test_split_class_owner_is_the_same_answer_from_every_file(tmp_path: Path):
+    """1.2: one class, one object identity, whichever file is being walked.
+
+    ``infer_split_class_owners`` ran per file and only saw that file's classes,
+    so ``registration_lineage._class_state_object_id_for_owner`` -- which is
+    asked about an owner that is usually defined somewhere else -- got
+    ``class_attr_state:X:state`` while X's own file was walked and
+    ``class_state:X`` while any other file was. Two nodes for one class's state,
+    and the lineage edge recorded from the second case pointed at an ID the
+    object table never registered.
+
+    On climlab this was real: ``AplusBT`` and ``StepFunctionAlbedo`` each had
+    both nodes before this fix and one after.
+    """
+    (tmp_path / "child.py").write_text(_coordinator_source("Child"), encoding="utf-8")
+    (tmp_path / "model.py").write_text(
+        """
+from child import Child
+
+
+class Model:
+    def __init__(self):
+        self.state = {}
+        self.children = {}
+        self.wire_up('c', Child(state=self.state))
+
+    def wire_up(self, name, proc):
+        self.children.update({name: proc})
+
+    def run(self):
+        for name, proc in self.children.items():
+            proc.step()
+""",
+        encoding="utf-8",
+    )
+
+    objects, _edges, lineage = _collect_with_registration(tmp_path)
+
+    child_state_nodes = sorted(
+        object_id
+        for object_id in objects
+        if object_id in {"class_state:child.Child", "class_attr_state:child.Child:state"}
+    )
+    assert child_state_nodes == ["class_attr_state:child.Child:state"], child_state_nodes
+
+    # And every lineage endpoint names an object that actually exists.
+    endpoints = {
+        object_id
+        for edge in lineage
+        for object_id in (edge.src_object_id, edge.dst_object_id)
+        if object_id.startswith(("class_state:", "class_attr_state:"))
+    }
+    assert endpoints <= set(objects), sorted(endpoints - set(objects))
+
+
+def test_split_class_owners_include_nested_classes(tmp_path: Path):
+    """1.2 / C4: ``visit_ClassDef`` sets ``current_class`` for a nested class too.
+
+    ``infer_split_class_owners`` walked ``tree.body``, so a class defined inside
+    a function or another class was never splittable, while the collector was
+    perfectly willing to ask about it. The two disagreed with no way to tell.
+    """
+    from microservice_pipeline.data_access.generate_data_access_ast import (
+        infer_split_class_owners,
+    )
+
+    source = "def make():\n" + "\n".join(
+        "    " + line for line in _coordinator_source("Nested").splitlines()
+    )
+    owners = infer_split_class_owners(ast.parse(source), "sample")
+    assert "sample.Nested" in owners, owners
+
+
+def test_lineage_roots_do_not_cache_an_answer_computed_inside_a_cycle():
+    """1.3: the cycle guard's empty set is correct for one traversal only.
+
+    ``_lineage_roots`` wrote its result to the shared cache even when the
+    traversal below it had been truncated by the cycle guard, so every later
+    query read the truncated value and the answer depended on which node was
+    asked first. Query order is ``objects.items()``, i.e. file order, and
+    ``_apply_lineage_aliases`` turns a one-root answer into an alias and erases
+    the alias on a many-root answer -- so this flipped ``alias_of`` between runs.
+    """
+    from microservice_pipeline.data_access.generate_data_access_ast import _lineage_roots
+    from microservice_pipeline.data_access.models import DataObject
+
+    def obj(object_id):
+        return DataObject(
+            id=object_id, kind="local_exposed", display_name=object_id, scope="callable",
+            owner="", container="", field="", file="f.py", lineno=1,
+            inferred_type="dict", confidence="high",
+        )
+
+    # R -> A, A -> B, B -> A (the cycle), B -> C
+    incoming = {"A": {"R", "B"}, "B": {"A"}, "C": {"B"}}
+    objects = {name: obj(name) for name in ("R", "A", "B", "C")}
+
+    cold = _lineage_roots("C", incoming, objects, {})
+    warm_cache = {}
+    _lineage_roots("A", incoming, objects, warm_cache)
+    warm = _lineage_roots("C", incoming, objects, warm_cache)
+    assert cold == warm, f"cold={sorted(cold)} warm={sorted(warm)}"
+
+
+def test_shared_container_lineage_roots_have_the_same_cycle_fix():
+    """1.3 / 4.3: the duplicate in ``infer_shared_containers`` had the same bug.
+
+    Fixing one copy of a duplicated function and not the other is how the two
+    drift apart, which is the outcome 4.3 predicts for leaving both in place.
+    """
+    from microservice_pipeline.data_access.infer_shared_containers import _lineage_root_ids
+
+    incoming = {"A": {"R", "B"}, "B": {"A"}, "C": {"B"}}
+    known = {"R", "A", "B", "C"}
+
+    cold = _lineage_root_ids("C", incoming, known, {})
+    warm_cache = {}
+    _lineage_root_ids("A", incoming, known, warm_cache)
+    warm = _lineage_root_ids("C", incoming, known, warm_cache)
+    assert cold == warm, f"cold={sorted(cold)} warm={sorted(warm)}"
+
+
+def test_cross_file_object_merge_keeps_the_better_description(tmp_path: Path):
+    """1.4: the cross-file merge kept only ``confidence`` and discarded the rest.
+
+    ``_record_access`` mints a placeholder with ``kind == 'unknown'`` whenever an
+    edge names an ID no pass has materialised yet. Within a file
+    ``_register_object`` upgrades that placeholder; across files nothing did, so
+    an object reachable from two modules kept whatever the first file said --
+    including ``unknown`` where a real kind arrived later.
+
+    On climlab this was 4 objects stuck at ``kind == unknown``; it is now 0.
+    """
+    (tmp_path / "producer.py").write_text(
+        """
+def build():
+    registry = {}
+    registry['a'] = 1
+    return registry
+""",
+        encoding="utf-8",
+    )
+    (tmp_path / "consumer.py").write_text(
+        """
+from producer import build
+
+
+def use():
+    data = build()
+    return data['a']
+""",
+        encoding="utf-8",
+    )
+
+    forward, reversed_order = _shuffled_runs(tmp_path)
+    for objects, _edges, _lineage in (forward, reversed_order):
+        unknown = sorted(o.id for o in objects.values() if o.kind == "unknown")
+        assert unknown == [], unknown
+
+    assert {k: v.__dict__ for k, v in forward[0].items()} == {
+        k: v.__dict__ for k, v in reversed_order[0].items()
+    }
+
+
+def test_object_merge_is_commutative():
+    """1.4: ``merge(a, b)`` and ``merge(b, a)`` must leave the same values.
+
+    This is the property, stated directly. Order-independence of the artifacts
+    is a consequence of it, so a rule added later that happens not to be
+    commutative fails here rather than showing up as an unexplained diff.
+    """
+    from microservice_pipeline.data_access.generate_data_access_ast import merge_data_object
+    from microservice_pipeline.data_access.models import DataObject
+
+    def make(**overrides):
+        base = dict(
+            id="x", kind="unknown", display_name="x", scope="unknown", owner="",
+            container="", field="", file="b.py", lineno=0, inferred_type="",
+            confidence="low", alias_of="", access_path="", structural_role="primary",
+        )
+        base.update(overrides)
+        return DataObject(**base)
+
+    left = make(kind="local_exposed", display_name="d", scope="callable", owner="m.f",
+                field="d", file="a.py", lineno=7, inferred_type="dict", confidence="high")
+    right = make(access_path="d['k']", alias_of="param:m.g:d", file="z.py", lineno=3,
+                 structural_role="precise")
+
+    forward, backward = make(**left.__dict__), make(**right.__dict__)
+    merge_data_object(forward, make(**right.__dict__))
+    merge_data_object(backward, make(**left.__dict__))
+    assert forward.__dict__ == backward.__dict__
+
+
+def test_return_summary_snapshot_sees_every_field(tmp_path: Path):
+    """1.5: the two snapshots compared different fields, so the fixpoint stopped early.
+
+    ``_return_summary_snapshot`` captured five of ``ExprRef``'s six fields and
+    ``_return_tuple_summary_snapshot`` captured four -- neither included
+    ``coarse_object_id`` and the tuple one omitted ``access_path``. A pass that
+    changed only a tuple slot's ``access_path`` produced an identical snapshot,
+    so the loop declared convergence. ``access_path`` is what ``_field_object_id``
+    builds field IDs from.
+    """
+    from microservice_pipeline.data_access.generate_data_access_ast import (
+        _return_summary_snapshot,
+        _return_tuple_summary_snapshot,
+    )
+    from microservice_pipeline.data_access.models import ExprRef
+
+    base = ExprRef(object_id="o", inferred_type="dict", confidence="high", display_name="d")
+    for field, changed in (
+        ("access_path", ExprRef("o", "dict", "high", "d", access_path="d['k']")),
+        ("coarse_object_id", ExprRef("o", "dict", "high", "d", coarse_object_id="c")),
+    ):
+        assert _return_summary_snapshot({"f": base}) != _return_summary_snapshot({"f": changed}), field
+        assert _return_tuple_summary_snapshot({"f": (base,)}) != _return_tuple_summary_snapshot(
+            {"f": (changed,)}
+        ), field
+
+
+def test_return_summary_tie_breaks_on_content_not_arrival_order():
+    """1.5 / C2: an unlisted order-dependency, found while building the gate.
+
+    ``_return_summary_score`` is four coarse flags, so two genuinely different
+    candidates tie constantly, and a tie used to be settled by keeping whichever
+    arrived first -- i.e. whichever file the loop reached first. The winner
+    decides the ``object_id`` and ``access_path`` the whole fixpoint propagates.
+    """
+    from microservice_pipeline.data_access.generate_data_access_ast import _merge_return_summary
+    from microservice_pipeline.data_access.models import ExprRef
+
+    a = ExprRef(object_id="local_exposed:m.f:a", inferred_type="dict", confidence="high", display_name="a")
+    b = ExprRef(object_id="local_exposed:m.g:b", inferred_type="dict", confidence="high", display_name="b")
+
+    assert _merge_return_summary(a, b) == _merge_return_summary(b, a)
+
+
+def test_lineage_edge_ordering_uses_every_column(tmp_path: Path):
+    """C3: a sort key that omits columns lets tied rows keep insertion order.
+
+    Python's sort is stable, so two lineage edges agreeing on the five sorted
+    columns but differing in ``caller`` kept whichever order the files were read
+    in. That produced a non-empty artifact diff with no analysis change behind it.
+    """
+    from microservice_pipeline.data_access.outputs import _lineage_payload
+    from microservice_pipeline.data_access.models import LineageEdge
+
+    def edge(caller, file):
+        return LineageEdge(
+            src_object_id="s", dst_object_id="d", relation="arg_to_param",
+            file=file, lineno=3, caller=caller, callee="c", slot="0",
+        )
+
+    forward = [edge("m.a", "a.py"), edge("m.b", "b.py")]
+    assert _lineage_payload(forward) == _lineage_payload(list(reversed(forward)))
+
+
+def test_artifacts_do_not_depend_on_file_processing_order(tmp_path: Path):
+    """The acceptance gate for this step, on a fixture that exercises all four findings.
+
+    Same property the ``check-data-access-determinism`` command proves on a real
+    codebase, kept here so a regression is caught without a corpus to hand.
+    """
+    (tmp_path / "shared.py").write_text(_coordinator_source("Shared"), encoding="utf-8")
+    (tmp_path / "cycle.py").write_text(
+        """
+def ping(box):
+    box['p'] = 1
+    return pong(box)
+
+
+def pong(box):
+    box['q'] = 2
+    return ping(box)
+""",
+        encoding="utf-8",
+    )
+    (tmp_path / "producer.py").write_text(
+        """
+def build():
+    registry = {}
+    registry['a'] = 1
+    return registry, {'b': 2}
+""",
+        encoding="utf-8",
+    )
+    (tmp_path / "consumer.py").write_text(
+        """
+from producer import build
+from shared import Shared
+
+
+class Runner:
+    def __init__(self):
+        self.state = {}
+        self.parts = {}
+        self.attach('s', Shared(state=self.state))
+
+    def attach(self, name, part):
+        self.parts.update({name: part})
+
+    def go(self):
+        first, second = build()
+        for name, part in self.parts.items():
+            part.step()
+        return first['a'], second['b']
+""",
+        encoding="utf-8",
+    )
+
+    (objects_a, edges_a, lineage_a), (objects_b, edges_b, lineage_b) = _shuffled_runs(tmp_path)
+
+    assert {k: v.__dict__ for k, v in objects_a.items()} == {
+        k: v.__dict__ for k, v in objects_b.items()
+    }
+    assert sorted(e.__dict__.items().__str__() for e in edges_a) == sorted(
+        e.__dict__.items().__str__() for e in edges_b
+    )
+    assert sorted(e.__dict__.items().__str__() for e in lineage_a) == sorted(
+        e.__dict__.items().__str__() for e in lineage_b
+    )
+
+
+def test_fixpoint_reports_when_the_cap_stopped_it(tmp_path: Path, monkeypatch):
+    """1.5: neither fixpoint could tell convergence from exhaustion.
+
+    The call-graph roadmap's own conclusion, after both of its fixpoints hit
+    their caps on matplotlib, is that a cap-hit is a hard failure rather than a
+    note. Here there was not even the note.
+    """
+    from microservice_pipeline.data_access import generate_data_access_ast as mod
+
+    monkeypatch.setattr(mod, "MAX_RETURN_SUMMARY_PASSES", 1)
+    (tmp_path / "a.py").write_text(
+        """
+def one():
+    d = {}
+    d['x'] = 1
+    return d
+
+
+def two():
+    return one()
+
+
+def three():
+    return two()
+""",
+        encoding="utf-8",
+    )
+    analysis_files = list(iter_analysis_files(tmp_path))
+    analysis = analyze_analysis_files(analysis_files)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        collect_data_access_from_analysis_files(
+            analysis_files,
+            analysis.project_nodes(),
+            project_root=tmp_path,
+            pyright_families={},
+            registration_rules=analysis.registration_rules,
+            project_index=analysis.project_index,
+            cache=analysis.cache,
+        )
+    assert any("did not converge" in str(w.message) for w in caught), [
+        str(w.message) for w in caught
+    ]

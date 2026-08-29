@@ -17,6 +17,8 @@ from __future__ import annotations
 import argparse
 import ast
 import sys
+import warnings
+from dataclasses import astuple
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
@@ -258,11 +260,108 @@ def _is_unknown_family(family: str) -> bool:
 
 
 def _prefer_inferred_type(current: str, incoming: str) -> str:
+    """The more specific of two families, tie broken on the value itself.
+
+    Keeping ``current`` when both are known made the answer "whichever was
+    registered first", which across files is "whichever file was processed
+    first". Two different known families for one object is a disagreement worth
+    resolving the same way every run rather than by arrival.
+    """
     if _is_unknown_family(current):
         return incoming or current
     if _is_unknown_family(incoming):
         return current
-    return current
+    return min(current, incoming)
+
+
+def _object_identity_rank(obj: DataObject) -> Tuple[int, str, str, str, str, str, str]:
+    """Order over the fields that say *what an object is*.
+
+    ``_record_access`` mints a placeholder with ``kind == "unknown"`` whenever an
+    edge names an ID no pass has materialised yet, so a real registration must
+    always beat one. Beyond that the tie is broken on content, so two files that
+    disagree resolve identically whichever order they arrive in.
+    """
+    return (
+        0 if obj.kind == "unknown" else 1,
+        obj.kind,
+        obj.display_name,
+        obj.scope,
+        obj.owner,
+        obj.container,
+        obj.field,
+    )
+
+
+def _prefer_earliest_site(existing: DataObject, incoming: DataObject) -> Optional[Tuple[str, int]]:
+    """The earliest ``(file, lineno)`` either record carries, or ``None``.
+
+    Previously "the first non-zero one wins", which across files is again a
+    function of processing order. An object reachable from several modules now
+    reports the same site every run.
+    """
+    sites = [
+        (obj.file, obj.lineno)
+        for obj in (existing, incoming)
+        if obj.lineno
+    ]
+    return min(sites) if sites else None
+
+
+def _prefer_populated(current: str, incoming: str) -> str:
+    """A non-empty value beats an empty one; two non-empty ones tie on content."""
+    if not current:
+        return incoming
+    if not incoming:
+        return current
+    return min(current, incoming)
+
+
+def merge_data_object(existing: DataObject, incoming: DataObject) -> bool:
+    """Fold ``incoming`` into ``existing``. Returns True on a real-kind conflict.
+
+    One rule, used both inside a file and across files. The cross-file loop used
+    to keep only ``confidence`` and discard every later refinement -- a known
+    ``inferred_type`` arriving to replace ``unknown``, a real kind arriving to
+    replace a placeholder, an ``access_path`` arriving where there was none --
+    so an object reachable from two modules kept whatever the first file said.
+    First-file-wins is only deterministic if file order is.
+
+    Every rule below is commutative: ``merge(a, b)`` and ``merge(b, a)`` leave
+    the same values. That is what makes the artifacts a function of the input
+    rather than of the order the input was read in.
+    """
+    conflict = (
+        existing.kind != "unknown"
+        and incoming.kind != "unknown"
+        and existing.kind != incoming.kind
+    )
+
+    # The identity fields move as a block. Splitting them field by field could
+    # pair one record's ``kind`` with another's ``owner``, describing an object
+    # neither pass ever saw.
+    if _object_identity_rank(incoming) > _object_identity_rank(existing):
+        existing.kind = incoming.kind
+        existing.display_name = incoming.display_name
+        existing.scope = incoming.scope
+        existing.owner = incoming.owner
+        existing.container = incoming.container
+        existing.field = incoming.field
+
+    existing.confidence = _confidence_max(existing.confidence, incoming.confidence)
+    existing.inferred_type = _prefer_inferred_type(existing.inferred_type, incoming.inferred_type)
+
+    site = _prefer_earliest_site(existing, incoming)
+    if site is not None:
+        existing.file, existing.lineno = site
+
+    existing.alias_of = _prefer_populated(existing.alias_of, incoming.alias_of)
+    existing.access_path = _prefer_populated(existing.access_path, incoming.access_path)
+    if existing.structural_role == "primary":
+        existing.structural_role = incoming.structural_role
+    elif incoming.structural_role != "primary":
+        existing.structural_role = min(existing.structural_role, incoming.structural_role)
+    return conflict
 
 
 def _specific_family(ref: ExprRef) -> bool:
@@ -278,23 +377,47 @@ def _return_summary_score(ref: ExprRef) -> Tuple[int, int, int, int]:
     )
 
 
+def _return_summary_rank(ref: ExprRef) -> Tuple[Tuple[int, int, int, int], Tuple[object, ...]]:
+    """Total order over candidate return summaries.
+
+    ``_return_summary_score`` is four coarse flags, so two genuinely different
+    candidates tie constantly. A tie used to be resolved by keeping whichever
+    arrived first, which is whichever file the loop reached first -- so the
+    ``object_id``, ``display_name`` and ``access_path`` that the whole fixpoint
+    then propagates were a function of file order. The content itself breaks the
+    tie instead; which candidate wins is arbitrary, but it is the same one every
+    run.
+    """
+    return _return_summary_score(ref), astuple(ref)
+
+
 def _merge_return_summary(existing: Optional[ExprRef], candidate: ExprRef) -> ExprRef:
     if existing is None:
         return candidate
-    if _return_summary_score(candidate) > _return_summary_score(existing):
+    if _return_summary_rank(candidate) > _return_summary_rank(existing):
         return candidate
     return existing
 
 
-def _return_summary_snapshot(return_summaries: Dict[str, ExprRef]) -> Dict[str, Tuple[str, str, str, str, str]]:
+def _expr_ref_snapshot(ref: Optional[ExprRef]) -> Tuple[object, ...]:
+    """Every field of an ``ExprRef``, for comparing one fixpoint pass to the next.
+
+    ``astuple`` rather than a hand-written tuple: the two snapshot helpers used
+    to list fields by hand and listed *different* ones, so a pass that changed
+    only a tuple slot's ``access_path`` produced an identical snapshot and the
+    loop declared convergence and stopped. ``access_path`` is what
+    ``_field_object_id`` builds field IDs from, so that is not a cosmetic loss.
+    Deriving the snapshot from the dataclass also means a field added to
+    ``ExprRef`` later is compared without anyone remembering to add it here.
+    """
+    return () if ref is None else astuple(ref)
+
+
+def _return_summary_snapshot(
+    return_summaries: Dict[str, ExprRef],
+) -> Dict[str, Tuple[object, ...]]:
     return {
-        callable_id: (
-            ref.object_id,
-            ref.inferred_type,
-            ref.confidence,
-            ref.display_name,
-            ref.access_path,
-        )
+        callable_id: _expr_ref_snapshot(ref)
         for callable_id, ref in sorted(return_summaries.items())
     }
 
@@ -321,16 +444,11 @@ def _merge_return_tuple_summary(
 
 def _return_tuple_summary_snapshot(
     return_tuple_summaries: Dict[str, Tuple[Optional[ExprRef], ...]],
-) -> Dict[str, Tuple[Tuple[str, str, str, str], ...]]:
-    snapshot: Dict[str, Tuple[Tuple[str, str, str, str], ...]] = {}
-    for callable_id, refs in sorted(return_tuple_summaries.items()):
-        snapshot[callable_id] = tuple(
-            ("", "", "", "")
-            if ref is None
-            else (ref.object_id, ref.inferred_type, ref.confidence, ref.display_name)
-            for ref in refs
-        )
-    return snapshot
+) -> Dict[str, Tuple[Tuple[object, ...], ...]]:
+    return {
+        callable_id: tuple(_expr_ref_snapshot(ref) for ref in refs)
+        for callable_id, refs in sorted(return_tuple_summaries.items())
+    }
 
 
 def _unparse(node: ast.AST) -> str:
@@ -461,6 +579,54 @@ def _return_slot_id(callable_id: str, slot: Optional[int] = None) -> str:
     return f"return:{callable_id}:{slot}"
 
 
+def _lineage_roots_with_cycle_flag(
+    object_id: str,
+    incoming: Dict[str, Set[str]],
+    objects: Dict[str, DataObject],
+    cache: Dict[str, Set[str]],
+    seen: Set[str],
+) -> Tuple[Set[str], bool]:
+    """Reaching roots for ``object_id``, and whether a live cycle truncated them.
+
+    The cycle guard returns an empty set for a node already on the stack, which
+    is correct for *that* traversal and only that traversal. Caching a value
+    computed above such a node published the truncated answer to every later
+    query, so the result depended on which node happened to be asked first --
+    and the asking order was ``objects.items()``, i.e. the order files were
+    processed. ``_apply_lineage_aliases`` turns a one-root answer into an alias
+    and erases the alias on a many-root answer, so this silently flipped
+    ``alias_of`` between runs on any project with a lineage cycle.
+
+    The flag rides back up so an ancestor knows its own answer is provisional
+    too. On an acyclic graph it is never set and every node still caches, so
+    there is no cost to the common case.
+    """
+    if object_id in cache:
+        return cache[object_id], False
+    if object_id in seen:
+        return set(), True
+    seen.add(object_id)
+
+    roots: Set[str] = set()
+    truncated = False
+    for parent_id in sorted(incoming.get(object_id, set())):
+        if parent_id == object_id:
+            continue
+        parent_roots, parent_truncated = _lineage_roots_with_cycle_flag(
+            parent_id, incoming, objects, cache, seen
+        )
+        truncated = truncated or parent_truncated
+        if parent_roots:
+            roots.update(parent_roots)
+        elif parent_id in objects:
+            roots.add(parent_id)
+
+    seen.remove(object_id)
+    if not truncated:
+        cache[object_id] = roots
+    return roots, truncated
+
+
 def _lineage_roots(
     object_id: str,
     incoming: Dict[str, Set[str]],
@@ -468,25 +634,9 @@ def _lineage_roots(
     cache: Dict[str, Set[str]],
     seen: Optional[Set[str]] = None,
 ) -> Set[str]:
-    if object_id in cache:
-        return cache[object_id]
-    local_seen = seen if seen is not None else set()
-    if object_id in local_seen:
-        return set()
-    local_seen.add(object_id)
-
-    roots: Set[str] = set()
-    for parent_id in incoming.get(object_id, set()):
-        if parent_id == object_id:
-            continue
-        parent_roots = _lineage_roots(parent_id, incoming, objects, cache, local_seen)
-        if parent_roots:
-            roots.update(parent_roots)
-        elif parent_id in objects:
-            roots.add(parent_id)
-
-    local_seen.remove(object_id)
-    cache[object_id] = roots
+    roots, _truncated = _lineage_roots_with_cycle_flag(
+        object_id, incoming, objects, cache, seen if seen is not None else set()
+    )
     return roots
 
 
@@ -504,7 +654,7 @@ def _apply_lineage_aliases(
             incoming.setdefault(object_id, set()).add(obj.alias_of)
 
     cache: Dict[str, Set[str]] = {}
-    for object_id, obj in objects.items():
+    for object_id, obj in sorted(objects.items()):
         if obj.kind not in {"local_exposed", "param", "object_state", "class_attr_state"}:
             continue
         roots = {
@@ -527,9 +677,22 @@ def infer_split_class_owners(
     module: str,
     pyright_families: Optional[Dict[str, str]] = None,
 ) -> Set[str]:
+    """Classes whose state is modelled as one object per attribute, not one per class.
+
+    ``ast.walk`` rather than ``tree.body``: ``visit_ClassDef`` sets
+    ``current_class`` for a class defined anywhere -- inside a function, inside
+    another class -- and ``_current_owner`` then names it ``{module}.{name}``
+    with no qualification. Scanning only top-level classes left every nested
+    class permanently unsplittable while the collector was perfectly willing to
+    ask about it, so the two disagreed.
+
+    Only direct ``FunctionDef`` children of each class body are inspected, so a
+    nested class's methods are attributed to the nested class and not also to
+    the class enclosing it.
+    """
     pyright_families = pyright_families if pyright_families is not None else {}
     split_owners: Set[str] = set()
-    for node in tree.body:
+    for node in ast.walk(tree):
         if not isinstance(node, ast.ClassDef):
             continue
         attrs: Set[str] = set()
@@ -579,6 +742,39 @@ def infer_split_class_owners(
             and len(containerish_attrs) >= COORDINATOR_CONTAINER_THRESHOLD
         ):
             split_owners.add(f"{module}.{node.name}")
+    return split_owners
+
+
+def infer_split_class_owners_for_analysis_files(
+    analysis_files: Sequence[AnalysisFile],
+    pyright_families: Optional[Dict[str, str]] = None,
+    cache: Optional[ParsedFileCache] = None,
+) -> Set[str]:
+    """Split-class owners for the whole project, computed once before any pass.
+
+    Whether a class's state is one object or one object per attribute decides
+    that class's *object IDs*, and it has to be one answer for the run.
+    Computing it per file made it a different answer depending on which file was
+    being walked: ``registration_lineage._class_state_object_id_for_owner`` asks
+    about an owner resolved from a class reference, which is very often defined
+    in another module, so the same class was ``class_attr_state:X:state`` while
+    its own file was walked and ``class_state:X`` while any other file was. The
+    lineage edges recorded from the second case pointed at an ID the object
+    table never registered.
+
+    A union is the right join: a class qualifies on the evidence in its own
+    definition, and only the file that defines it can supply that evidence.
+    """
+    resolved_cache = cache if cache is not None else ParsedFileCache()
+    split_owners: Set[str] = set()
+    for analysis_file in analysis_files:
+        split_owners.update(
+            infer_split_class_owners(
+                resolved_cache.get(analysis_file.path),
+                analysis_file.module,
+                pyright_families,
+            )
+        )
     return split_owners
 
 
@@ -863,6 +1059,15 @@ def collect_module_imports(
     return imports, star_imports
 
 
+def known_class_ids_from_callable_map(callable_map: Dict[str, CallableDef]) -> Set[str]:
+    """Every ``module.Class`` the callable map mentions."""
+    return {
+        f"{callable_def.module}.{callable_def.class_name}"
+        for callable_def in callable_map.values()
+        if getattr(callable_def, "class_name", None)
+    }
+
+
 class DataAccessCollector(RegisteredStateLineageMixin, ast.NodeVisitor):
     def __init__(
         self,
@@ -883,6 +1088,7 @@ class DataAccessCollector(RegisteredStateLineageMixin, ast.NodeVisitor):
         attrdict_classes: Optional[Set[str]] = None,
         registration_rules: Optional[Dict[str, RegistrationRule]] = None,
         project_index: Optional[ProjectIndex] = None,
+        known_classes: Optional[Set[str]] = None,
     ):
         self.module = module
         self.file = file
@@ -908,14 +1114,22 @@ class DataAccessCollector(RegisteredStateLineageMixin, ast.NodeVisitor):
         self.registration_rules = registration_rules or {}
         self.project_index = project_index
         self.attrdict_access_paths: Set[str] = set()
-        self.known_classes = {
-            f"{callable_def.module}.{callable_def.class_name}"
-            for callable_def in callable_map.values()
-            if getattr(callable_def, "class_name", None)
-        }
+        # ``callable_map`` does not change during a run, so this set is the same
+        # every time it is built -- and a collector is constructed once per file
+        # per fixpoint pass. Callers that have more than one file compute it once
+        # and hand it in; the fallback keeps single-file callers self-contained.
+        self.known_classes = (
+            known_classes
+            if known_classes is not None
+            else known_class_ids_from_callable_map(callable_map)
+        )
         self.objects: Dict[str, DataObject] = {}
         self.edges: List[AccessEdge] = []
         self.created_object_ids: Set[str] = set()
+        # IDs that two passes described with two different real kinds. Not an
+        # artifact column -- a diagnostic, in the spirit of the ``unknown``-kind
+        # counter: every entry is two passes disagreeing about what one object is.
+        self.kind_conflicts: Set[str] = set()
 
         self.module_callable = module_callable_id(module)
         self.current_class: Optional[str] = None
@@ -1058,32 +1272,7 @@ class DataAccessCollector(RegisteredStateLineageMixin, ast.NodeVisitor):
         structural_role: str = "primary",
     ) -> None:
         lineno = getattr(node, "lineno", 0) if node is not None else 0
-        existing = self.objects.get(object_id)
-        if existing:
-            if existing.kind == "unknown" and kind != "unknown":
-                existing.kind = kind
-                existing.display_name = display_name
-                existing.scope = scope
-                existing.owner = owner
-                existing.container = container
-                existing.field = field
-                if lineno:
-                    existing.lineno = lineno
-                    existing.file = str(self.file)
-            existing.confidence = _confidence_max(existing.confidence, confidence)
-            existing.inferred_type = _prefer_inferred_type(existing.inferred_type, inferred_type)
-            if existing.lineno == 0 and lineno:
-                existing.lineno = lineno
-                existing.file = str(self.file)
-            if not existing.alias_of and alias_of:
-                existing.alias_of = alias_of
-            if not existing.access_path and access_path:
-                existing.access_path = access_path
-            if existing.structural_role == "primary" and structural_role != "primary":
-                existing.structural_role = structural_role
-            return
-
-        self.objects[object_id] = DataObject(
+        candidate = DataObject(
             id=object_id,
             kind=kind,
             display_name=display_name,
@@ -1099,6 +1288,12 @@ class DataAccessCollector(RegisteredStateLineageMixin, ast.NodeVisitor):
             access_path=access_path,
             structural_role=structural_role,
         )
+        existing = self.objects.get(object_id)
+        if existing is None:
+            self.objects[object_id] = candidate
+            return
+        if merge_data_object(existing, candidate):
+            self.kind_conflicts.add(object_id)
 
     def _record_access(
         self,
@@ -1618,6 +1813,35 @@ class DataAccessCollector(RegisteredStateLineageMixin, ast.NodeVisitor):
         if canonical is not None:
             candidates.append(canonical)
 
+    def _is_known_callable_id(self, candidate: str) -> bool:
+        """Is this ID a callable any pass knows about?
+
+        Four dict lookups, where this used to be four whole-corpus set
+        constructions unioned together -- rebuilt for every ``ast.Call`` node
+        visited, and profiled at 26% of the stage's self time on climlab.
+
+        A cached union is not an option: ``return_summaries`` and
+        ``return_tuple_summaries`` are written by the collector *during* its own
+        traversal, so a snapshot goes stale mid-walk. Testing membership against
+        the live dicts is equivalent by definition and cannot go stale, which is
+        why this and not the frozen index the review proposed.
+        """
+        return (
+            candidate in self.callable_map
+            or candidate in self.callable_params
+            or candidate in self.return_summaries
+            or candidate in self.return_tuple_summaries
+        )
+
+    def _all_known_callable_ids(self) -> Set[str]:
+        """Every known callable ID, for the one caller that needs a prefix scan."""
+        return (
+            set(self.callable_map)
+            | set(self.callable_params)
+            | set(self.return_summaries)
+            | set(self.return_tuple_summaries)
+        )
+
     def _candidate_callable_ids_for_call(self, node: ast.Call) -> List[str]:
         dynamic_candidates = self._dynamic_getattr_callable_ids(node.func)
         if dynamic_candidates:
@@ -1647,12 +1871,11 @@ class DataAccessCollector(RegisteredStateLineageMixin, ast.NodeVisitor):
         else:
             self._append_candidate(candidates, call_name)
             candidates.append(f"{self.module}.{call_name}")
-        known_ids = set(self.callable_map) | set(self.callable_params) | set(self.return_summaries) | set(self.return_tuple_summaries)
         expanded: List[str] = []
         for candidate in candidates:
             expanded.append(candidate)
             init_candidate = f"{candidate}.__init__"
-            if init_candidate in known_ids:
+            if self._is_known_callable_id(init_candidate):
                 expanded.append(init_candidate)
         return list(dict.fromkeys(expanded))
 
@@ -1673,18 +1896,25 @@ class DataAccessCollector(RegisteredStateLineageMixin, ast.NodeVisitor):
         if not imported_base:
             return []
 
-        known_ids = set(self.callable_map) | set(self.callable_params) | set(self.return_summaries) | set(self.return_tuple_summaries)
         if isinstance(attr_arg, ast.Constant) and isinstance(attr_arg.value, str):
             target = f"{imported_base}.{attr_arg.value}"
-            if target in known_ids:
+            if self._is_known_callable_id(target):
                 return [target]
             # Same alias canonicalization as the direct-call path: the attribute
             # a package re-exports is not the path the callable is defined at.
             canonical = self._canonical_callable_id(target)
             return [canonical] if canonical is not None else []
 
+        # The only branch that genuinely needs the whole set rather than a
+        # membership test, and it is reached only by a getattr with a computed
+        # attribute name. Built here rather than above so the common path never
+        # pays for it.
         prefix = f"{imported_base}."
-        return sorted(callable_id for callable_id in known_ids if callable_id.startswith(prefix))
+        return sorted(
+            callable_id
+            for callable_id in self._all_known_callable_ids()
+            if callable_id.startswith(prefix)
+        )
 
     def _bind_call_args_to_params(
         self,
@@ -2677,6 +2907,8 @@ def collect_data_access_from_tree(
     attrdict_classes: Optional[Set[str]] = None,
     registration_rules: Optional[Dict[str, RegistrationRule]] = None,
     project_index: Optional[ProjectIndex] = None,
+    split_class_owners: Optional[Set[str]] = None,
+    known_classes: Optional[Set[str]] = None,
 ) -> Tuple[Dict[str, DataObject], List[AccessEdge], List[LineageEdge]]:
     attach_parents(tree)
     if callable_map is None:
@@ -2686,7 +2918,13 @@ def collect_data_access_from_tree(
         module,
         current_is_package=is_package_file(file),
     )
-    split_class_owners = infer_split_class_owners(tree, module, pyright_families)
+    # ``None`` means "this caller has only one file", which is the single-source
+    # path: there, per-file and project-wide are the same set.
+    resolved_split_class_owners = (
+        split_class_owners
+        if split_class_owners is not None
+        else infer_split_class_owners(tree, module, pyright_families)
+    )
     resolved_attrdict_classes = (
         attrdict_classes
         if attrdict_classes is not None
@@ -2705,11 +2943,12 @@ def collect_data_access_from_tree(
         param_bindings=param_bindings,
         param_access_paths=param_access_paths,
         lineage_edges=lineage_edges,
-        split_class_owners=split_class_owners,
+        split_class_owners=resolved_split_class_owners,
         pyright_families=pyright_families,
         attrdict_classes=resolved_attrdict_classes,
         registration_rules=registration_rules,
         project_index=project_index,
+        known_classes=known_classes,
     )
     collector.visit(tree)
     return collector.objects, collector.edges, collector.lineage_edges
@@ -2750,6 +2989,13 @@ def collect_data_access_from_source(
             and _return_tuple_summary_snapshot(return_tuple_summaries) == before_tuple
         ):
             break
+    else:
+        warnings.warn(
+            f"data-access return summaries did not converge within "
+            f"MAX_RETURN_SUMMARY_PASSES={MAX_RETURN_SUMMARY_PASSES}; "
+            f"some objects and access edges may be missing",
+            stacklevel=2,
+        )
 
     tree = parse_python_source(source, filename=filename)
     param_bindings: Dict[str, Set[str]] = {}
@@ -2815,9 +3061,26 @@ def collect_data_access_from_analysis_files(
     attrdict_classes = collect_attrdict_classes_from_analysis_files(
         analysis_files, cache=resolved_cache
     )
+    # Two whole-project facts settled before any pass runs. Both used to be
+    # recomputed inside every collector, which meant once per file per pass --
+    # and in the split-owner case the per-file answers disagreed with each
+    # other, so a class's object IDs depended on which file was being walked.
+    split_class_owners = infer_split_class_owners_for_analysis_files(
+        analysis_files, resolved_pyright_families, cache=resolved_cache
+    )
+    known_classes = known_class_ids_from_callable_map(callable_map)
 
     # Iterate to a small fixpoint so return summaries can propagate through
     # shallow call chains even when files are not processed in dependency order.
+    #
+    # ``registration_rules`` and ``project_index`` are threaded here as well as
+    # into the final pass below. They used to be omitted, which meant the
+    # fixpoint converged on a *weaker* analysis than the one that actually
+    # produces the artifacts: with the project index in hand the final pass
+    # resolves re-exported callables the fixpoint could not, discovers new return
+    # summaries while it runs, and hands them only to the files it happens to
+    # reach afterwards. That made two objects on climlab exist or not exist
+    # depending on file order.
     for _ in range(MAX_RETURN_SUMMARY_PASSES):
         before = _return_summary_snapshot(return_summaries)
         before_tuple = _return_tuple_summary_snapshot(return_tuple_summaries)
@@ -2835,15 +3098,31 @@ def collect_data_access_from_analysis_files(
                 callable_params=callable_params,
                 pyright_families=resolved_pyright_families,
                 attrdict_classes=attrdict_classes,
+                registration_rules=registration_rules,
+                project_index=project_index,
+                split_class_owners=split_class_owners,
+                known_classes=known_classes,
             )
         if (
             _return_summary_snapshot(return_summaries) == before
             and _return_tuple_summary_snapshot(return_tuple_summaries) == before_tuple
         ):
             break
+    else:
+        # The cap stopped the loop rather than convergence, so some return
+        # summaries may still be one hop short. Silence here is what let an
+        # incomplete result look like a settled one -- same reasoning, and same
+        # wording, as ``call_graph.passes``.
+        warnings.warn(
+            f"data-access return summaries did not converge within "
+            f"MAX_RETURN_SUMMARY_PASSES={MAX_RETURN_SUMMARY_PASSES}; "
+            f"some objects and access edges may be missing",
+            stacklevel=2,
+        )
 
     param_bindings: Dict[str, Set[str]] = {}
     param_access_paths: Dict[str, Set[str]] = {}
+    kind_conflicts: Set[str] = set()
     for analysis_file in analysis_files:
         py_file = analysis_file.path
         module = analysis_file.module
@@ -2864,17 +3143,27 @@ def collect_data_access_from_analysis_files(
             attrdict_classes=attrdict_classes,
             registration_rules=registration_rules,
             project_index=project_index,
+            split_class_owners=split_class_owners,
+            known_classes=known_classes,
         )
         for object_id, data_object in module_objects.items():
             if object_id not in objects:
                 objects[object_id] = data_object
-            else:
-                objects[object_id].confidence = _confidence_max(
-                    objects[object_id].confidence,
-                    data_object.confidence,
-                )
+            elif merge_data_object(objects[object_id], data_object):
+                kind_conflicts.add(object_id)
         edges.extend(module_edges)
         lineage_edges.extend(module_lineage_edges)
+
+    if kind_conflicts:
+        # Two files described one ID with two different real kinds. The merge
+        # resolves it the same way every run, but the disagreement itself is a
+        # defect signal -- §4.6's argument that a placeholder count is better
+        # read as a defect counter than as a legitimate object kind.
+        warnings.warn(
+            f"{len(kind_conflicts)} data object(s) were described with conflicting "
+            f"kinds by different files, e.g. {sorted(kind_conflicts)[0]}",
+            stacklevel=2,
+        )
 
     _apply_confirmed_param_aliases(objects, param_bindings)
     _apply_confirmed_param_access_paths(objects, param_access_paths)
@@ -2940,20 +3229,36 @@ def _pyright_families_for_config(
         return {}
 
 
-def run_from_extraction_config(config: ExtractionConfig, *, outdir: Optional[Path] = None) -> Tuple[int, int, int]:
+def run_from_extraction_config(
+    config: ExtractionConfig,
+    *,
+    outdir: Optional[Path] = None,
+    analysis_files: Optional[Sequence[AnalysisFile]] = None,
+) -> Tuple[int, int, int]:
+    """Run the whole data-access stage for a config.
+
+    ``analysis_files`` overrides file discovery. Only the determinism check uses
+    it, to run this exact function twice with the file list in two different
+    orders. It is a parameter rather than something that check reimplements
+    because a paraphrase of this function would drift from it, and a determinism
+    check that has quietly stopped testing the real pipeline reports success
+    either way -- which is the failure mode the check exists to rule out.
+    """
     shared_config = (
         load_shared_field_containers(config.data_access.shared_containers_config)
         if config.data_access.shared_containers_config
         else None
     )
     configure_shared_field_containers(shared_config)
-    analysis_files = iter_analysis_files_for_source_roots(
-        config.source_roots,
-        entrypoints=config.entrypoints,
-        project_root=config.project_root,
-        include_globs=config.include_globs,
-        exclude_globs=config.exclude_globs,
-    )
+    if analysis_files is None:
+        analysis_files = iter_analysis_files_for_source_roots(
+            config.source_roots,
+            entrypoints=config.entrypoints,
+            project_root=config.project_root,
+            include_globs=config.include_globs,
+            exclude_globs=config.exclude_globs,
+        )
+    analysis_files = list(analysis_files)
     # The call-graph passes are re-run here rather than read from that stage's
     # artifacts: registration lineage would otherwise be silently wrong whenever
     # edges.csv was stale, and neither stage would be runnable on its own.
