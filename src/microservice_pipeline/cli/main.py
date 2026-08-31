@@ -18,6 +18,7 @@ def _commands() -> dict[str, Callable[[Sequence[str] | None], None]]:
     from microservice_pipeline.data_access.determinism_check import main as check_determinism_main
     from microservice_pipeline.data_access.dynamic_access_trace import main as trace_data_access_main
     from microservice_pipeline.data_access.generate_data_access_ast import main as data_access_main
+    from microservice_pipeline.data_access.identity_comparison import main as compare_identity_main
     from microservice_pipeline.data_access.infer_shared_containers import main as infer_shared_containers_main
     from microservice_pipeline.evaluation.evaluate_microservice_clustering import main as evaluate_main
     from microservice_pipeline.notebook_tasks.analyze_notebook_tasks import main as notebook_tasks_main
@@ -30,6 +31,7 @@ def _commands() -> dict[str, Callable[[Sequence[str] | None], None]]:
         "call-cluster": call_cluster_main,
         "check-data-access-determinism": check_determinism_main,
         "compare-data-access": compare_data_access_main,
+        "compare-data-access-identity": compare_identity_main,
         "compare-graphs": compare_graphs_main,
         "data-access": data_access_main,
         "evaluate": evaluate_main,
