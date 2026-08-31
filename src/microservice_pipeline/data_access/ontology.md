@@ -154,7 +154,7 @@ Its fields are:
 | --- | --- |
 | `src_object_id` | Source data ID or virtual flow-point ID. |
 | `dst_object_id` | Destination data ID or virtual flow-point ID. |
-| `relation` | Kind of flow, such as `arg_to_param`. |
+| `relation` | Kind of flow, such as `arg_to_param`. Says whether the two ends are the same object or only related — see section 4. |
 | `file` | File containing the evidence. |
 | `lineno` | Line containing the evidence. |
 | `caller` | Caller at the source location, when relevant. |
@@ -479,7 +479,21 @@ read/load           -> param:...:config
 
 ## 4. Lineage relations
 
-The current lineage vocabulary contains six relations.
+The current lineage vocabulary contains seven relations, and they divide into
+two kinds.
+
+**Identity relations** say the two ends hold *the same object*: `arg_to_param`,
+`return_value`, `return_slot`, `local_assign`, `state_assign`, `tuple_unpack`.
+These are the ones that may become an `alias_of`, and the ones anything
+downstream may treat as a reason to merge two nodes.
+
+**`derived_from`** says the value at one end was *made from* the value at the
+other. It is flow, not identity. It is listed in the same table and carried in
+the same column, but nothing may merge on it.
+
+The split lives in one place, `data_access.models.IDENTITY_RELATIONS`, so the
+extractor's alias solver and the runtime oracle that scores its claims cannot
+drift apart about what a relation means.
 
 ### 4.1 `arg_to_param`
 
@@ -675,20 +689,70 @@ return:sample.build_pair:1
 local_exposed:sample.run:errors
 ```
 
-### 4.7 `alias_of` compared with lineage
+### 4.7 `derived_from`
+
+Direction:
+
+```text
+the value it was made from -> the new value
+```
+
+Example:
+
+```python
+dic = self.state.copy()          # a copy is a new dictionary
+tlay = _climlab_to_rrtm(field)   # a function that reshapes on most paths
+```
+
+Possible edges:
+
+```text
+class_state:sample.Model
+    --derived_from-->
+local_exposed:sample.Model.snapshot:dic
+```
+
+Recorded in three situations, all of them "a call produced this value":
+
+- `x.copy()`, which exists precisely to produce a different object;
+- a call whose callee does **not** hand back the same expression on every path,
+  so the caller cannot know which one it got;
+- anything reached through one of the above, since a value made from a made
+  value is still made.
+
+The family and the field structure still come from the source object -- a copy
+of a dictionary is a dictionary, and `d.copy()['k']` reaches the same value as
+`d['k']` -- so the edge is kept rather than dropped. Only the claim that the two
+are one object is withheld.
+
+Whether a callee qualifies is decided from its syntax: every `return` in it
+carries a value, they are all the same expression, and control cannot fall off
+the end (which would return `None` on that path). Generators never qualify --
+calling one hands back a generator, not the value in its `return`.
+
+### 4.8 `alias_of` compared with lineage
 
 `DataObject.alias_of` is a convenient single-object answer. A lineage graph can
 contain several possible sources.
 
-The extractor sets `alias_of` only when it can find one unambiguous root. If two
-different roots can reach the object, `alias_of` remains empty while the lineage
-edges preserve both possibilities.
+The extractor sets `alias_of` only when it can find one unambiguous root, and
+only when the identity relations on their own reach that same single root. If
+two different roots can reach the object, or if the only route to the root runs
+through a `derived_from` edge, `alias_of` remains empty while the lineage edges
+preserve what was seen.
+
+Both halves of that rule matter. Following `derived_from` to a root would put
+back the merge the edge exists to avoid; *ignoring* `derived_from` entirely would
+hide ambiguity that makes an alias unsafe, and would hand out aliases the older,
+blunter rule refused. Requiring the two readings to agree can only ever withhold
+an alias.
 
 Therefore:
 
 ```text
-alias_of    = one safe summary
+alias_of    = one safe summary, identity evidence only
 lineage     = complete recorded flow evidence, including ambiguity
+              and including flow that is explicitly not identity
 ```
 
 ## 5. Internal resolver concepts

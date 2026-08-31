@@ -159,6 +159,10 @@ HAC_MUTATING_DATA_ACCESSES = frozenset({"create", "write", "read_write"})
 LOCAL_CALLABLE_MARKER = ".<locals>."
 LOCAL_CALLABLE_MUST_LINK_RELATION = "local_callable"
 
+# A must-link is a hard constraint: the two nodes end up in one cluster whatever
+# the rest of the graph says. So only relations that claim the two names hold the
+# *same object* belong here. ``derived_from`` -- "this value was made from that
+# one" -- is deliberately absent, and so is ``arg_to_param``.
 STRONG_MUST_LINK_RELATIONS = {
     "state_assign",
     "tuple_unpack",

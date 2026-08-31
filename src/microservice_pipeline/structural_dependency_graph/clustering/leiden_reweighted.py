@@ -19,6 +19,8 @@ DEFAULT_SUBTYPE_RATIO_MAX = 1.5
 DEFAULT_SINGLE_WRITER_BOOST = 1.5
 DEFAULT_SINGLE_WRITER_MAX_WEIGHT = 8.0
 WRITER_ACCESSES = frozenset({"write", "create", "read_write"})
+# Identity relations only -- see ``cluster_structural_graph.STRONG_MUST_LINK_RELATIONS``.
+# ``derived_from`` is a "made from" edge and must not force a merge.
 DEFAULT_MUST_LINK_RELATIONS = frozenset({"state_assign", "local_assign", "tuple_unpack"})
 
 

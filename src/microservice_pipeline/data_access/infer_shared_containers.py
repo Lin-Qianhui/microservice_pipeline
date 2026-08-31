@@ -41,6 +41,11 @@ except ImportError:  # pragma: no cover - supports direct script execution
         probe_pyright_targets,
     )
 
+try:
+    from microservice_pipeline.data_access.models import IDENTITY_RELATIONS
+except ImportError:  # pragma: no cover - supports direct script execution
+    from data_access.models import IDENTITY_RELATIONS  # type: ignore
+
 
 GENERIC_CONTAINER_NAMES = {"df", "data", "results", "table", "mapping", "dict", "items"}
 
@@ -160,6 +165,13 @@ def _lineage_roots_for_objects(data_access_payload: dict) -> Dict[str, Set[str]]
         if alias_of:
             incoming[obj["id"]].add(alias_of)
     for edge in data_access_payload.get("lineage_edges", []):
+        # Only identity relations. A ``derived_from`` edge says the value was
+        # made from its source, not that it *is* its source, so following one to
+        # a root would put back exactly the merges Step 4a removed -- the
+        # section 4.3 drift this file has already suffered once, when its copy
+        # of the root walk inherited section 1.3's caching bug.
+        if str(edge.get("relation", "")) not in IDENTITY_RELATIONS:
+            continue
         src = (edge.get("src_object_id") or "").strip()
         dst = (edge.get("dst_object_id") or "").strip()
         if src and dst:

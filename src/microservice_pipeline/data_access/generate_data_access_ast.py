@@ -18,7 +18,7 @@ import argparse
 import ast
 import sys
 import warnings
-from dataclasses import astuple
+from dataclasses import astuple, replace
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
@@ -44,12 +44,21 @@ try:
     from microservice_pipeline.jsonc_config import load_jsonc
     from microservice_pipeline.data_access.models import (
         CONFIDENCE_RANK,
+        IDENTITY_RELATIONS,
+        RELATION_ARG_TO_PARAM,
+        RELATION_DERIVED_FROM,
+        RELATION_LOCAL_ASSIGN,
+        RELATION_RETURN_SLOT,
+        RELATION_RETURN_VALUE,
+        RELATION_STATE_ASSIGN,
+        RELATION_TUPLE_UNPACK,
         AccessEdge,
         DataObject,
         ExprRef,
         LineageEdge,
         LocalBinding,
         Scope,
+        ValueOrigin,
         confidence_max,
         confidence_weight,
     )
@@ -110,12 +119,21 @@ except ImportError:  # pragma: no cover - supports direct script execution
     from jsonc_config import load_jsonc  # type: ignore
     from microservice_pipeline.data_access.models import (  # type: ignore
         CONFIDENCE_RANK,
+        IDENTITY_RELATIONS,
+        RELATION_ARG_TO_PARAM,
+        RELATION_DERIVED_FROM,
+        RELATION_LOCAL_ASSIGN,
+        RELATION_RETURN_SLOT,
+        RELATION_RETURN_VALUE,
+        RELATION_STATE_ASSIGN,
+        RELATION_TUPLE_UNPACK,
         AccessEdge,
         DataObject,
         ExprRef,
         LineageEdge,
         LocalBinding,
         Scope,
+        ValueOrigin,
         confidence_max,
         confidence_weight,
     )
@@ -178,6 +196,7 @@ try:
         parse_python_source,
         path_to_module,
     )
+    from microservice_pipeline.call_graph.ast_utils import unwrap_passthrough
     from microservice_pipeline.data_access.pyright_type_probe import (
         FAMILY_DATAFRAME,
         FAMILY_DICT,
@@ -213,6 +232,7 @@ except ImportError:  # pragma: no cover - supports direct script execution
         parse_python_source,
         path_to_module,
     )
+    from microservice_pipeline.call_graph.ast_utils import unwrap_passthrough  # type: ignore
     from microservice_pipeline.data_access.pyright_type_probe import (  # type: ignore
         FAMILY_DATAFRAME,
         FAMILY_DICT,
@@ -451,6 +471,123 @@ def _return_tuple_summary_snapshot(
     }
 
 
+# A callable's own statements stop at any nested scope: a ``return`` inside a
+# nested function belongs to that function, not to this one.
+_NESTED_SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
+
+
+def _own_statements(body: Sequence[ast.stmt]) -> List[ast.AST]:
+    found: List[ast.AST] = []
+    stack: List[ast.AST] = list(reversed(list(body)))
+    while stack:
+        node = stack.pop()
+        if isinstance(node, _NESTED_SCOPES):
+            continue
+        found.append(node)
+        stack.extend(reversed(list(ast.iter_child_nodes(node))))
+    return found
+
+
+def _always_returns(body: Sequence[ast.stmt]) -> bool:
+    """Whether control can never fall off the end of ``body``.
+
+    A function that falls off the end returns ``None``, which is a *different*
+    value from the one its single ``return`` names -- so ``if c: return x`` with
+    nothing after it does not return ``x`` on every path, and enumerating its
+    ``Return`` nodes alone cannot tell you that.
+
+    Deliberately conservative: any shape not listed answers ``False``, which
+    withholds an alias rather than inventing one. ``while True:`` loops that only
+    exit through a ``return`` are the notable omission.
+    """
+    for stmt in body:
+        if isinstance(stmt, (ast.Return, ast.Raise)):
+            return True
+        if isinstance(stmt, ast.If):
+            if stmt.orelse and _always_returns(stmt.body) and _always_returns(stmt.orelse):
+                return True
+        elif isinstance(stmt, (ast.With, ast.AsyncWith)):
+            if _always_returns(stmt.body):
+                return True
+        elif isinstance(stmt, ast.Try):
+            if stmt.finalbody and _always_returns(stmt.finalbody):
+                return True
+            # No handlers is ``try/finally``, where ``all`` over nothing is the
+            # right answer: only the body has to settle it.
+            if _always_returns(list(stmt.body) + list(stmt.orelse)) and all(
+                _always_returns(handler.body) for handler in stmt.handlers
+            ):
+                return True
+        elif isinstance(stmt, ast.Match):
+            has_wildcard = any(
+                isinstance(case.pattern, ast.MatchAs)
+                and case.pattern.pattern is None
+                and case.guard is None
+                for case in stmt.cases
+            )
+            if has_wildcard and all(_always_returns(case.body) for case in stmt.cases):
+                return True
+    return False
+
+
+def _returns_one_source(node: ast.AST) -> bool:
+    """Whether every path out of this callable hands back the same expression.
+
+    This is the gate on treating a call's result as *being* one of the objects
+    inside the callee. Step 1b measured what happens without it:
+    ``_climlab_to_cam3`` starts ``if np.isscalar(field): return field`` and
+    builds a new array on every other path, and that one branch made all
+    eighteen of its call sites claim they held ``field`` itself. Roughly 41 of
+    the 51 contradictions on climlab were this one shape.
+
+    Answered syntactically, on the text of the returned expressions, for three
+    reasons: it is settled on the first pass, so it needs no place in the
+    fixpoint's convergence test (the section 1.5 trap); it cannot oscillate; and
+    when it is wrong it is wrong in the safe direction -- ``return d`` and
+    ``return self.data`` naming one object read as two, which withholds a true
+    alias rather than asserting a false one.
+    """
+    body = getattr(node, "body", None)
+    if not isinstance(body, list):
+        return False
+    own = _own_statements(body)
+    if any(isinstance(stmt, (ast.Yield, ast.YieldFrom)) for stmt in own):
+        # A generator call returns a generator, never the value in its
+        # ``return``, so no expression inside it describes what the caller gets.
+        return False
+    returns = [stmt for stmt in own if isinstance(stmt, ast.Return)]
+    if not returns:
+        return False
+    texts: Set[str] = set()
+    for stmt in returns:
+        if stmt.value is None:
+            return False  # a bare ``return`` yields None -- a different value
+        texts.add(_unparse(unwrap_passthrough(stmt.value)))
+        if len(texts) > 1:
+            return False
+    return _always_returns(body)
+
+
+def _is_copy_call(node: ast.AST) -> bool:
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "copy"
+    )
+
+
+def _as_derived(ref: Optional[ExprRef]) -> Optional[ExprRef]:
+    """The same reference, marked as "made from" rather than "is".
+
+    ``replace`` rather than mutation: the resolvers hand back refs that other
+    call sites also hold, and flipping the flag in place would spread the
+    derivation to expressions that really are the object.
+    """
+    if ref is None or ref.derived:
+        return ref
+    return replace(ref, derived=True)
+
+
 def _unparse(node: ast.AST) -> str:
     try:
         return ast.unparse(node)
@@ -640,35 +777,70 @@ def _lineage_roots(
     return roots
 
 
-def _apply_lineage_aliases(
+def _incoming_lineage(
     objects: Dict[str, DataObject],
     lineage_edges: Sequence[LineageEdge],
-) -> None:
+    *,
+    identity_only: bool,
+) -> Dict[str, Set[str]]:
     incoming: Dict[str, Set[str]] = {}
     for edge in lineage_edges:
         if not edge.src_object_id or not edge.dst_object_id:
+            continue
+        if identity_only and edge.relation not in IDENTITY_RELATIONS:
             continue
         incoming.setdefault(edge.dst_object_id, set()).add(edge.src_object_id)
     for object_id, obj in objects.items():
         if obj.alias_of:
             incoming.setdefault(object_id, set()).add(obj.alias_of)
+    return incoming
 
-    cache: Dict[str, Set[str]] = {}
+
+def _apply_lineage_aliases(
+    objects: Dict[str, DataObject],
+    lineage_edges: Sequence[LineageEdge],
+) -> None:
+    """Turn the lineage graph into ``alias_of``, using both readings of it.
+
+    ``alias_of`` means "is the same object as", so only ``IDENTITY_RELATIONS``
+    may create one -- a ``derived_from`` edge says the value was *made from* its
+    source, and merging the two is the false merge Step 1b measured.
+
+    But the identity-only graph is not enough on its own. Dropping the derived
+    edges also drops *ambiguity* the solver currently detects: a local reachable
+    from two different values has no alias today, and would acquire one if the
+    edge that made it ambiguous were filtered out. That would trade one kind of
+    false merge for another. So both graphs are consulted and they have to
+    agree: an alias is recorded only when the identity graph and the full graph
+    reach the same single root. The rule can therefore only ever *withhold* an
+    alias relative to the previous behaviour, never invent one -- which is what
+    makes the direction of every measurement in Step 4a unambiguous.
+    """
+    incoming_all = _incoming_lineage(objects, lineage_edges, identity_only=False)
+    incoming_identity = _incoming_lineage(objects, lineage_edges, identity_only=True)
+
+    cache_all: Dict[str, Set[str]] = {}
+    cache_identity: Dict[str, Set[str]] = {}
     for object_id, obj in sorted(objects.items()):
         if obj.kind not in {"local_exposed", "param", "object_state", "class_attr_state"}:
             continue
         roots = {
             root_id
-            for root_id in _lineage_roots(object_id, incoming, objects, cache)
+            for root_id in _lineage_roots(object_id, incoming_all, objects, cache_all)
             if root_id and root_id != object_id and root_id in objects
         }
-        if len(roots) == 1:
+        identity_roots = {
+            root_id
+            for root_id in _lineage_roots(object_id, incoming_identity, objects, cache_identity)
+            if root_id and root_id != object_id and root_id in objects
+        }
+        if len(roots) == 1 and roots == identity_roots:
             obj.alias_of = next(iter(roots))
-        elif len(roots) > 1 and obj.alias_of:
-            # A direct return summary may have picked one "best" return object
-            # while the full lineage graph still has multiple possible roots.
-            # Do not keep the one-summary alias when reaching definitions are
-            # ambiguous.
+        elif obj.alias_of and (len(roots) > 1 or roots != identity_roots):
+            # Either the full lineage graph has several possible roots -- a
+            # direct return summary may have picked one "best" return object
+            # while reaching definitions are ambiguous -- or the only root is
+            # reached through a ``derived_from`` edge, which is not an identity.
             obj.alias_of = ""
 
 
@@ -1080,6 +1252,7 @@ class DataAccessCollector(RegisteredStateLineageMixin, ast.NodeVisitor):
         return_summaries: Optional[Dict[str, ExprRef]] = None,
         return_tuple_summaries: Optional[Dict[str, Tuple[Optional[ExprRef], ...]]] = None,
         callable_params: Optional[Dict[str, Tuple[str, ...]]] = None,
+        callable_return_identity: Optional[Dict[str, bool]] = None,
         param_bindings: Optional[Dict[str, Set[str]]] = None,
         param_access_paths: Optional[Dict[str, Set[str]]] = None,
         lineage_edges: Optional[List[LineageEdge]] = None,
@@ -1101,6 +1274,13 @@ class DataAccessCollector(RegisteredStateLineageMixin, ast.NodeVisitor):
             return_tuple_summaries if return_tuple_summaries is not None else {}
         )
         self.callable_params = callable_params if callable_params is not None else {}
+        # Per callable: does every path out of it hand back the same expression?
+        # Filled in ``_enter_callable`` from the syntax alone, so it is settled
+        # on the first pass and can ride the same plumbing as
+        # ``callable_params`` instead of needing its own fixpoint entry.
+        self.callable_return_identity = (
+            callable_return_identity if callable_return_identity is not None else {}
+        )
         self.param_bindings = param_bindings if param_bindings is not None else {}
         self.param_access_paths = param_access_paths if param_access_paths is not None else {}
         self.lineage_edges = lineage_edges if lineage_edges is not None else []
@@ -1676,17 +1856,26 @@ class DataAccessCollector(RegisteredStateLineageMixin, ast.NodeVisitor):
             return "dict_key"
         return CONTAINER_FIELD_KIND
 
-    def _infer_type_from_value(self, value: object) -> Tuple[str, str, str]:
+    def _infer_type_from_value(self, value: object) -> ValueOrigin:
+        """The family of an assigned value, and the object it came from.
+
+        ``ValueOrigin.identity`` says whether the value *is* that object or was
+        merely *made from* it. Only the first may become ``alias_of``; the
+        second becomes a ``derived_from`` lineage edge, which keeps the flow
+        without merging the two nodes.
+        """
         if isinstance(value, ExprRef):
-            return value.inferred_type, value.object_id, value.confidence
+            return ValueOrigin(
+                value.inferred_type, value.object_id, value.confidence, not value.derived
+            )
         if isinstance(value, ast.Dict):
-            return FAMILY_DICT, "", "high"
+            return ValueOrigin(FAMILY_DICT, "", "high")
         if isinstance(value, ast.List):
-            return FAMILY_LIST, "", "high"
+            return ValueOrigin(FAMILY_LIST, "", "high")
         if isinstance(value, ast.Set):
-            return FAMILY_SET, "", "high"
+            return ValueOrigin(FAMILY_SET, "", "high")
         if isinstance(value, ast.Tuple):
-            return FAMILY_UNKNOWN, "", "medium"
+            return ValueOrigin(FAMILY_UNKNOWN, "", "medium")
         if isinstance(value, ast.Subscript):
             base = self._resolve_expr(value.value)
             if (
@@ -1694,46 +1883,64 @@ class DataAccessCollector(RegisteredStateLineageMixin, ast.NodeVisitor):
                 and self._field_kind(base) == "df_col"
                 and _slice_selects_multiple_fields(_slice_value(value))
             ):
-                return FAMILY_DATAFRAME, base.object_id, "medium"
+                return ValueOrigin(FAMILY_DATAFRAME, base.object_id, "medium", not base.derived)
         if isinstance(value, ast.Call):
             call_name = _attribute_path(value.func) or ""
             returned = self._return_ref_from_call(value)
             if returned:
-                return returned.inferred_type, returned.object_id, returned.confidence
+                return ValueOrigin(
+                    returned.inferred_type,
+                    returned.object_id,
+                    returned.confidence,
+                    not returned.derived,
+                )
             if self._value_is_attrdict_constructor(value):
-                return FAMILY_DICT, "", "medium"
+                return ValueOrigin(FAMILY_DICT, "", "medium")
             if call_name in {"dict", "builtins.dict"} or call_name.endswith(".dict"):
-                return FAMILY_DICT, "", "high"
+                return ValueOrigin(FAMILY_DICT, "", "high")
             if call_name in {"list", "builtins.list"} or call_name.endswith(".list"):
-                return FAMILY_LIST, "", "high"
+                return ValueOrigin(FAMILY_LIST, "", "high")
             if call_name in {"set", "builtins.set"} or call_name.endswith(".set"):
-                return FAMILY_SET, "", "high"
+                return ValueOrigin(FAMILY_SET, "", "high")
             if call_name.endswith("DataFrame") or call_name.endswith("read_csv"):
-                return FAMILY_DATAFRAME, "", "high"
+                return ValueOrigin(FAMILY_DATAFRAME, "", "high")
             if call_name.endswith(tuple(FILE_READ_FUNCS)):
-                return FAMILY_DATAFRAME, "", "high"
+                return ValueOrigin(FAMILY_DATAFRAME, "", "high")
             if _call_name_matches(call_name, XARRAY_OPEN_FUNCS):
-                return FAMILY_XARRAY, "", "high"
+                return ValueOrigin(FAMILY_XARRAY, "", "high")
             if _call_name_matches(call_name, POOCH_READ_FUNCS):
-                return FAMILY_PATH, "", "medium"
-            if isinstance(value.func, ast.Attribute) and value.func.attr == "copy":
+                return ValueOrigin(FAMILY_PATH, "", "medium")
+            if _is_copy_call(value):
+                # A copy is the one call in the language whose whole purpose is
+                # to *not* be the same object, so the base is where the value
+                # came from and its family, but never what it is. Step 1b caught
+                # this directly: ``dic = self.state.copy()`` was recorded as
+                # ``dic`` being ``self.state``.
                 base = self._resolve_expr(value.func.value)
                 if base:
-                    return base.inferred_type or FAMILY_UNKNOWN, base.object_id, "medium"
+                    return ValueOrigin(
+                        base.inferred_type or FAMILY_UNKNOWN, base.object_id, "medium", False
+                    )
             if isinstance(value.func, ast.Attribute) and value.func.attr in {
                 "loc",
                 "iloc",
                 "pivot_table",
             }:
-                return FAMILY_DATAFRAME, "", "medium"
+                return ValueOrigin(FAMILY_DATAFRAME, "", "medium")
         if isinstance(value, ast.Name) and self.scope and value.id in self.scope.locals:
             binding = self.scope.locals[value.id]
-            return binding.inferred_type, binding.alias_of or binding.object_id, binding.confidence
+            return ValueOrigin(
+                binding.inferred_type,
+                binding.alias_of or binding.object_id,
+                binding.confidence,
+            )
         if isinstance(value, (ast.Attribute, ast.Name)):
             ref = self._resolve_expr(value)
             if ref:
-                return ref.inferred_type, ref.object_id, ref.confidence
-        return FAMILY_UNKNOWN, "", "low"
+                return ValueOrigin(
+                    ref.inferred_type, ref.object_id, ref.confidence, not ref.derived
+                )
+        return ValueOrigin(FAMILY_UNKNOWN, "", "low")
 
     def _alias_display_from_value(self, value: object, alias_of: str) -> str:
         if not alias_of:
@@ -1949,21 +2156,26 @@ class DataAccessCollector(RegisteredStateLineageMixin, ast.NodeVisitor):
             param_names = self.callable_params.get(callee_id, ())
             for param_name, arg in self._bind_call_args_to_params(node, param_names):
                 arg_ref = self._resolve_expr_for_lineage(arg)
-                source_ids: List[str] = []
+                sources: List[Tuple[str, bool]] = []
                 if arg_ref is not None and arg_ref.object_id:
-                    source_ids.append(arg_ref.object_id)
-                source_ids.extend(self._lineage_source_ids_from_value(arg))
-                if not source_ids:
+                    sources.append((arg_ref.object_id, not arg_ref.derived))
+                sources.extend(self._lineage_source_ids_from_value(arg))
+                if not sources:
                     continue
                 param_id = f"param:{callee_id}:{param_name}"
                 if arg_ref is not None and arg_ref.access_path:
                     self.param_access_paths.setdefault(param_id, set()).add(arg_ref.access_path)
-                for source_id in dict.fromkeys(source_ids):
-                    self.param_bindings.setdefault(param_id, set()).add(source_id)
+                for source_id, identity in dict.fromkeys(sources):
+                    if identity:
+                        # ``param_bindings`` feeds ``_apply_confirmed_param_aliases``,
+                        # which mints ``alias_of`` from it directly. A derived
+                        # argument left in here would put back the same false
+                        # merge from the other side.
+                        self.param_bindings.setdefault(param_id, set()).add(source_id)
                     self._record_lineage(
                         source_id,
                         param_id,
-                        "arg_to_param",
+                        RELATION_ARG_TO_PARAM if identity else RELATION_DERIVED_FROM,
                         node,
                         callee=callee_id,
                         slot=param_name,
@@ -1973,8 +2185,23 @@ class DataAccessCollector(RegisteredStateLineageMixin, ast.NodeVisitor):
         for callable_id in self._candidate_callable_ids_for_call(node):
             refs = self.return_tuple_summaries.get(callable_id)
             if refs:
-                return refs
+                if self.callable_return_identity.get(callable_id, False):
+                    return refs
+                return tuple(_as_derived(ref) for ref in refs)
         return None
+
+    def _call_returns_one_source(self, node: ast.AST) -> bool:
+        """Whether this call site's callee returns the same thing on every path.
+
+        ``False`` when the callee is unknown as well as when it is known to have
+        several return paths: an unresolved call is not evidence of identity.
+        """
+        if not isinstance(node, ast.Call):
+            return False
+        for callable_id in self._candidate_callable_ids_for_call(node):
+            if callable_id in self.callable_return_identity:
+                return self.callable_return_identity[callable_id]
+        return False
 
     def _unique_returning_callable_for_call(
         self,
@@ -2018,6 +2245,11 @@ class DataAccessCollector(RegisteredStateLineageMixin, ast.NodeVisitor):
                     confidence,
                     summary.display_name,
                     summary.access_path,
+                    # The summary keeps one "best" return per callable, so on a
+                    # callable with several return paths it describes one of
+                    # them. That is fine for the family and the field structure
+                    # and wrong for identity, which is what ``derived`` records.
+                    derived=not self.callable_return_identity.get(callable_id, False),
                 )
         return None
 
@@ -2042,17 +2274,23 @@ class DataAccessCollector(RegisteredStateLineageMixin, ast.NodeVisitor):
         self,
         value: object,
         slot: Optional[int] = None,
-    ) -> List[str]:
+    ) -> List[Tuple[str, bool]]:
+        """Extra lineage sources for a value, each with whether it is an identity.
+
+        The ``return:`` marker is an identity source only when the callee
+        returns one and the same thing on every path -- otherwise the value here
+        was merely *made by* that call. See ``_returns_one_source``.
+        """
         if not isinstance(value, ast.AST):
             return []
-        source_ids: List[str] = []
+        sources: List[Tuple[str, bool]] = []
         raw_bound_id = self._raw_bound_object_id_for_lineage(value)
         if raw_bound_id:
-            source_ids.append(raw_bound_id)
+            sources.append((raw_bound_id, True))
         return_slot_id = self._return_slot_lineage_source_from_call(value, slot=slot)
         if return_slot_id:
-            source_ids.append(return_slot_id)
-        return list(dict.fromkeys(source_ids))
+            sources.append((return_slot_id, self._call_returns_one_source(value)))
+        return list(dict.fromkeys(sources))
 
     def _resolve_expr_for_lineage(self, node: ast.AST) -> Optional[ExprRef]:
         if isinstance(node, ast.Attribute):
@@ -2087,6 +2325,7 @@ class DataAccessCollector(RegisteredStateLineageMixin, ast.NodeVisitor):
                 all_args.append(node.args.kwarg)
             params = tuple(arg.arg for arg in all_args if arg.arg not in {"self", "cls"})
             self.callable_params[callable_id] = params
+            self.callable_return_identity[callable_id] = _returns_one_source(node)
 
             # Defaults can read module globals or outer-scope data.
             for default in list(node.args.defaults) + list(node.args.kw_defaults):
@@ -2140,7 +2379,7 @@ class DataAccessCollector(RegisteredStateLineageMixin, ast.NodeVisitor):
                 self._record_lineage(
                     returned.object_id,
                     _return_slot_id(self.current_callable),
-                    "return_value",
+                    RELATION_RETURN_VALUE if not returned.derived else RELATION_DERIVED_FROM,
                     node,
                 )
                 # Functions can have multiple return paths; keep the most
@@ -2163,7 +2402,7 @@ class DataAccessCollector(RegisteredStateLineageMixin, ast.NodeVisitor):
                     self._record_lineage(
                         tuple_ref.object_id,
                         _return_slot_id(self.current_callable, idx),
-                        "return_slot",
+                        RELATION_RETURN_SLOT if not tuple_ref.derived else RELATION_DERIVED_FROM,
                         node,
                         slot=str(idx),
                     )
@@ -2476,8 +2715,12 @@ class DataAccessCollector(RegisteredStateLineageMixin, ast.NodeVisitor):
             returned = self._return_ref_from_call(node)
             if returned:
                 return returned
-            if isinstance(node.func, ast.Attribute) and node.func.attr == "copy":
-                return self._resolve_expr(node.func.value)
+            if _is_copy_call(node):
+                # Still the base object: a shallow copy shares the *values* the
+                # field resolution below is after, and the family is unchanged.
+                # But the container itself is a new object, so anything asking
+                # about identity has to be told.
+                return _as_derived(self._resolve_expr(node.func.value))
         return None
 
     def _resolve_receiver_expr(self, node: ast.AST) -> Optional[ExprRef]:
@@ -2630,9 +2873,19 @@ class DataAccessCollector(RegisteredStateLineageMixin, ast.NodeVisitor):
                     self.scope.local_element_shared_state_owner_types[target.id] = set(element_state_owners)
                 else:
                     self.scope.local_element_shared_state_owner_types.pop(target.id, None)
-            inferred_type, alias_of, confidence = self._infer_type_from_value(value)
-            if inferred_type in CONTAINER_TYPES or alias_of:
-                expose = bool(alias_of)
+            origin = self._infer_type_from_value(value)
+            inferred_type, alias_of, confidence = (
+                origin.inferred_type,
+                origin.alias_of,
+                origin.confidence,
+            )
+            if inferred_type in CONTAINER_TYPES or origin.source_id:
+                # Deliberately ``source_id`` rather than ``alias_of``: a derived
+                # value is still a real object worth materialising, with real
+                # accesses on it. Gating exposure on the alias would delete the
+                # object along with the false identity claim, and the Step 1a
+                # recall figure would fall while Step 1b's precision rose.
+                expose = bool(origin.source_id)
                 ref = self._local_ref(
                     target.id,
                     target,
@@ -2646,11 +2899,19 @@ class DataAccessCollector(RegisteredStateLineageMixin, ast.NodeVisitor):
                 if self._value_is_attrdict_constructor(value):
                     self._mark_attrdict_access_path(ref.access_path)
                 if expose:
-                    if alias_of:
-                        self._record_lineage(alias_of, ref.object_id, "local_assign", target)
-                    for source_id in self._lineage_source_ids_from_value(value):
-                        if source_id != alias_of:
-                            self._record_lineage(source_id, ref.object_id, "local_assign", target)
+                    relation = (
+                        RELATION_LOCAL_ASSIGN if origin.identity else RELATION_DERIVED_FROM
+                    )
+                    if origin.source_id:
+                        self._record_lineage(origin.source_id, ref.object_id, relation, target)
+                    for source_id, identity in self._lineage_source_ids_from_value(value):
+                        if source_id != origin.source_id:
+                            self._record_lineage(
+                                source_id,
+                                ref.object_id,
+                                RELATION_LOCAL_ASSIGN if identity else RELATION_DERIVED_FROM,
+                                target,
+                            )
                     self._record_access(
                         ref.object_id,
                         self._store_access_for_object(ref.object_id, access),
@@ -2677,12 +2938,17 @@ class DataAccessCollector(RegisteredStateLineageMixin, ast.NodeVisitor):
                 self._expose_escaping_locals_in_value(value, target, operation="escape_assign")
             ref = self._resolve_attribute(target)
             if ref:
-                inferred_type, alias_of, confidence = self._infer_type_from_value(value)
+                origin = self._infer_type_from_value(value)
+                inferred_type, alias_of, confidence = (
+                    origin.inferred_type,
+                    origin.alias_of,
+                    origin.confidence,
+                )
                 if (
                     attr_path
                     and self.scope
                     and attr_path.startswith(("self.", "cls."))
-                    and (inferred_type in CONTAINER_TYPES or alias_of)
+                    and (inferred_type in CONTAINER_TYPES or origin.source_id)
                 ):
                     self.scope.attr_bindings[attr_path] = LocalBinding(
                         object_id=ref.object_id,
@@ -2701,11 +2967,21 @@ class DataAccessCollector(RegisteredStateLineageMixin, ast.NodeVisitor):
                     and not _is_state_object_id(ref.object_id)
                 ):
                     self.objects[ref.object_id].inferred_type = inferred_type
-                if alias_of and ref.object_id != alias_of:
-                    self._record_lineage(alias_of, ref.object_id, "state_assign", target)
-                for source_id in self._lineage_source_ids_from_value(value):
-                    if source_id != alias_of and source_id != ref.object_id:
-                        self._record_lineage(source_id, ref.object_id, "state_assign", target)
+                if origin.source_id and ref.object_id != origin.source_id:
+                    self._record_lineage(
+                        origin.source_id,
+                        ref.object_id,
+                        RELATION_STATE_ASSIGN if origin.identity else RELATION_DERIVED_FROM,
+                        target,
+                    )
+                for source_id, identity in self._lineage_source_ids_from_value(value):
+                    if source_id != origin.source_id and source_id != ref.object_id:
+                        self._record_lineage(
+                            source_id,
+                            ref.object_id,
+                            RELATION_STATE_ASSIGN if identity else RELATION_DERIVED_FROM,
+                            target,
+                        )
                 self._record_access(
                     ref.object_id,
                     self._store_access_for_object(ref.object_id, access),
@@ -2735,17 +3011,17 @@ class DataAccessCollector(RegisteredStateLineageMixin, ast.NodeVisitor):
                         self._record_lineage(
                             element_ref.object_id,
                             target_object_id,
-                            "tuple_unpack",
+                            RELATION_TUPLE_UNPACK if not element_ref.derived else RELATION_DERIVED_FROM,
                             element,
                             slot=str(idx),
                         )
                     if target_object_id:
-                        for source_id in self._lineage_source_ids_from_value(value, slot=idx):
+                        for source_id, identity in self._lineage_source_ids_from_value(value, slot=idx):
                             if element_ref is None or source_id != element_ref.object_id:
                                 self._record_lineage(
                                     source_id,
                                     target_object_id,
-                                    "tuple_unpack",
+                                    RELATION_TUPLE_UNPACK if identity else RELATION_DERIVED_FROM,
                                     element,
                                     slot=str(idx),
                                 )
@@ -2900,6 +3176,7 @@ def collect_data_access_from_tree(
     return_summaries: Optional[Dict[str, ExprRef]] = None,
     return_tuple_summaries: Optional[Dict[str, Tuple[Optional[ExprRef], ...]]] = None,
     callable_params: Optional[Dict[str, Tuple[str, ...]]] = None,
+    callable_return_identity: Optional[Dict[str, bool]] = None,
     param_bindings: Optional[Dict[str, Set[str]]] = None,
     param_access_paths: Optional[Dict[str, Set[str]]] = None,
     lineage_edges: Optional[List[LineageEdge]] = None,
@@ -2940,6 +3217,7 @@ def collect_data_access_from_tree(
         return_summaries=return_summaries,
         return_tuple_summaries=return_tuple_summaries,
         callable_params=callable_params,
+        callable_return_identity=callable_return_identity,
         param_bindings=param_bindings,
         param_access_paths=param_access_paths,
         lineage_edges=lineage_edges,
@@ -2966,6 +3244,7 @@ def collect_data_access_from_source(
     return_summaries: Dict[str, ExprRef] = {}
     return_tuple_summaries: Dict[str, Tuple[Optional[ExprRef], ...]] = {}
     callable_params: Dict[str, Tuple[str, ...]] = {}
+    callable_return_identity: Dict[str, bool] = {}
     file = Path(filename)
     attrdict_classes = collect_attrdict_classes(parse_python_source(source, filename=filename), module, file)
     # Iterate to a small fixpoint so transitive return aliases like A -> B -> C
@@ -2981,6 +3260,7 @@ def collect_data_access_from_source(
             return_summaries=return_summaries,
             return_tuple_summaries=return_tuple_summaries,
             callable_params=callable_params,
+            callable_return_identity=callable_return_identity,
             pyright_families=pyright_families,
             attrdict_classes=attrdict_classes,
         )
@@ -3009,6 +3289,7 @@ def collect_data_access_from_source(
         return_summaries=return_summaries,
         return_tuple_summaries=return_tuple_summaries,
         callable_params=callable_params,
+        callable_return_identity=callable_return_identity,
         param_bindings=param_bindings,
         param_access_paths=param_access_paths,
         lineage_edges=module_lineage_edges,
@@ -3058,6 +3339,7 @@ def collect_data_access_from_analysis_files(
     return_summaries: Dict[str, ExprRef] = {}
     return_tuple_summaries: Dict[str, Tuple[Optional[ExprRef], ...]] = {}
     callable_params: Dict[str, Tuple[str, ...]] = {}
+    callable_return_identity: Dict[str, bool] = {}
     attrdict_classes = collect_attrdict_classes_from_analysis_files(
         analysis_files, cache=resolved_cache
     )
@@ -3096,6 +3378,7 @@ def collect_data_access_from_analysis_files(
                 return_summaries=return_summaries,
                 return_tuple_summaries=return_tuple_summaries,
                 callable_params=callable_params,
+                callable_return_identity=callable_return_identity,
                 pyright_families=resolved_pyright_families,
                 attrdict_classes=attrdict_classes,
                 registration_rules=registration_rules,
@@ -3136,6 +3419,7 @@ def collect_data_access_from_analysis_files(
             return_summaries=return_summaries,
             return_tuple_summaries=return_tuple_summaries,
             callable_params=callable_params,
+            callable_return_identity=callable_return_identity,
             param_bindings=param_bindings,
             param_access_paths=param_access_paths,
             lineage_edges=module_lineage_edges,

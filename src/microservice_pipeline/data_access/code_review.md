@@ -239,6 +239,13 @@ either scope the ID to the callable, or resolve the expression through the exist
 lineage machinery to whatever the parameter was bound to at its call sites, which
 `param_bindings` already computes.
 
+> **Measurable since Step 1b (2026-08-29), but it does not fire on climlab.** The oracle
+> records the path *string* at each site — object identity cannot settle this, since two
+> equal paths are one file whether or not they are one `str`. climlab has 5 `file:` objects,
+> only one is touched by more than one callable, and its callables never disagreed. The
+> defect is still real (the test fixture reproduces it exactly); climlab just does not open
+> files from parameters. Judging the fix needs a project that does, or `evaluate`.
+
 ### 1.8 Class bodies have no scope, so class attributes leak into the module — CONFIRMED
 
 `visit_ClassDef` sets `current_class` and walks the body, but never pushes a `Scope`.
@@ -642,6 +649,22 @@ building the join lattice that `typeenv.py` would own. But it should be *written
 down*: `limitation.md` on the call-graph side exists for exactly this, and this
 package has no equivalent.
 
+> **Step 1b (2026-08-29) found one place where this stops being a limitation and becomes a
+> bug.** Last-assignment-wins over return statements makes a callable with one
+> `return <parameter>` branch claim it returns that parameter *always*, and the caller turns
+> that into `alias_of` — so a value merely computed from an argument is recorded as being
+> that argument. That is not coarseness, it is a false merge, and it is the single largest
+> source of them in the artifact. It is scheduled at the top of Step 4, and it does **not**
+> need the join lattice this section describes: enumerating a function's `Return` nodes is
+> enough to tell "returns its argument on some path" from "returns its argument".
+>
+> **Fixed by Step 4a (2026-08-31).** The last sentence needed one correction: enumerating
+> `Return` nodes is not quite enough, because a function that falls off the end returns
+> `None` on that path and no `Return` node records it. With that added, the claim holds —
+> no join lattice was needed, and contradicted identity claims went 51 → 17. **The rest of
+> this section is untouched and remains the one finding in this document with no step of
+> its own.**
+
 ### 4.5 Thresholds chosen rather than derived — REASONED
 
 `COORDINATOR_ATTR_THRESHOLD = 4`, `COORDINATOR_METHOD_THRESHOLD = 3`,
@@ -925,6 +948,13 @@ would not be reproducible.
 
 So §6 splits into **Step 1a** and **Step 1b**, with Step 2 between them. See §7.
 
+> **Both are built (2026-08-24 and 2026-08-29).** The split was the right call for the reason
+> given, and for one this section did not anticipate: the two instruments turned out to need
+> *opposite* sampling rules. The access tracer retires each site on first hit, because an
+> instruction that fetches `spacing` always fetches `spacing`. Carrying that rule into the
+> identity tracer inflated its contradiction count by a factor of three, because a loop binds
+> a different object each pass. Building them as one instrument would have hidden that.
+
 **What the harness already provides** (checked 2026-08-23), which is why 1a is a smaller
 piece of work than this section makes it sound:
 
@@ -951,11 +981,13 @@ already-solved problems whose fix is sitting on an object this package is handed
 because two of them make data access *silently emit nothing* rather than emit
 something wrong.
 
-**Execution order** (revised 2026-08-23, after Step 0):
+**Execution order** (revised 2026-08-31, after Step 4a):
 
 ```
-0  ->  1a  ->  2  ->  1b  ->  3  ->  4  ->  5  ->  7  ->  8
-       |       |      |
+0  ->  1a  ->  2  ->  1b  ->  4a  ->  3  ->  4  ->  5  ->  7  ->  8
+DONE   DONE   DONE   DONE   DONE    <- next
+       |       |      |      |
+       |       |      |      +- the false-merge fix, taken out of order: see below
        |       |      +- identity oracle: needs Step 2's determinism to have a
        |       |         reproducible baseline
        |       +- the one gate that needs no oracle, so it can go early
@@ -964,7 +996,17 @@ something wrong.
 
 Step numbers are unchanged from the original plan so existing references still resolve;
 what changed is that **Step 1 split into 1a and 1b with Step 2 between them** (§6.1),
-and **Step 6 left the sequence** — it is now opportunistic, see below.
+**Step 6 left the sequence** — it is now opportunistic, see below — and **the top item
+of Step 4 was pulled out ahead of Step 3 as Step 4a**.
+
+> **Why 4a jumped Step 3 (2026-08-31).** Not because it is cheap. Step 3 changes
+> container families, which changes `_field_kind`, which changes the object IDs the Step
+> 1b baseline is entirely composed of. Run in the planned order, the identity numbers
+> would have moved for reasons unrelated to false merges and the fix could not have been
+> credited with anything. Run first, it was judged against a two-day-old baseline that
+> reproduced to the last digit. The two steps are scored by *different* instruments
+> — Step 3 by 1a's recall, this by 1b's precision — so nothing else in the ordering
+> depended on it.
 
 Two things Step 0 settled that this ordering now assumes:
 
@@ -1099,6 +1141,52 @@ make order-dependent, so a baseline taken before Step 2 would not be reproducibl
 Acceptance: an alias precision/recall report, and a recorded count of static alias
 claims the trace contradicts.
 
+> **DONE (2026-08-29) — see [`step1b_identity_oracle.md`](revision_progess/step1b_identity_oracle.md).**
+> Baseline on climlab: **alias precision 84.5%** (279 confirmed, **51 contradicted**, 690
+> unobserved of 1,597 claims), **alias recall 65.9%** — 7,915 of 23,225 runtime aliasings are
+> split across unconnected parts of the static graph. 76.4% of objects name a site the
+> instrument can read. Step 1a's numbers are unmoved (recall 69.0%, confirmed 75.2%,
+> falsified 1) and the Step 2 determinism gate still passes byte-identical.
+>
+> Six departures from the wording above, all explained there. The load-bearing ones: (i)
+> "`id()` at the observed access" is not possible — the operand stack is unreachable from
+> Python — but `sys._getframe` inside the callback is, so values are read out of the running
+> frame and out of `self.__dict__`, never via `getattr`, which would execute properties.
+> (ii) A raw `id()` is not an identity, because CPython recycles addresses; the weakref fix
+> does not work since `list` and `dict` are not weak-referenceable, so one strong reference
+> per recorded object is kept, under a reported cap. (iii) **§1.7 cannot be answered by
+> `id()` at all** — file identity is a path *value* — so a second value channel was added.
+>
+> **"Contradicted" here is not coverage-independent, unlike Step 1a's "falsified".** There is
+> no compile-time fact to fall back on, so the 51 is a lower bound carrying that caveat, and
+> all 51 were hand-checked against the source before the number was recorded.
+>
+> **The instrument was wrong the first time, in a new way.** Carrying over Step 1a's
+> retire-on-first-hit rule reported **152** contradictions at 52.4% precision; an identity
+> site is not like an access site, because a loop binds a different object each pass.
+> Sweeping the sample budget gives 8 → 152, 64 → 56, 512 → 51, 4096 → 51, so **two thirds of
+> the first count was the instrument**, the default is now calibrated at 512, and the run
+> reports how many sites still exhausted their budget.
+>
+> **The instrument found a defect in no section of this document, and it is a large one:**
+> the lineage graph records "made from" as "is". A value produced by a call is claimed to
+> *be* one of that call's arguments — `dic = self.state.copy()`, `self.timeave =
+> self.state.copy()`, and ~18 lines of `cam3.py` of the form `Tatm =
+> self._climlab_to_cam3(self.Tatm)`. The cause is `_merge_return_summary` keeping a single
+> "best" return summary, so one `if np.isscalar(field): return field` branch makes a whole
+> function "returns its own argument" at every call site — §4.4 producing wrong identity
+> rather than merely coarse identity. Scored by claim source, `arg_to_param` is 106/6 while
+> `local_assign` is 78/31: **passing an argument is the claim the extractor gets right, and
+> assigning a call result is the one it gets wrong.** It also gives §5.6 a concrete example
+> (`super(MutableAttr, self).__setattr__` resolved to `MutableAttr._setattr`).
+>
+> **§1.7 does not fire on climlab.** Only one `file:` node is touched by more than one
+> callable and its callables never disagreed on the path. That is a property of climlab, not
+> a refutation of §1.7 — the test fixture reproduces the defect exactly — so §1.7's fix must
+> be judged elsewhere, or by `evaluate` as this section already prescribes.
+>
+> No line of `generate_data_access_ast.py` was changed in this step.
+
 **Step 3 — Container families: §1.1, §2.1, §2.2, §2.4.** The single largest precision
 lever, and Step 1a makes it measurable. Acceptance: the share of objects with
 `inferred_type == unknown` falls, and per-kind recall rises with it. Add the
@@ -1106,7 +1194,70 @@ probe-resolution assertion from §2.1 so a silent total failure can never look l
 clean run again.
 
 **Step 4 — Cheap correctness: §1.6, §1.7, §1.8, §1.9, §1.10, §1.11, §1.12, §1.13, §1.14,
-plus §5.5.** Each is local and independently testable. §1.14 is the one Step 1a's oracle
+plus §5.5, plus the "made from" / "is" defect Step 1b found.** Each is local and
+independently testable.
+
+> **Added by Step 1b (2026-08-29): the lineage graph records "made from" as "is".** A value
+> produced by a call is claimed to *be* one of that call's arguments. Measured: 31 of the 78
+> scored `local_assign` claims on climlab are contradicted by the trace, against 6 of 106 for
+> `arg_to_param` — **passing an argument is the claim the extractor gets right, and assigning
+> a call result is the one it gets wrong.** This belongs at the *top* of this step, not the
+> bottom: it is the largest source of false merges in the artifact, and false merges are why
+> §1.7 was ranked above its apparent size. Judge it with the Step 1b oracle's precision
+> figure, currently 84.5%.
+>
+> It is **two defects**, and the first is the cheapest fix in this whole step:
+>
+> **(a) `.copy()` is hard-coded as an alias.** `_infer_type_from_value`, in the `ast.Call`
+> branch, returns the base object as `alias_of` for any `x.copy()`. A copy is the one call in
+> the language whose entire purpose is to *not* be the same object. Four lines, no judgement
+> call, and it accounts for 5 of the 51 contradictions (`dic = self.state.copy()`,
+> `self.timeave = self.state.copy()`, and the two `alias_of` rows derived from them).
+>
+> **(b) A single return path speaks for the whole callable.** The same branch hands
+> `_return_ref_from_call(...).object_id` back as `alias_of`, and `_merge_return_summary`
+> keeps one "best" summary per callable, so `if np.isscalar(field): return field` makes
+> `_climlab_to_cam3` "returns its own argument" at all eighteen of its call sites. The
+> remaining ~46. The fix is to alias only when *every* return path returns the same source.
+>
+> **Neither fix needs §4.4.** §4.4 is the underlying cause and is recorded there as a
+> limitation rather than a bug, but "do all return statements return this parameter?" is
+> answerable by enumerating `Return` nodes — no join lattice, so this is not blocked on the
+> one item in this document that has no step.
+
+> **DONE as Step 4a (2026-08-31) — see [`step4a_false_merges.md`](revision_progess/step4a_false_merges.md).**
+> Taken ahead of Step 3 on purpose; the argument is with the execution order above.
+> Contradicted identity claims on climlab **51 → 17**, alias precision **84.5% → 93.6%**,
+> and the `local_assign` row that this finding is *about* went 78/31 → 54/4. Objects
+> 1866 → 1868, **access edges unchanged at 4239**, and the Step 1a oracle is unmoved
+> (recall 69.0%, confirmed 75.2%, falsified 1) — this fix did not pay for its precision
+> with somebody else's recall. Determinism gate still byte-identical over five seeds.
+> Alias recall 65.9% → 64.3%: the price, and it is stated there rather than buried.
+>
+> Three departures from the wording above, all explained there. (i) **The alias is minted
+> in three places and one of them undoes the other two** — `_apply_lineage_aliases` runs
+> afterwards and rebuilds `alias_of` by composing the surviving lineage edges, so without
+> a relation-aware rule there both fixes measure as doing nothing. That rule reads the
+> graph twice, with everything and with identity relations only, and requires the two to
+> agree; filtering alone would have *added* aliases by hiding ambiguity. (ii) **Enumerating
+> `Return` nodes is not sufficient**: a function that falls off the end returns `None` on
+> that path, so the gate also asks whether the body always returns, and excludes
+> generators. (iii) The fix is a new non-identity relation, `derived_from`, rather than a
+> deleted edge — `expose = bool(alias_of)` means deleting the claim deletes the object and
+> its access edges with it.
+>
+> **One thing this document does not record, found while planning it:** `local_assign` and
+> `state_assign` are **must-link relations** in `cluster_structural_graph` and
+> `leiden_reweighted`. A false "is" claim was therefore a hard constraint fusing two
+> clusters, not merely a heavier edge — which is the strongest form of the argument §1.7
+> makes for ranking false coupling above its apparent size.
+>
+> All 17 survivors were hand-checked: **none is this defect.** Two are §6.2's mis-resolved
+> `super().__setattr__` (Step 5), two are the `Iceline(state=self.state)` shared-state merge
+> (Step 7), and thirteen are the instrument reaching its limits on branches the drivers
+> never took — §6.3's caveat, now the majority of what is left.
+
+§1.14 is the one Step 1a's oracle
 found; it is also the cheapest, and the oracle will confirm the fix directly. §1.7 and §1.11 are the two that
 generate false coupling, so judge them with `evaluate` rather than with recall — the
 registry-coupling lesson from the call-graph roadmap applies unchanged. §5.5 (lambda

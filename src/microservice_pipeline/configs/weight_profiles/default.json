@@ -28,7 +28,8 @@
         "return_slot": 1.5,
         "local_assign": 1.0,
         "tuple_unpack": 1.0,
-        "arg_to_param": 0.5
+        "arg_to_param": 0.5,
+        "derived_from": 0.5
       },
       "fallback_weight": 0.5
     },

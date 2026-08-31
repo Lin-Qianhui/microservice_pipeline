@@ -2298,3 +2298,227 @@ def three():
     assert any("did not converge" in str(w.message) for w in caught), [
         str(w.message) for w in caught
     ]
+
+
+# --- Step 4a: "made from" is not "is" -----------------------------------
+#
+# The extractor used to record a value produced by a call as *being* one of that
+# call's arguments. Step 1b's oracle measured the cost on climlab: 31 of 78
+# scored ``local_assign`` claims contradicted by the running program, against 6
+# of 106 for ``arg_to_param``. These pin the two causes and the rule that keeps
+# the fix from being undone downstream.
+
+
+def _lineage_relations(lineage, src_part, dst_part):
+    return {
+        edge.relation
+        for edge in lineage
+        if src_part in edge.src_object_id and dst_part in edge.dst_object_id
+    }
+
+
+def test_copy_is_recorded_as_derived_not_as_an_alias(tmp_path):
+    """A copy is the one call whose whole purpose is to be a different object."""
+    (tmp_path / "sample.py").write_text(
+        """
+class Model:
+    def __init__(self):
+        self.state = {}
+
+    def snapshot(self):
+        dic = self.state.copy()
+        dic['extra'] = 1
+        return dic
+""",
+        encoding="utf-8",
+    )
+
+    objects, edges, lineage = _collect_with_registration(tmp_path)
+
+    copy_local = "local_exposed:sample.Model.snapshot:dic"
+    source = "class_state:sample.Model"
+    assert objects[copy_local].alias_of == ""
+    assert _lineage_relations(lineage, source, copy_local) == {"derived_from"}
+    # The object and its accesses survive: only the identity claim is withheld.
+    # Gating exposure on the alias would have deleted the object too, and with it
+    # every access the runtime oracle can see.
+    assert _edge_exists(edges, copy_local, access="create")
+    assert _edge_exists(edges, copy_local, access="read")
+    # The new key belongs to the copy, not to the dictionary it was copied from.
+    assert any(":dic:extra" in obj_id for obj_id in objects)
+    assert not any(":Model:extra" in obj_id for obj_id in objects)
+
+
+def test_one_return_path_does_not_make_the_whole_callable_an_alias(tmp_path):
+    """``_climlab_to_cam3``'s shape: one branch returns the argument, the rest build."""
+    (tmp_path / "sample.py").write_text(
+        """
+import numpy as np
+
+
+def reshape(field):
+    if np.isscalar(field):
+        return field
+    return np.transpose(field)
+
+
+class Model:
+    def __init__(self):
+        self.data = {}
+
+    def run(self):
+        out = reshape(self.data)
+        return out
+""",
+        encoding="utf-8",
+    )
+
+    objects, _edges, lineage = _collect_with_registration(tmp_path)
+
+    local = "local_exposed:sample.Model.run:out"
+    assert objects[local].alias_of == ""
+    assert "arg_to_param" not in _lineage_relations(lineage, "class_state:sample.Model", local)
+
+
+def test_a_callable_returning_one_source_still_aliases(tmp_path):
+    """The gate must not withdraw the claims that are right."""
+    (tmp_path / "sample.py").write_text(
+        """
+def passthrough(field):
+    return field
+
+
+class Model:
+    def __init__(self):
+        self.data = {}
+
+    def run(self):
+        out = passthrough(self.data)
+        return out['x']
+""",
+        encoding="utf-8",
+    )
+
+    objects, _edges, _lineage = _collect_with_registration(tmp_path)
+
+    assert objects["param:sample.passthrough:field"].alias_of == "class_state:sample.Model"
+
+
+def test_falling_off_the_end_is_a_second_return_path(tmp_path):
+    """``if c: return x`` with nothing after it returns ``None`` on the other path.
+
+    Enumerating ``Return`` nodes cannot see that path, which is why the gate also
+    asks whether the body always returns.
+    """
+    (tmp_path / "sample.py").write_text(
+        """
+def maybe(field):
+    if field:
+        return field
+
+
+class Model:
+    def __init__(self):
+        self.data = {}
+
+    def run(self):
+        out = maybe(self.data)
+        return out
+""",
+        encoding="utf-8",
+    )
+
+    objects, _edges, _lineage = _collect_with_registration(tmp_path)
+
+    assert objects["local_exposed:sample.Model.run:out"].alias_of == ""
+
+
+def test_a_generator_does_not_return_the_value_in_its_return(tmp_path):
+    """Calling a generator hands back a generator, never the ``return`` value."""
+    (tmp_path / "sample.py").write_text(
+        """
+def rows(field):
+    yield 1
+    return field
+
+
+class Model:
+    def __init__(self):
+        self.data = {}
+
+    def run(self):
+        out = rows(self.data)
+        return out
+""",
+        encoding="utf-8",
+    )
+
+    objects, _edges, _lineage = _collect_with_registration(tmp_path)
+
+    assert objects["local_exposed:sample.Model.run:out"].alias_of == ""
+
+
+def test_alias_solver_ignores_a_derived_from_edge():
+    """The rule that stops the fix from being silently undone.
+
+    ``_apply_lineage_aliases`` runs after the walk and rebuilds ``alias_of`` from
+    the lineage graph. Without a relation filter it would compose the surviving
+    edges and put back exactly the merge the walk withheld.
+    """
+    from microservice_pipeline.data_access.generate_data_access_ast import _apply_lineage_aliases
+    from microservice_pipeline.data_access.models import DataObject, LineageEdge
+
+    def _object(object_id, kind):
+        return DataObject(
+            id=object_id, kind=kind, display_name=object_id, scope="callable",
+            owner="sample.f", container="", field="", file="sample.py", lineno=1,
+            inferred_type="dict", confidence="medium",
+        )
+
+    objects = {
+        "param:sample.f:src": _object("param:sample.f:src", "param"),
+        "local_exposed:sample.g:made": _object("local_exposed:sample.g:made", "local_exposed"),
+        "local_exposed:sample.g:same": _object("local_exposed:sample.g:same", "local_exposed"),
+    }
+    lineage = [
+        LineageEdge("param:sample.f:src", "local_exposed:sample.g:made", "derived_from", "sample.py", 1),
+        LineageEdge("param:sample.f:src", "local_exposed:sample.g:same", "local_assign", "sample.py", 2),
+    ]
+
+    _apply_lineage_aliases(objects, lineage)
+
+    assert objects["local_exposed:sample.g:made"].alias_of == ""
+    assert objects["local_exposed:sample.g:same"].alias_of == "param:sample.f:src"
+
+
+def test_a_derived_edge_still_erases_an_ambiguous_alias():
+    """Filtering must not *add* aliases either.
+
+    Reading only the identity edges would hide the ambiguity that makes an alias
+    unsafe, so a node reachable from two places keeps no alias even when only one
+    of the two routes is an identity.
+    """
+    from microservice_pipeline.data_access.generate_data_access_ast import _apply_lineage_aliases
+    from microservice_pipeline.data_access.models import DataObject, LineageEdge
+
+    def _object(object_id, kind):
+        return DataObject(
+            id=object_id, kind=kind, display_name=object_id, scope="callable",
+            owner="sample.f", container="", field="", file="sample.py", lineno=1,
+            inferred_type="dict", confidence="medium",
+        )
+
+    objects = {
+        "param:sample.f:a": _object("param:sample.f:a", "param"),
+        "param:sample.f:b": _object("param:sample.f:b", "param"),
+        "local_exposed:sample.g:x": _object("local_exposed:sample.g:x", "local_exposed"),
+    }
+    objects["local_exposed:sample.g:x"].alias_of = "param:sample.f:a"
+    lineage = [
+        LineageEdge("param:sample.f:a", "local_exposed:sample.g:x", "local_assign", "sample.py", 1),
+        LineageEdge("param:sample.f:b", "local_exposed:sample.g:x", "derived_from", "sample.py", 2),
+    ]
+
+    _apply_lineage_aliases(objects, lineage)
+
+    assert objects["local_exposed:sample.g:x"].alias_of == ""
