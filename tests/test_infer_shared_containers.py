@@ -1,4 +1,11 @@
-from microservice_pipeline.data_access.infer_shared_containers import PROBE_RE, infer_shared_containers_from_payload
+from pathlib import Path
+
+from microservice_pipeline.data_access.infer_shared_containers import (
+    PROBE_RE,
+    CandidateContainer,
+    infer_shared_containers_from_payload,
+    probe_pyright_families,
+)
 
 
 def _payload(objects, edges=None, lineage_edges=None):
@@ -546,3 +553,35 @@ def test_unknown_pyright_family_blocks_merge():
 def test_probe_regex_extracts_revealed_types():
     output = 'x.py:12:5 - information: Type of "__msp_probe_1" is "DataFrame"\n'
     assert PROBE_RE.findall(output) == [("__msp_probe_1", "DataFrame")]
+
+
+def test_probe_pyright_families_returns_the_family_mapping(tmp_path: Path):
+    # ``probe_pyright_targets`` returns a report, not a mapping. This asserts the
+    # unwrapping, because the caller feeds the result straight to ``.get()``.
+    source_file = tmp_path / "sample.py"
+    source_file.write_text("def fn(data):\n    return data\n", encoding="utf-8")
+
+    fake_pyright = tmp_path / "fake_pyright"
+    fake_pyright.write_text(
+        "#!/bin/sh\n"
+        "printf '%s\\n' 'sample.py:2:1 - information: Type of \"__msp_probe_1\" is \"dict[str, float]\"'\n"
+        "exit 1\n",
+        encoding="utf-8",
+    )
+    fake_pyright.chmod(0o755)
+
+    candidate = CandidateContainer(
+        kind="df_col",
+        container_id="param:sample.fn:data",
+        leaf_name="data",
+        normalized_leaf="data",
+        object_kind="dict_key",
+        file=str(source_file),
+        lineno=1,
+    )
+
+    families = probe_pyright_families(tmp_path, tmp_path, [candidate], str(fake_pyright))
+
+    assert families == {"param:sample.fn:data": "dict"}
+    # The consumer in ``infer_shared_containers_from_payload`` calls ``.get()``.
+    assert families.get("param:sample.fn:data") == "dict"

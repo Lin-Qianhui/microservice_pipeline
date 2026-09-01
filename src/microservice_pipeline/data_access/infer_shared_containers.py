@@ -426,7 +426,10 @@ def probe_pyright_families(
                     lineno=candidate.lineno,
                 )
             )
-    return probe_pyright_targets(project_root, targets, pyright_bin)
+    # ``probe_pyright_targets`` returns a report, not a mapping: the counts are
+    # what tell a failed probe apart from a correctly-typed unknown. Only the
+    # families are wanted here, as in ``generate_data_access_ast``.
+    return probe_pyright_targets(project_root, targets, pyright_bin).families
 
 
 def render_report(

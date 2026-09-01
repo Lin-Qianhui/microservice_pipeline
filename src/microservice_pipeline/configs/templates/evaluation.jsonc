@@ -50,7 +50,7 @@
     // evaluation_kind_tokens is a comma-separated list matched against the
     // semicolon-tokenized kind column. It can include callable kinds such as
     // "function" and "method", and data kinds such as "class_attr_state",
-    // "module_attr_state", and "local_exposed". Rows are included when either
+    // "module_global", and "local_exposed". Rows are included when either
     // node_type or kind matches the configured scope.
     "evaluation_kind_tokens": "class_attr_state",
 

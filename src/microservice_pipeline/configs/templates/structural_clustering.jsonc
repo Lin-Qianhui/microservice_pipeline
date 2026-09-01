@@ -91,7 +91,7 @@
     "node_mode": "auto",
     "na_labels": [],
     "evaluation_node_types": "callable,data",
-    "evaluation_kind_tokens": "function,method,class_attr_state,module_attr_state,local_exposed",
+    "evaluation_kind_tokens": "function,method,class_attr_state,module_global,local_exposed",
     "all_evaluation_nodes": false,
   },
 
