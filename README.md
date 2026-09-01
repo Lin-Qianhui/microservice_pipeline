@@ -595,6 +595,49 @@ Sweep evaluation settings live in `structural_clustering.jsonc` because they
 are used while `structural-cluster` is producing `parameter_sweep.csv`.
 Standalone detailed evaluation uses `evaluation.jsonc`.
 
+### Refreshing A Mapping After A Pipeline Change
+
+The evaluator joins on the exact `node` string, so a change to how data objects
+are identified silently drops labelled rows out of the metrics. After such a
+change, check how much of the mapping still resolves before trusting any number:
+`metrics_summary.md` reports `Unmatched manual rows`, and a non-zero value means
+labels are being ignored, not that the clustering got worse.
+
+Re-labelling by hand after every pipeline change does not scale. When a project's
+labels turn out to be a function of the owning Python module -- one microservice
+per module, no exceptions -- the mapping can be regenerated instead from a small
+rule table versioned next to the config:
+
+```bash
+# 1. Extract the rule table from the mapping that already exists.
+python scripts/regenerate_manual_mapping.py derive-rules \
+    --manual configs/microservice_pipeline/manual_mapping_labeled.csv \
+    --source-root . \
+    --out configs/microservice_pipeline/manual_mapping_rules.csv
+
+# 2. Regenerate. --verify-against replays the rule over the old mapping and
+#    refuses to write if any shared node would change label.
+python scripts/regenerate_manual_mapping.py generate \
+    --clusters artifacts/structural_microservice_candidates_leiden/cluster_assignments.csv \
+    --rules configs/microservice_pipeline/manual_mapping_rules.csv \
+    --source-root . \
+    --verify-against configs/microservice_pipeline/manual_mapping_labeled.csv \
+    --out configs/microservice_pipeline/manual_mapping_labeled.csv
+```
+
+`derive-rules` refuses to emit a table when any module carries more than one
+label, which is the check that the shortcut applies at all. `generate` refuses to
+write when an in-scope node belongs to a module the rule table does not cover, so
+a new module surfaces as a decision to make rather than a silently-`NA` row.
+
+Two properties are worth keeping in mind. The rule table, not the CSV, is the
+durable artifact: the CSV is a projection of it at one scope, so widening
+`--data-kinds` later recovers rows without re-adjudicating anything. And a mapping
+that can be regenerated this way is by construction a module partition, so
+metrics computed against it measure how well clustering recovers the package
+layout. That is a real limitation of the oracle and belongs in any write-up of
+the numbers.
+
 ## Optional Notebook Task Analysis
 
 Use notebook-task analysis when tutorial or workflow notebooks should inform
