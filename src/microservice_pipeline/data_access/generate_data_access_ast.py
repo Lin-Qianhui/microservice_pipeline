@@ -208,6 +208,7 @@ try:
         FAMILY_SET,
         FAMILY_UNKNOWN,
         FAMILY_XARRAY,
+        PyrightProbeReport,
         PyrightProbeTarget,
         discover_project_root,
         probe_pyright_targets,
@@ -244,10 +245,16 @@ except ImportError:  # pragma: no cover - supports direct script execution
         FAMILY_SET,
         FAMILY_UNKNOWN,
         FAMILY_XARRAY,
+        PyrightProbeReport,
         PyrightProbeTarget,
         discover_project_root,
         probe_pyright_targets,
     )
+
+# Statements after which nothing in the same block runs, so a Pyright probe
+# placed below one sits in unreachable code. Pyright does not report a type for
+# it at all, and says nothing about why.
+TERMINAL_STATEMENTS = (ast.Return, ast.Raise, ast.Break, ast.Continue)
 
 SHARED_FIELD_CONTAINERS = {
     "df_col": {},
@@ -970,13 +977,30 @@ def collect_pyright_probe_targets(tree: ast.Module, module: str, file: Path) -> 
         if current is None or (target.lineno and (current.lineno == 0 or target.lineno < current.lineno)):
             targets[target.target_id] = target
 
-    def probe_insert_lineno(node: ast.AST) -> int:
+    def probe_insert_position(node: ast.AST) -> Tuple[str, int, int]:
+        """Where to put the probe for ``node``: ``(mode, lineno, column)``.
+
+        Normally after the statement the expression sits in. But a probe placed
+        after a ``return``, ``raise``, ``break`` or ``continue`` is in code that
+        never runs, and pyright simply does not answer for it -- so the family
+        was silently lost. Those go in front.
+        """
         current: Optional[ast.AST] = node
         while current is not None and not isinstance(current, ast.stmt):
             current = getattr(current, "parent", None)
         if current is None:
-            return getattr(node, "end_lineno", getattr(node, "lineno", 0))
-        return getattr(current, "end_lineno", getattr(current, "lineno", getattr(node, "lineno", 0)))
+            return "after_line", getattr(node, "end_lineno", getattr(node, "lineno", 0)), 0
+        if isinstance(current, TERMINAL_STATEMENTS):
+            return (
+                "before_line",
+                getattr(current, "lineno", getattr(node, "lineno", 0)),
+                getattr(current, "col_offset", 0),
+            )
+        return (
+            "after_line",
+            getattr(current, "end_lineno", getattr(current, "lineno", getattr(node, "lineno", 0))),
+            0,
+        )
 
     class Visitor(ast.NodeVisitor):
         def __init__(self) -> None:
@@ -993,6 +1017,7 @@ def collect_pyright_probe_targets(tree: ast.Module, module: str, file: Path) -> 
         def _record_name_target(self, node: ast.Name) -> None:
             if node.id in {"self", "cls"}:
                 return
+            mode, insert_lineno, insert_col = probe_insert_position(node)
             if self.current_callable:
                 target_id = f"local_exposed:{self.current_callable}:{node.id}"
                 record_target(
@@ -1001,10 +1026,11 @@ def collect_pyright_probe_targets(tree: ast.Module, module: str, file: Path) -> 
                         expression=node.id,
                         file=file,
                         module=module,
-                        mode="after_line",
+                        mode=mode,
                         callable_id=self.current_callable,
                         lineno=getattr(node, "lineno", 0),
-                        insert_lineno=probe_insert_lineno(node),
+                        insert_lineno=insert_lineno,
+                        insert_col=insert_col,
                     )
                 )
             else:
@@ -1015,9 +1041,10 @@ def collect_pyright_probe_targets(tree: ast.Module, module: str, file: Path) -> 
                         expression=node.id,
                         file=file,
                         module=module,
-                        mode="after_line",
+                        mode=mode,
                         lineno=getattr(node, "lineno", 0),
-                        insert_lineno=probe_insert_lineno(node),
+                        insert_lineno=insert_lineno,
+                        insert_col=insert_col,
                     )
                 )
 
@@ -1091,6 +1118,7 @@ def collect_pyright_probe_targets(tree: ast.Module, module: str, file: Path) -> 
         def visit_Attribute(self, node: ast.Attribute) -> None:
             path = _attribute_path(node)
             if path and self.current_callable:
+                mode, insert_lineno, insert_col = probe_insert_position(node)
                 if path.startswith(("self.", "cls.")) and self.current_class:
                     owner = f"{module}.{self.current_class}"
                     top_attr = _top_level_attr_name(path.split(".", 1)[1])
@@ -1101,10 +1129,11 @@ def collect_pyright_probe_targets(tree: ast.Module, module: str, file: Path) -> 
                             expression=f"{qualifier}.{top_attr}",
                             file=file,
                             module=module,
-                            mode="after_line",
+                            mode=mode,
                             callable_id=self.current_callable,
                             lineno=getattr(node, "lineno", 0),
-                            insert_lineno=probe_insert_lineno(node),
+                            insert_lineno=insert_lineno,
+                            insert_col=insert_col,
                         )
                     )
                 elif not path.startswith(("self.", "cls.")):
@@ -1114,10 +1143,11 @@ def collect_pyright_probe_targets(tree: ast.Module, module: str, file: Path) -> 
                             expression=path,
                             file=file,
                             module=module,
-                            mode="after_line",
+                            mode=mode,
                             callable_id=self.current_callable,
                             lineno=getattr(node, "lineno", 0),
-                            insert_lineno=probe_insert_lineno(node),
+                            insert_lineno=insert_lineno,
+                            insert_col=insert_col,
                         )
                     )
             self.generic_visit(node)
@@ -1149,6 +1179,24 @@ def _collect_project_pyright_families(
     return collect_pyright_families_from_analysis_files(resolved_project_root, analysis_files, pyright_bin)
 
 
+def _import_root_for_analysis_file(analysis_file: AnalysisFile) -> Optional[Path]:
+    """The directory this file's top-level package must be imported from.
+
+    ``climlab/domain/xarray.py`` with module ``climlab.domain.xarray`` is
+    importable from the directory holding ``climlab/``, which is what pyright
+    needs on its search path. Derived from the module name rather than assumed,
+    because a source root may sit inside a package already (path ``src/shop``
+    with prefix ``shop``).
+    """
+    depth = len(analysis_file.module.split(".")) if analysis_file.module else 1
+    if analysis_file.path.name == "__init__.py":
+        depth += 1
+    parents = analysis_file.path.resolve().parents
+    if depth - 1 >= len(parents):
+        return None
+    return parents[depth - 1]
+
+
 def collect_pyright_families_from_analysis_files(
     project_root: Path,
     analysis_files: Sequence[AnalysisFile],
@@ -1158,12 +1206,78 @@ def collect_pyright_families_from_analysis_files(
 ) -> Dict[str, str]:
     resolved_cache = cache if cache is not None else ParsedFileCache()
     targets: List[PyrightProbeTarget] = []
+    support_files: List[Path] = []
+    import_roots: Set[Path] = set()
+    module_imports: Dict[str, Dict[str, str]] = {}
     for analysis_file in analysis_files:
         py_file = analysis_file.path
         module = analysis_file.module
         tree = resolved_cache.get(py_file)
         targets.extend(collect_pyright_probe_targets(tree, module, py_file))
-    return probe_pyright_targets(project_root, targets, pyright_bin)
+        # Pyright names a class by the bare name the source wrote, so the probe
+        # answer ``Dataset`` is only xarray's in a module that imported it from
+        # there. This is the map that says which module did.
+        imports, _star = collect_module_imports(
+            tree, module, current_is_package=is_package_file(py_file)
+        )
+        module_imports[module] = imports
+        # Every analyzed file, not only the probed ones. A module with no probe
+        # target of its own still has to exist for the imports through it to
+        # resolve, and package __init__ files -- pure re-exports, so never a
+        # probe target -- are exactly the ones everything imports through.
+        support_files.append(py_file)
+        import_root = _import_root_for_analysis_file(analysis_file)
+        if import_root is not None:
+            import_roots.add(import_root)
+
+    resolved_root = project_root.resolve()
+    extra_paths: List[Path] = []
+    for import_root in sorted(import_roots):
+        try:
+            extra_paths.append(import_root.relative_to(resolved_root))
+        except ValueError:
+            continue
+
+    report = probe_pyright_targets(
+        project_root,
+        targets,
+        pyright_bin,
+        support_files=support_files,
+        extra_paths=extra_paths,
+        module_imports=module_imports,
+    )
+    _report_pyright_resolution(report)
+    return report.families
+
+
+def _report_pyright_resolution(report: PyrightProbeReport) -> None:
+    """Print what the probe achieved, and refuse a run where it achieved nothing.
+
+    No threshold is chosen here. Nothing resolving at all, while probes were
+    emitted, is unambiguous and needs no number; anything short of that is
+    printed rather than judged, because what counts as "enough" is a property of
+    the project being analyzed, not of this code.
+    """
+    if not report.probes_emitted:
+        return
+    print(
+        f"Pyright probes: {report.probes_emitted} emitted, "
+        f"{report.probes_answered} answered, "
+        f"{report.probes_resolved} resolved to a type "
+        f"({report.answers_unknown} came back Unknown)",
+        file=sys.stderr,
+    )
+    if report.files_outside_project_root:
+        print(
+            f"  {report.files_outside_project_root} file(s) skipped: outside the project root",
+            file=sys.stderr,
+        )
+    if report.probes_resolved == 0:
+        raise RuntimeError(
+            f"Pyright resolved none of {report.probes_emitted} probes. "
+            "Every container family would be 'unknown', which is indistinguishable "
+            "from a correctly-typed unknown in the artifacts."
+        )
 
 
 def _mode_to_access(mode: str) -> str:

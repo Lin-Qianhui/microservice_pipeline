@@ -66,6 +66,15 @@ that is genuinely unrecognised.
 fully-qualified spellings (`xarray.Dataset`, `xr.Dataset`), so a bare `Dataset` from
 `from xarray import Dataset` is not xarray.
 
+> **FIXED by Step 3 (2026-08-31).** Parsed as a union of nestings, classified on the head
+> of each member, with uninformative members (`Unknown`, `Any`, `None`, `Never`) dropped
+> before the rest are required to agree. Answers thrown away as unknown **2,220 → 1,637**;
+> `dict` 34 → 263. The bare-`Dataset` instance is fixed by handing the classifier each
+> module's import map, so the name is resolved to where it came from — worth two answers
+> on climlab and no artifact rows, since those two locals are never modelled (§1.16).
+> One thing this section does not say: the same substring scanning was reading type names
+> out of *function signatures*, so numpy's `moveaxis` was a list and `os.path.join` a path.
+
 ### 1.2 One class gets two different object IDs depending on which file is analysed — CONFIRMED
 
 `infer_split_class_owners` is called from `collect_data_access_from_tree` once per
@@ -408,6 +417,49 @@ definer — which is also where `visit_Lambda` will need them once §5.5 lands.
 
 Belongs with the rest of the cheap, local, independently testable fixes in **Step 4**.
 
+### 1.15 `object` is a catch-all that swallows scalars — CONFIRMED, found by Step 3
+
+Added 2026-08-31. `pyright_family_from_type_text` answers `FAMILY_OBJECT` for any type
+whose head it does not recognise, and `_field_kind` treats everything that is not
+`dataframe`, `dict` or `xarray` as a container. So a `float` is modelled as something
+that could hold fields.
+
+On climlab this is **450 of 3,183 probe answers** — 288 `float`, 87 `int`, 44 `bool`,
+31 `str`. A number is not a container, and `x.real` on one is not a data access in any
+sense this pipeline cares about.
+
+Deliberately not fixed in Step 3, and the reason is the reason it is worth a finding of
+its own: the fix *removes* objects and access edges, while Step 3's fix creates them, so
+landing them together would have moved the Step 1a recall figure for two opposite reasons
+with no way to separate them. It is also the first change in this document that would
+lower recall on purpose, which needs its own argument and its own measurement.
+
+Fix: a `scalar` family that `_field_kind` refuses to treat as a container, judged by
+Step 1a's recall and by `evaluate` rather than by recall alone.
+
+### 1.16 A local's family can be known while the local is never modelled — CONFIRMED, found by Step 3
+
+Added 2026-08-31. `_local_ref` asks `_family_for_object_id` for a local's family, but
+whether a local becomes an object at all is decided by its caller from the shape of the
+assignment — chiefly whether `_infer_type_from_value` recognised the right-hand side.
+The two are independent, and the second gate is the blunter one.
+
+Concretely, in `climlab/domain/xarray.py`:
+
+```python
+ds = Dataset()          # pyright: xarray.Dataset. No object is created.
+da = DataArray(...)     # pyright: xarray.DataArray. No object is created.
+```
+
+Step 3 taught the probe to recognise both, and neither reaches the artifact, because
+`_infer_type_from_value` has no rule for "a call to a class that is a known container
+type" — it has rules for `dict(...)`, `list(...)`, `DataFrame(...)` and the xarray *open*
+functions, matched by name. The type checker's answer is available and unused.
+
+This is the constructive half of §1.6: that finding is about the name-matching being too
+loose, and this one is about it being the only mechanism. Fix: let a known probe family
+expose a local, so the two gates become one.
+
 ---
 
 ## 2. Pyright probing
@@ -436,6 +488,13 @@ generated config suppresses the diagnostic that would have said so.
 Copy the source roots the config already knows about, and assert that a non-zero
 fraction of probes resolved before accepting the result.
 
+> **FIXED by Step 3 (2026-08-31).** The sandbox now receives every file the stage
+> analyses, probed or not. On climlab the eight files that never reached it were **all
+> package `__init__.py`** — the files every intra-project import passes through — and
+> adding them is worth **+113** resolved answers, which measured as the whole of that
+> slice's effect. The assertion refuses a run only when *nothing* resolved, and prints
+> the counts otherwise; a fraction would have been a chosen threshold (§4.5).
+
 ### 2.2 The generated config drops the project's environment — REASONED
 
 `_write_probe_config` emits `include`, `pythonVersion`, `typeCheckingMode` and two
@@ -444,6 +503,14 @@ is not the project root, so pyright's own venv discovery has nothing to find. pa
 xarray and every other third-party type — precisely the types this analysis exists to
 read — resolve only if they happen to be installed in the ambient interpreter running
 the pipeline.
+
+> **FIXED by Step 3 (2026-08-31), and it changed nothing measurable.** `extraPaths` is
+> derived per file from the module name, a project venv beside the source is passed as
+> `venvPath`/`venv`, and otherwise the interpreter running the pipeline is named with
+> `--pythonpath` rather than left to be found. Measured on its own: **zero** additional
+> answers on climlab, because the temp root already serves as the import root and the
+> ambient interpreter already had numpy. The mechanism is real and nothing should depend
+> on that luck; it is simply not a source of lost families here.
 
 ### 2.3 A source root outside `project_root` crashes the run — REASONED
 
@@ -472,6 +539,12 @@ reveal_type(__msp_probe_7)         # pyright: Unknown
 Pyright types unreachable code as `Unknown`, so the family is lost and nothing
 anywhere reports a problem. Terminal statements need the probe *before* them.
 
+> **FIXED by Step 3 (2026-08-31).** 153 probes on climlab (134 after `return`, 19 after
+> `raise`). One correction to the wording: pyright does not answer `Unknown` for these —
+> it does not answer **at all**, which is why 155 probes had no reply. Moving them in
+> front took answers 3,183 → 3,318 and typed answers 1,761 → 1,857. A probe that would
+> land inside `if x: return y` is dropped rather than placed, which is the remaining 20.
+
 ### 2.5 The callable-ID convention is written three times — REASONED
 
 `collect_pyright_probe_targets.Visitor._callable_id`,
@@ -496,6 +569,13 @@ or "climlab" in lowered
 inside the branch that decides whether a type called `Field` is a data container. This
 is the same class of framework hardcode that Steps 4 and 4b deliberately removed from
 `call_graph/` — and it sits in the module with the widest reuse in this package.
+
+> **FIXED by Step 3 (2026-08-31), ahead of its own step.** It sat inside the function
+> §1.1 rewrites, so leaving it would have meant measuring that rewrite against
+> climlab-special-cased behaviour. Removed on its own first: **byte-identical artifacts**,
+> because the three other clauses in the same condition already matched climlab's `Field`.
+> It was dead code, which is worth knowing rather than assuming. §2.7 is untouched and
+> remains Step 7's.
 
 ### 2.7 The shared-state gate is still a literal keyword — REASONED
 
@@ -981,12 +1061,13 @@ already-solved problems whose fix is sitting on an object this package is handed
 because two of them make data access *silently emit nothing* rather than emit
 something wrong.
 
-**Execution order** (revised 2026-08-31, after Step 4a):
+**Execution order** (revised 2026-08-31, after Step 3):
 
 ```
 0  ->  1a  ->  2  ->  1b  ->  4a  ->  3  ->  4  ->  5  ->  7  ->  8
-DONE   DONE   DONE   DONE   DONE    <- next
-       |       |      |      |
+DONE   DONE   DONE   DONE   DONE   DONE  <- next
+       |       |      |      |      |
+       |       |      |      |      +- container families; also removed 2.6
        |       |      |      +- the false-merge fix, taken out of order: see below
        |       |      +- identity oracle: needs Step 2's determinism to have a
        |       |         reproducible baseline
@@ -1192,6 +1273,48 @@ lever, and Step 1a makes it measurable. Acceptance: the share of objects with
 `inferred_type == unknown` falls, and per-kind recall rises with it. Add the
 probe-resolution assertion from §2.1 so a silent total failure can never look like a
 clean run again.
+
+> **DONE (2026-08-31) — see [`step3_container_families.md`](revision_progess/step3_container_families.md).**
+> Objects with an unknown family **759 (40.6%) → 556 (28.7%)**; named `dict_key` objects
+> 69 → 187 and anonymous `container_field` objects 141 → 25. At the probe level, answers
+> Pyright could type went 1,648 → 1,857 and answers thrown away as unknown 2,220 → 1,637.
+> **Access edges unchanged at 4,239 at every slice**, and the Step 1a oracle is unmoved
+> (recall 69.0%, confirmed 75.2%, falsified 1). Determinism byte-identical over five
+> seeds. §2.6's `"climlab"` hardcode was removed here, on its own, and produced
+> byte-identical artifacts — it was dead code.
+>
+> **The acceptance criterion above is half wrong, and the correction matters.** "Per-kind
+> recall rises with it" cannot happen: the access oracle's unit is a
+> `(callable, attribute-or-key, access-kind)` triple that never mentions an object, which
+> is the same property that kept it still through Steps 2 and 4a. What families change is
+> *which kind of object the confirmed accesses are filed under* — named dictionary keys
+> 36 → 226, anonymous container fields 167 → 29, with the total confirmed identical at
+> 3,124. A redistribution, not a gain, and it has to be read as one.
+>
+> Four departures from the wording above. (i) §2.1's sandbox fix is the whole of slice 1's
+> effect (+113 answers) and §2.2's environment settings contributed **nothing** on climlab
+> — the temp root is already the import root and the ambient interpreter already had
+> numpy; they are kept as correctness, not as a measured gain. (ii) The probe-resolution
+> assertion refuses a run only when *nothing at all* resolved, and prints the counts
+> otherwise; any threshold short of that would be §4.5's mistake. (iii) §1.1's second
+> instance (a bare `Dataset` from `from xarray import Dataset`) is fixed by handing the
+> classifier each module's import map, and it changes **two probe answers and zero
+> artifact rows** on climlab — real, unit-tested, and not exercised here, as with §1.7.
+> (iv) Hand-checking all 626 reclassified answers found one regression the totals hid:
+> pyright writes a method's own class as `Self@AttrDict`, which the new head-parsing read
+> as an unknown name.
+>
+> **Alias precision 93.6% → 93.1%, contradicted claims 17 → 20.** All three new ones are
+> `AplusBT(state=self.state)`, `StepFunctionAlbedo(state=self.state)` and
+> `MeridionalHeatDiffusion(state=self.state)` in `ebm.py` — the same shared-state
+> constructor defect Step 4a already found as `Iceline(state=self.state)` and assigned to
+> **Step 7**. They are not new: `class_attr_state:...EBM:state` did not exist before this
+> step, so the claim had no node to land on and could not be scored. Verified against both
+> artifacts directly.
+>
+> **Two findings in no section of this document**, both recorded above as §1.15 and §1.16:
+> `object` swallows scalars, and a local's family can be known while the local is never
+> modelled as an object at all.
 
 **Step 4 — Cheap correctness: §1.6, §1.7, §1.8, §1.9, §1.10, §1.11, §1.12, §1.13, §1.14,
 plus §5.5, plus the "made from" / "is" defect Step 1b found.** Each is local and

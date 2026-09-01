@@ -336,12 +336,29 @@ def write_report(
         edges_by_callable.setdefault(edge.callable, []).append(edge)
         edges_by_object.setdefault(edge.object_id, []).append(edge)
 
+    # An object whose container family is unknown is filed under the anonymous
+    # ``container_field`` bucket rather than as a dictionary key or a dataframe
+    # column, so this share is how much of the artifact is not really typed.
+    family_counts: Dict[str, int] = {}
+    for obj in objects.values():
+        family_counts[obj.inferred_type or "unknown"] = (
+            family_counts.get(obj.inferred_type or "unknown", 0) + 1
+        )
+    unknown_families = family_counts.get("unknown", 0)
+    unknown_share = (100.0 * unknown_families / len(objects)) if objects else 0.0
+    family_summary = ", ".join(
+        f"`{family}={count}`"
+        for family, count in sorted(family_counts.items(), key=lambda item: (-item[1], item[0]))
+    )
+
     lines = [
         "# Data Access View",
         "",
         f"- Callables with access: `{len(edges_by_callable)}`",
         f"- Data objects: `{len(objects)}`",
         f"- Access edges: `{len(edges)}`",
+        f"- Objects with an unknown container family: `{unknown_families}` ({unknown_share:.1f}%)",
+        f"- Container families: {family_summary}",
         "- Confidence weights: `high=1.0`, `medium=0.6`, `low=0.25`",
         "",
         "## By Callable",
