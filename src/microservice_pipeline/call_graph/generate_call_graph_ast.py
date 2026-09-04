@@ -99,6 +99,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import warnings
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Set, Tuple
@@ -114,6 +115,7 @@ from .ast_utils import (
     attach_parents,
     attribute_to_name,
     parse_python_file,
+    partition_parseable,
     parse_python_source,
 )
 from .definitions import (
@@ -292,6 +294,21 @@ def analyze_analysis_files(
     cache = ParsedFileCache()
     summary_only_files = list(iter_summary_only_files(summary_packages))
     every_file = [*analysis_files, *summary_only_files]
+
+    # A file that cannot be parsed is dropped here, once, rather than raising
+    # out of whichever pass reached it first -- review items 14 and 15, and the
+    # precondition for data-access review 1.12, since this function runs before
+    # the data-access stage and would otherwise raise before it started.
+    every_file, parse_failures = partition_parseable(every_file, cache)
+    if parse_failures:
+        detail = "; ".join(f"{path}: {reason}" for path, reason in parse_failures[:3])
+        warnings.warn(
+            f"{len(parse_failures)} file(s) could not be parsed and were skipped: {detail}"
+            + (" ..." if len(parse_failures) > 3 else ""),
+            stacklevel=2,
+        )
+    skipped = {path for path, _ in parse_failures}
+    analysis_files = [entry for entry in analysis_files if entry.path not in skipped]
 
     nodes, module_map, known_classes = build_indices_from_analysis_files(
         every_file,

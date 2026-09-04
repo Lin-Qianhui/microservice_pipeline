@@ -13,7 +13,7 @@ from __future__ import annotations
 import ast
 import warnings
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple, TypeVar
 
 
 def attribute_to_name(node: ast.AST) -> Optional[str]:
@@ -44,10 +44,17 @@ def unwrap_passthrough(node: ast.AST) -> ast.AST:
 
 
 def parse_python_file(py_file: Path) -> ast.Module:
-    """Parse a UTF-8 file without executing it."""
+    """Parse a Python file without executing it.
+
+    ``read_bytes`` rather than ``read_text(encoding="utf-8")``: handing
+    ``ast.parse`` the raw bytes lets it honour a PEP-263 coding cookie, so a
+    latin-1 source with ``# -*- coding: latin-1 -*-`` parses instead of raising
+    ``UnicodeDecodeError``. That is half of data-access review 1.12; the other
+    half is that a failure here must not end the run, which is the caller's job.
+    """
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", SyntaxWarning)
-        return ast.parse(py_file.read_text(encoding="utf-8"), filename=str(py_file))
+        return ast.parse(py_file.read_bytes(), filename=str(py_file))
 
 
 def parse_python_source(source: str, filename: str = "<source>") -> ast.Module:
@@ -103,3 +110,39 @@ class ParsedFileCache:
 
     def __len__(self) -> int:
         return len(self._trees)
+
+
+_HasPath = TypeVar("_HasPath")
+
+
+def partition_parseable(
+    files: Sequence[_HasPath], cache: "ParsedFileCache"
+) -> Tuple[List[_HasPath], List[Tuple[Path, str]]]:
+    """Split analysed files into the ones that parse and the ones that do not.
+
+    One unparseable file -- a vendored or generated source with a syntax error,
+    or one this build cannot decode -- used to raise out through every caller
+    and end the whole run. That is data-access review 1.12 and call-graph review
+    items 14 and 15, which are the same defect seen from two packages.
+
+    Doing the partition **once, up front** rather than catching at each parse
+    site is the point. Every later pass then sees the same file set by
+    construction, so a file cannot be present for one pass and missing from
+    another -- which is the shape of the fixpoint defect Step 2 found, where a
+    loop converged on a smaller question than the final pass asked.
+
+    Parsing here costs nothing: it warms the shared cache that every pass would
+    have filled anyway. Failures are returned rather than logged, because only
+    the caller knows whether this run should report them or refuse.
+    """
+    parseable: List[_HasPath] = []
+    failures: List[Tuple[Path, str]] = []
+    for entry in files:
+        path = getattr(entry, "path", entry)
+        try:
+            cache.get(path)
+        except (SyntaxError, ValueError, UnicodeDecodeError, OSError) as exc:
+            failures.append((path, f"{type(exc).__name__}: {exc}"))
+            continue
+        parseable.append(entry)
+    return parseable, failures

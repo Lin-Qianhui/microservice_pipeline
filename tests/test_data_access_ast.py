@@ -3,6 +3,7 @@ import warnings
 from pathlib import Path
 
 from microservice_pipeline.data_access.generate_data_access_ast import (
+    DataAccessCollector,
     collect_module_imports,
     collect_data_access,
     collect_data_access_from_analysis_files,
@@ -11,6 +12,7 @@ from microservice_pipeline.data_access.generate_data_access_ast import (
 )
 from microservice_pipeline.call_graph.generate_call_graph_ast import (
     AnalysisFile,
+    attach_parents,
     analyze_analysis_files,
     build_indices,
     build_indices_from_analysis_files,
@@ -165,7 +167,7 @@ def load(path):
 
     df_columns = [obj for obj in objects.values() if obj.kind == "df_col"]
     assert any(obj.field == "mass_g" for obj in df_columns)
-    assert _edge_exists(edges, "file:path", access="read")
+    assert _edge_exists(edges, "file:sample.load:path", access="read")
     assert _edge_exists(edges, "mass_g", access="write")
     assert _edge_exists(edges, "mass_g", access="read")
 
@@ -210,11 +212,11 @@ def save_and_load(path, data):
 """
     )
 
-    assert "file:path" in objects
-    assert _edge_exists(edges, "file:path", access="create", operation="open")
-    assert _edge_exists(edges, "file:path", access="write", operation="json.dump")
-    assert _edge_exists(edges, "file:path", access="read", operation="open")
-    assert _edge_exists(edges, "file:path", access="read", operation="json.load")
+    assert "file:sample.save_and_load:path" in objects
+    assert _edge_exists(edges, "file:sample.save_and_load:path", access="create", operation="open")
+    assert _edge_exists(edges, "file:sample.save_and_load:path", access="write", operation="json.dump")
+    assert _edge_exists(edges, "file:sample.save_and_load:path", access="read", operation="open")
+    assert _edge_exists(edges, "file:sample.save_and_load:path", access="read", operation="json.load")
 
 
 def test_dataframe_aliases_propagate_to_source_object():
@@ -1121,7 +1123,7 @@ def load(path):
 """
     )
 
-    assert _edge_exists(edges, "file:path", access="read", operation="xr.open_dataset")
+    assert _edge_exists(edges, "file:sample.load:path", access="read", operation="xr.open_dataset")
     expected = {
         "dict_key:sample.load:ds:lat": "method:sel:labeled_access",
         "dict_key:sample.load:ds:lev": "method:isel:labeled_access",
@@ -1165,7 +1167,7 @@ def load(path):
     )
 
     assert _edge_exists(edges, "https://example.com/data.nc", access="read", operation="pooch.retrieve")
-    assert _edge_exists(edges, "file:path", access="read", operation="xr.open_dataarray")
+    assert _edge_exists(edges, "file:sample.load:path", access="read", operation="xr.open_dataarray")
     assert any(obj.kind == "dict_key" and obj.field == "lev" for obj in objects.values())
 
 
@@ -1542,6 +1544,15 @@ def consume(items):
 
 
 def test_dynamic_getattr_module_dispatch_records_param_lineage_for_possible_callees():
+    """A ``getattr`` dispatch records the flow, but no longer claims identity.
+
+    Review 1.11: the fan-out deliberately bypasses the uniqueness gate, so one
+    call emitted an ``arg_to_param`` edge per callable per argument -- and those
+    edges are not inert, because extra roots *erase* an alias in
+    ``_apply_lineage_aliases``. They are now ``derived_from``: the flow is still
+    visible, the identity claim is withheld, and ``param_bindings`` -- which
+    mints ``alias_of`` directly -- stays empty.
+    """
     source = """
 import sample_ops as ops
 
@@ -1569,8 +1580,11 @@ def dispatch(particle, model, proc):
     lineage = {
         (edge.src_object_id, edge.dst_object_id, edge.callee, edge.slot)
         for edge in lineage_edges
-        if edge.relation == "arg_to_param"
+        if edge.relation == "derived_from"
     }
+
+    assert not any(edge.relation == "arg_to_param" for edge in lineage_edges)
+    assert param_bindings == {}
 
     assert (
         "param:sample.dispatch:particle",
@@ -2522,3 +2536,554 @@ def test_a_derived_edge_still_erases_an_ambiguous_alias():
     _apply_lineage_aliases(objects, lineage)
 
     assert objects["local_exposed:sample.g:x"].alias_of == ""
+
+
+# --- review 1.8: class bodies have a scope and a callable of their own -------
+
+
+def test_class_attribute_does_not_leak_into_the_module_scope():
+    """A class-level name must not resolve for module-level code.
+
+    Review 1.8's first probe: the binding used to outlive the class body, so
+    ``registry['k'] = 1`` after the class resolved against ``A.registry`` and
+    minted a key access. At runtime that line is a ``NameError``.
+    """
+    objects, edges = _collect(
+        """
+class A:
+    registry = {}
+
+registry['k'] = 1
+"""
+    )
+
+    leaked = [
+        object_id
+        for object_id in objects
+        if "sample.<module>:registry" in object_id
+    ]
+    assert leaked == []
+    assert not _edge_exists(edges, "sample.<module>:registry:k")
+
+
+def test_two_classes_may_share_an_attribute_name():
+    """Review 1.8's third probe, which used to produce no objects at all.
+
+    One scope for the whole file meant the second class's binding overwrote the
+    first's, and the collision lost both.
+    """
+    objects, _ = _collect(
+        """
+class A:
+    registry = {'a': 1}
+
+class B:
+    registry = {'b': 2}
+"""
+    )
+
+    owners = {
+        obj.owner for obj in objects.values() if obj.kind.startswith("class")
+    }
+    assert owners == {"sample.A", "sample.B"}
+
+
+def test_class_body_accesses_are_attributed_to_the_class():
+    """The class body is its own code object, and CPython names it after the class.
+
+    A default argument is the clearest case: Python evaluates it when the ``def``
+    statement runs, which is inside the class body. This is the climlab defect
+    Step 1a's oracle falsified (``RRTMG_SW.__init__`` claiming ``nbndsw``).
+    """
+    _, edges = _collect(
+        """
+SIZE = 4
+
+class Grid:
+    def __init__(self, shape=SIZE):
+        self.shape = shape
+"""
+    )
+
+    readers = {
+        edge.callable
+        for edge in edges
+        if edge.object_id == "module_global:sample.SIZE"
+    }
+    assert readers == {"sample.Grid"}
+
+
+def test_methods_keep_their_dotted_id_now_that_a_class_body_is_a_callable():
+    """The class body must not turn its methods into closures.
+
+    ``mod.Class.method`` is what CPython calls a method and what every other ID
+    in this package assumes; ``mod.Class.<locals>.method`` would silently
+    disconnect data access from the call graph.
+    """
+    _, edges = _collect(
+        """
+class Grid:
+    def use(self, rows):
+        return rows['a']
+"""
+    )
+
+    assert any(edge.callable == "sample.Grid.use" for edge in edges)
+    assert not any("<locals>" in edge.callable for edge in edges)
+
+
+def test_a_nested_function_inside_a_method_is_still_a_closure():
+    """The complement of the test above: ``<locals>`` must survive where it belongs."""
+    _, edges = _collect(
+        """
+class Grid:
+    def use(self, rows):
+        def inner(data):
+            return data['a']
+        return inner(rows)
+"""
+    )
+
+    assert any(edge.callable == "sample.Grid.use.<locals>.inner" for edge in edges)
+
+
+# --- review 1.6: name matching must anchor on a whole dotted segment --------
+
+
+def test_a_method_call_whose_name_ends_in_set_does_not_mint_a_set():
+    """Review 1.6's transcript, verbatim.
+
+    ``ax.set(...)`` is matplotlib's bulk property setter and ``node.list()`` is
+    anything at all; neither builds a collection.
+    """
+    objects, _ = _collect(
+        """
+def f(ax, node):
+    style = ax.set(1)
+    kids = node.list()
+    return style, kids
+"""
+    )
+
+    families = {
+        object_id: obj.inferred_type
+        for object_id, obj in objects.items()
+        if object_id.endswith(":style") or object_id.endswith(":kids")
+    }
+    assert "set" not in families.values()
+    assert "list" not in families.values()
+
+
+def test_a_projects_own_read_csv_lookalike_is_not_a_dataframe():
+    """``my_read_csv`` used to be a DataFrame at confidence ``high``."""
+    objects, _ = _collect(
+        """
+def f(loader):
+    frame = loader.my_read_csv('x.csv')
+    return frame
+"""
+    )
+
+    assert not any(
+        obj.inferred_type == "dataframe"
+        for object_id, obj in objects.items()
+        if object_id.endswith(":frame")
+    )
+
+
+def test_a_real_pandas_read_csv_is_still_a_dataframe():
+    """The complement: anchoring must not cost the true matches."""
+    objects, _ = _collect(
+        """
+import pandas as pd
+
+def f():
+    frame = pd.read_csv('x.csv')
+    return frame
+"""
+    )
+
+    assert any(
+        obj.inferred_type == "dataframe"
+        for object_id, obj in objects.items()
+        if object_id.endswith(":frame")
+    )
+
+
+def test_a_method_named_open_does_not_mint_a_file_object():
+    """``self.db.open(conn)`` is not a file open.
+
+    This was 1.6's worst instance because the node kind it invented is the one
+    review 1.7 shows fusing unrelated callables.
+    """
+    objects, _ = _collect(
+        """
+def f(self, conn):
+    self.db.open(conn)
+"""
+    )
+
+    assert not [object_id for object_id in objects if object_id.startswith("file:")]
+
+
+def test_a_real_open_is_still_a_file_object():
+    objects, _ = _collect(
+        """
+def f():
+    handle = open('data/users.csv')
+    return handle
+"""
+    )
+
+    assert [object_id for object_id in objects if object_id.startswith("file:")]
+
+
+# --- review 1.10: index/columns are only a table's shape on a table ---------
+
+
+def test_self_index_and_self_columns_are_observable_on_an_ordinary_object():
+    """Review 1.10's transcript, verbatim.
+
+    ``index`` and ``columns`` are ordinary attribute names on anything that is
+    not a table, and suppressing them regardless of receiver made them
+    unobservable on every object in the project.
+    """
+    _, edges = _collect(
+        """
+class Grid:
+    def use(self):
+        a = self.index
+        b = self.columns
+        c = self.spacing
+        return a, b, c
+"""
+    )
+
+    read = {
+        edge.evidence
+        for edge in edges
+        if edge.operation == "attribute_load"
+    }
+    assert read == {"self.index", "self.columns", "self.spacing"}
+
+
+def test_a_dataframes_index_is_still_suppressed():
+    """The complement: on a real table these describe shape, not data."""
+    _, edges = _collect(
+        """
+import pandas as pd
+
+def f():
+    df = pd.read_csv('x.csv')
+    return df.index
+"""
+    )
+
+    assert not [edge for edge in edges if edge.operation == "attribute_load"]
+
+
+# --- review 1.16: a known probe family is enough to model a local -----------
+
+
+def test_a_local_whose_family_only_the_probe_knows_is_still_modelled():
+    """``ds = Dataset()`` produced no object at all.
+
+    ``_infer_type_from_value`` matches constructors by name and had no rule for
+    "a call to a class the type checker already knows is a container", so the
+    probe's answer was available and unused. This is the constructive half of
+    review 1.6.
+    """
+    objects, edges = _collect(
+        """
+def f():
+    ds = Dataset()
+    return ds['temperature']
+""",
+        pyright_families={"local_exposed:sample.f:ds": "xarray"},
+    )
+
+    assert any("temperature" in object_id for object_id in objects)
+    assert _edge_exists(edges, "temperature", access="read")
+
+
+def test_a_local_the_probe_calls_a_scalar_is_not_a_container():
+    """The gate is ``CONTAINER_TYPES``, so review 1.15's scalars stay out.
+
+    ``object`` is the catch-all family a float or an int comes back as, and it
+    must not become a thing that can hold fields -- that finding is deliberately
+    left to its own step.
+    """
+    objects, _ = _collect(
+        """
+def f():
+    x = Whatever()
+    return x
+""",
+        pyright_families={"local_exposed:sample.f:x": "object"},
+    )
+
+    assert not [object_id for object_id in objects if object_id.endswith(":x")]
+
+
+# --- review 1.13: one method call is one access -----------------------------
+
+
+def test_a_method_call_records_its_receiver_once():
+    """Review 1.13's transcript, verbatim.
+
+    The two rows differ in ``operation``, so they never collapsed into one edge
+    with a higher evidence count -- they became two separately weighted edges in
+    the structural graph for one syntactic fact.
+    """
+    _, edges = _collect(
+        """
+def f(items):
+    items.count(3)
+"""
+    )
+
+    reads = [
+        edge for edge in edges
+        if edge.object_id == "param:sample.f:items" and edge.access == "read"
+    ]
+    assert len(reads) == 1
+    assert reads[0].operation == "method:count:receiver"
+
+
+def test_accesses_nested_inside_a_receiver_are_still_recorded():
+    """Only the top of the receiver expression is suppressed.
+
+    ``self.data['x'].append(v)`` reads ``self.data`` and subscripts it before the
+    method runs, and those are real accesses that the deduplication must not
+    take with it.
+    """
+    _, edges = _collect(
+        """
+def f(self, v):
+    self.data['x'].append(v)
+"""
+    )
+
+    operations = {edge.operation for edge in edges}
+    assert "subscript_load" in operations
+    assert "attribute_load" in operations
+
+
+# --- review 1.12: one unparseable file must not end the run -----------------
+
+
+def test_an_unparseable_file_is_skipped_and_reported(tmp_path):
+    """Review 1.12. A vendored or generated file with a syntax error used to
+    raise out through every caller, and none of the four caught it."""
+    (tmp_path / "good.py").write_text(
+        "def load(rows):\n    return rows['a']\n", encoding="utf-8"
+    )
+    (tmp_path / "broken.py").write_text("def (((\n", encoding="utf-8")
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        objects, edges = _collect_with_registration(tmp_path)[:2]
+
+    assert any("could not be parsed" in str(w.message) for w in caught)
+    assert any("broken.py" in str(w.message) for w in caught)
+    assert any(edge.callable == "good.load" for edge in edges)
+
+
+def test_a_pep263_coding_cookie_is_honoured(tmp_path):
+    """The other half of 1.12: a latin-1 source with a coding cookie.
+
+    ``read_text(encoding="utf-8")`` raised ``UnicodeDecodeError`` on these;
+    handing ``ast.parse`` the raw bytes lets it read the cookie.
+    """
+    (tmp_path / "latin.py").write_bytes(
+        "# -*- coding: latin-1 -*-\ndef load(rows):\n    cafe = rows['a']\n    return cafe  # caf\xe9\n".encode(
+            "latin-1"
+        )
+    )
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        _, edges = _collect_with_registration(tmp_path)[:2]
+
+    assert not [w for w in caught if "could not be parsed" in str(w.message)]
+    assert any(edge.callable == "latin.load" for edge in edges)
+
+
+# --- review 1.9 and 5.5: a lambda is its own callable and its own scope -----
+
+
+def test_a_lambda_parameter_does_not_resolve_to_an_enclosing_local():
+    """Review 1.9's transcript, verbatim.
+
+    The lambda's own parameter was attributed to the outer dictionary, inventing
+    a key access on an object the lambda never touches.
+    """
+    _, edges = _collect(
+        """
+def f(rows):
+    data = {'a': 1}
+    return sorted(rows, key=lambda data: data['a'])
+"""
+    )
+
+    assert not _edge_exists(edges, "sample.f:data:a")
+
+
+def test_a_lambda_is_its_own_callable_keyed_the_way_cpython_keys_it():
+    """Review 5.5. The call graph indexes every lambda as
+    ``<enclosing>.<locals>.<lambda>``; data access entered no callable at all,
+    so the two stages disagreed about who touched the data."""
+    _, edges = _collect(
+        """
+def f(rows):
+    return sorted(rows, key=lambda r: r['a'])
+"""
+    )
+
+    assert any(edge.callable == "sample.f.<locals>.<lambda>" for edge in edges)
+
+
+def test_a_lambda_in_a_class_body_matches_the_call_graphs_id():
+    """The class-body case, where the two ID rules could most easily drift."""
+    _, edges = _collect(
+        """
+class C:
+    key = lambda r: r['a']
+"""
+    )
+
+    assert any(edge.callable == "sample.C.<locals>.<lambda>" for edge in edges)
+
+
+def test_a_lambda_default_belongs_to_the_scope_that_writes_it():
+    """A lambda's defaults run where the lambda is written -- review 1.14's rule."""
+    _, edges = _collect(
+        """
+SIZE = 4
+
+def f(rows):
+    return sorted(rows, key=lambda r, n=SIZE: r['a'])
+"""
+    )
+
+    readers = {
+        edge.callable for edge in edges if edge.object_id == "module_global:sample.SIZE"
+    }
+    assert readers == {"sample.f"}
+
+
+# --- review 1.7: an unresolved file is not one node for the whole project ---
+
+
+def test_two_callables_that_open_a_parameter_do_not_share_a_file_node():
+    """Review 1.7's transcript, verbatim.
+
+    Two callables that share no file at runtime shared a data object, and the
+    structural graph reads that as coupling. Any project whose conventional
+    parameter name is ``path`` collapsed its whole filesystem surface onto a
+    handful of nodes.
+    """
+    objects, _ = _collect(
+        """
+def load_users(path):
+    return open(path)
+
+def load_invoices(path):
+    return open(path)
+"""
+    )
+
+    file_objects = {object_id for object_id in objects if object_id.startswith("file:")}
+    assert file_objects == {
+        "file:sample.load_users:path",
+        "file:sample.load_invoices:path",
+    }
+
+
+def test_a_literal_path_is_still_one_node_for_the_project():
+    """The complement: two callables that open the same literal really do share it."""
+    objects, _ = _collect(
+        """
+def a():
+    return open('data/users.csv')
+
+def b():
+    return open('data/users.csv')
+"""
+    )
+
+    file_objects = {object_id for object_id in objects if object_id.startswith("file:")}
+    assert file_objects == {"file:data/users.csv"}
+
+
+def test_a_wide_getattr_fan_out_records_nothing():
+    """Review 1.11: beyond the cap, record nothing at all.
+
+    An over-approximation that deletes information elsewhere is worse than a
+    missing edge, and these edges erase aliases in ``_apply_lineage_aliases``.
+    """
+    from microservice_pipeline.data_access.rules import MAX_DYNAMIC_GETATTR_TARGETS
+
+    wide = MAX_DYNAMIC_GETATTR_TARGETS + 1
+    lineage_edges = []
+    param_bindings = {}
+    collect_data_access_from_tree(
+        ast.parse(
+            "import sample_ops as ops\n\ndef dispatch(particle, proc):\n"
+            "    return getattr(ops, proc)(particle)\n",
+            filename="sample.py",
+        ),
+        module="sample",
+        file=Path("sample.py"),
+        callable_map={f"sample_ops.op{n}": object() for n in range(wide)},
+        callable_params={f"sample_ops.op{n}": ("particle",) for n in range(wide)},
+        param_bindings=param_bindings,
+        lineage_edges=lineage_edges,
+    )
+
+    assert not [edge for edge in lineage_edges if edge.callee.startswith("sample_ops.")]
+    assert param_bindings == {}
+
+
+# --- review 5.4: a class body is never a call target ------------------------
+
+
+def test_a_constructor_call_never_resolves_to_the_class_body():
+    """Review 5.4. ``SlabOcean(...)`` means ``SlabOcean.__init__``.
+
+    The candidate list puts the bare class name ahead of its constructor and
+    ``_return_ref_from_call`` takes the first entry that hits a map, so a class
+    body left in the resolution universe would silently take the constructor's
+    place -- deleting whatever the constructor was known to return.
+
+    Pinned because a bare ``SlabOcean()`` reaches the candidate list through
+    ``f"{module}.{call_name}"`` rather than through the ``callable_map`` branch,
+    so a guard on that branch alone looks right and misses the common case.
+    """
+    from dataclasses import dataclass
+
+    @dataclass
+    class _Def:
+        kind: str
+
+    source = "def build():\n    ocean = SlabOcean()\n    return ocean\n"
+    tree = ast.parse(source, filename="sample.py")
+    attach_parents(tree)
+    call = next(n for n in ast.walk(tree) if isinstance(n, ast.Call))
+
+    collector = DataAccessCollector(
+        module="sample",
+        file=Path("sample.py"),
+        module_globals=set(),
+        callable_map={
+            "sample.SlabOcean": _Def("class_body"),
+            "sample.SlabOcean.__init__": _Def("function"),
+        },
+        return_summaries={},
+        callable_params={"sample.SlabOcean": (), "sample.SlabOcean.__init__": ()},
+    )
+    collector.current_callable = "sample.build"
+
+    candidates = collector._candidate_callable_ids_for_call(call)
+    assert "sample.SlabOcean" not in candidates
+    assert candidates[0] == "sample.SlabOcean.__init__"

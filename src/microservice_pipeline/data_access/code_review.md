@@ -1065,7 +1065,7 @@ something wrong.
 
 ```
 0  ->  1a  ->  2  ->  1b  ->  4a  ->  3  ->  4  ->  5  ->  7  ->  8
-DONE   DONE   DONE   DONE   DONE   DONE  <- next
+DONE   DONE   DONE   DONE   DONE   DONE   DONE  <- next
        |       |      |      |      |
        |       |      |      |      +- container families; also removed 2.6
        |       |      |      +- the false-merge fix, taken out of order: see below
@@ -1317,8 +1317,10 @@ clean run again.
 > modelled as an object at all.
 
 **Step 4 — Cheap correctness: §1.6, §1.7, §1.8, §1.9, §1.10, §1.11, §1.12, §1.13, §1.14,
-plus §5.5, plus the "made from" / "is" defect Step 1b found.** Each is local and
-independently testable.
+plus §5.5, plus §1.16, plus the "made from" / "is" defect Step 1b found.** Each is local
+and independently testable. (§1.16 added to this list 2026-09-03: Step 3 recorded it in
+§1 and scheduled it nowhere, and it is the constructive half of §1.6 — doing §1.6 without
+it removes false families and adds none.)
 
 > **Added by Step 1b (2026-08-29): the lineage graph records "made from" as "is".** A value
 > produced by a call is claimed to *be* one of that call's arguments. Measured: 31 of the 78
@@ -1386,6 +1388,60 @@ generate false coupling, so judge them with `evaluate` rather than with recall �
 registry-coupling lesson from the call-graph roadmap applies unchanged. §5.5 (lambda
 callables) belongs here because the fix — entering a callable for a lambda, keyed the
 way `definitions.visit_Lambda` keys it — is also what fixes §1.9.
+
+> **DONE as Step 4b (2026-09-03) — see [`step4b_cheap_correctness.md`](revision_progess/step4b_cheap_correctness.md).**
+> Claims the running program contradicts **1 → 0**; access recall **68.9% → 69.5%**; alias
+> precision **93.1% → 94.0%** and alias recall **64.2% → 64.9%** — both oracles moved the
+> same way, which Step 4a's trade did not. Objects 1934 → 2011, access edges 4239 → 4381,
+> `unknown`-kind objects still 0, determinism byte-identical over five seeds with
+> `--check-inputs`, call-graph artifacts byte-identical, 380 tests passing (35 new).
+>
+> **Three corrections to the text above, all found by checking rather than reading.**
+> (i) **§1.6's proposed fix does not work.** `_call_name_matches` asks whether the name
+> ends with a whole dotted segment, and `ax.set` *does* end with `.set` — so routing the
+> builtin constructors through it would have changed nothing. A builtin has no module path
+> in front of it, so those need exact matching; the dotted test is right only for library
+> functions reached through an alias, where it correctly declines `loader.my_read_csv`.
+> (ii) **§1.14 cannot be finished without §1.8, and Step 1a's record of it is wrong.** The
+> runtime puts the `nbndsw` read in `...rrtmg_sw.RRTMG_SW` — the *class body* — not in
+> `<module>` as recorded, because a method's defaults are evaluated while the `class`
+> statement runs. Moving the read out of `__init__` alone left the contradiction at 1; it
+> reached 0 only once class bodies were callables. (iii) **§5.4's guard was brought
+> forward** from Step 5, because §1.8 moves class bodies towards being resolvable and the
+> constructor lookup takes the *first* name it recognises, with the class listed ahead of
+> its `__init__`. It landed alone and produced byte-identical artifacts. It is a guard,
+> not a precondition: §1.8 as landed does not put class bodies into the maps that lookup
+> consults, and removing the guard afterwards is still byte-identical. Checking that is
+> what found a gap in the guard as first written — it covered only calls spelled with a
+> full dotted path and missed the common bare `SlabOcean()`; it now filters the assembled
+> candidate list once, the way the call graph filters its universe, with a test pinning it.
+>
+> **The access oracle's `falsified` verdict — the one it offers as proof — was broken.**
+> §1.16 took it 0 → 2, and hand-checking found both were the instrument's fault: it read a
+> subscript's key from the single preceding instruction, and `x['k'] += 1` compiles that
+> key two instructions back behind `COPY`, with the store half further back still behind
+> `SWAP`. Fixed in `dynamic_access_trace` by stepping over stack shuffling and by giving
+> the store half the key its load half resolved at the same source position. Every figure
+> above is against a baseline re-scored with the corrected instrument (recall 69.0% →
+> 68.9%). Third instrument defect in this revision, third one caught by hand-checking.
+>
+> **§1.7 does fire on climlab, correcting Step 1b.** `file:path` was joining
+> `solar.orbital.long._get_Laskar_data` and `solar.orbital.table._get_Berger_data` — two
+> modules, two different remote data files, one variable name. Step 1b's test asked whether
+> the two callables ever disagreed about a path *value*, which they cannot, since they
+> never run together; the defect is that two unrelated functions were given one node.
+>
+> **Five fixes cannot be judged here at all** and are fixture-proven: §1.6 (climlab's only
+> loose matches are genuine `pd.read_csv`), §1.10 (climlab never writes `.index`/`.columns`),
+> §1.9 and §5.5 (**climlab contains no lambdas**), §1.8's class-state half (no class-level
+> containers), and §1.12 (every file parses). The access report's claim that its
+> unmodelled-callable bucket is lambdas "by construction" is wrong for this project: 0 of
+> those 1,903 accesses are in lambdas, 1,196 are in class bodies. That recall was §1.8's to
+> recover, not §5.5's.
+>
+> **§1.15 remains unscheduled**, and §1.16's gate deliberately excludes it with a test
+> pinning that. §1.11's fan-out cap is a *chosen* number and is named in `rules.py` as one,
+> joining §4.5's list.
 
 **Step 5 — Cross-stage consistency: §5.7, then §5.4 and §5.6 as guards.** Connect the
 `confidence.weights` knob to data-access edges before anyone sweeps it, or the sweep

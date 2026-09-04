@@ -65,22 +65,30 @@ try:
     from microservice_pipeline.data_access.outputs import _edges_payload, _objects_payload, write_outputs
     from microservice_pipeline.data_access.rules import (
         CONTAINER_FIELD_KIND,
+        DATAFRAME_CONSTRUCTORS,
+        DATAFRAME_STRUCTURE_ATTRS,
+        DICT_CONSTRUCTORS,
         CONTAINER_TYPES,
         COORDINATOR_ATTR_THRESHOLD,
         COORDINATOR_CONTAINER_THRESHOLD,
         COORDINATOR_METHOD_THRESHOLD,
         FILE_READ_FUNCS,
         FILE_WRITE_METHODS,
+        LIST_CONSTRUCTORS,
+        MAX_DYNAMIC_GETATTR_TARGETS,
+        OPEN_FUNCS,
         MAX_RETURN_SUMMARY_PASSES,
         MUTATING_METHODS,
         PANDAS_INDEXER_ATTRS,
         PANDAS_INPLACE_METHODS,
         POOCH_READ_FUNCS,
+        SET_CONSTRUCTORS,
         XARRAY_INDEXER_ATTRS,
         XARRAY_LABEL_METHODS,
         XARRAY_OPEN_FUNCS,
         _attr_expr_family_key,
         _attribute_path,
+        _builtin_call_matches,
         _call_name_matches,
         _class_attr_family_key,
         _field_inferred_type,
@@ -140,22 +148,30 @@ except ImportError:  # pragma: no cover - supports direct script execution
     from microservice_pipeline.data_access.outputs import _edges_payload, _objects_payload, write_outputs  # type: ignore
     from microservice_pipeline.data_access.rules import (  # type: ignore
         CONTAINER_FIELD_KIND,
+        DATAFRAME_CONSTRUCTORS,
+        DATAFRAME_STRUCTURE_ATTRS,
+        DICT_CONSTRUCTORS,
         CONTAINER_TYPES,
         COORDINATOR_ATTR_THRESHOLD,
         COORDINATOR_CONTAINER_THRESHOLD,
         COORDINATOR_METHOD_THRESHOLD,
         FILE_READ_FUNCS,
         FILE_WRITE_METHODS,
+        LIST_CONSTRUCTORS,
+        MAX_DYNAMIC_GETATTR_TARGETS,
+        OPEN_FUNCS,
         MAX_RETURN_SUMMARY_PASSES,
         MUTATING_METHODS,
         PANDAS_INDEXER_ATTRS,
         PANDAS_INPLACE_METHODS,
         POOCH_READ_FUNCS,
+        SET_CONSTRUCTORS,
         XARRAY_INDEXER_ATTRS,
         XARRAY_LABEL_METHODS,
         XARRAY_OPEN_FUNCS,
         _attr_expr_family_key,
         _attribute_path,
+        _builtin_call_matches,
         _call_name_matches,
         _class_attr_family_key,
         _field_inferred_type,
@@ -193,6 +209,7 @@ try:
         iter_python_files,
         module_callable_id,
         parse_python_file,
+        partition_parseable,
         parse_python_source,
         path_to_module,
     )
@@ -230,6 +247,7 @@ except ImportError:  # pragma: no cover - supports direct script execution
         iter_python_files,
         module_callable_id,
         parse_python_file,
+        partition_parseable,
         parse_python_source,
         path_to_module,
     )
@@ -1417,6 +1435,27 @@ class DataAccessCollector(RegisteredStateLineageMixin, ast.NodeVisitor):
             if known_classes is not None
             else known_class_ids_from_callable_map(callable_map)
         )
+        # Class bodies are callable nodes -- code runs there, and this stage now
+        # files accesses against them -- but they are never call *targets*:
+        # Python offers no way to invoke a class body, and ``SlabOcean(...)``
+        # means ``SlabOcean.__init__``. They must therefore be kept out of the
+        # resolution universe, because ``_candidate_callable_ids_for_call`` lists
+        # ``mod.ClassName`` ahead of ``mod.ClassName.__init__`` and
+        # ``_return_ref_from_call`` takes the first candidate that hits -- so a
+        # class body left in would silently delete constructor-return inference.
+        # The call graph solved this with ``models.resolvable_callable_ids``,
+        # applied at its own resolution sites; review 5.4 records that this
+        # package received the unfiltered map and had no equivalent. Same
+        # once-per-run reasoning as ``known_classes`` above.
+        # ``getattr`` rather than ``.kind``: callers that only need key
+        # membership hand in placeholder values, so this asks whether the map
+        # explicitly marks an ID a class body and treats anything else as not
+        # one.
+        self.class_body_ids = frozenset(
+            callable_id
+            for callable_id, definition in callable_map.items()
+            if getattr(definition, "kind", None) == "class_body"
+        )
         self.objects: Dict[str, DataObject] = {}
         self.edges: List[AccessEdge] = []
         self.created_object_ids: Set[str] = set()
@@ -1428,6 +1467,16 @@ class DataAccessCollector(RegisteredStateLineageMixin, ast.NodeVisitor):
         self.module_callable = module_callable_id(module)
         self.current_class: Optional[str] = None
         self.current_callable: Optional[str] = None
+        # The class-body callable currently being walked, when there is one.
+        # Distinct from ``current_class``, which stays set while the *methods*
+        # of that class are walked: a ``def`` directly inside a class body is a
+        # method (``mod.Class.method``), while a ``def`` inside a method is a
+        # closure (``...<locals>.name``), and only this tells the two apart.
+        self.current_class_body: Optional[str] = None
+        # Receiver expressions whose read is already recorded as
+        # ``method:<name>:receiver``; see ``_handle_method_receiver_read``.
+        # Keyed by ``id()``, which is stable because the tree outlives the walk.
+        self.receiver_read_nodes: Set[int] = set()
         self.callable_stack: List[str] = []
         self.scopes: List[Scope] = []
 
@@ -1809,19 +1858,31 @@ class DataAccessCollector(RegisteredStateLineageMixin, ast.NodeVisitor):
 
     def _file_ref(self, file_expr: ast.AST, node: ast.AST, confidence: str = "high") -> ExprRef:
         if isinstance(file_expr, ast.Constant) and isinstance(file_expr.value, str):
+            # A literal path is genuinely global: two callables that both open
+            # ``data/users.csv`` really do share a file.
             display = file_expr.value
-            object_part = file_expr.value
+            object_id = f"file:{_safe_id_part(file_expr.value)}"
+            owner = "filesystem"
         else:
+            # An expression is an *unresolved* file whose identity is unknown,
+            # and keying on the source text made every ``open(path)`` in the
+            # project one node -- so ``load_users`` and ``load_invoices`` shared
+            # a data object because both spell the parameter ``path``. That is
+            # manufactured coupling in the artifact this pipeline exists to
+            # cluster, which is why review 1.7 ranks it above its apparent size.
+            # Scoping the ID to the callable makes two unresolved files two
+            # nodes; it does not claim they are different, only that nothing
+            # here shows them to be the same.
             display = _unparse(file_expr)
-            object_part = display
+            object_id = f"file:{_safe_id_part(self.current_callable or self.module)}:{_safe_id_part(display)}"
+            owner = self.current_callable or self.module
             confidence = "medium" if confidence == "high" else confidence
-        object_id = f"file:{_safe_id_part(object_part)}"
         self._register_object(
             object_id=object_id,
             kind="file",
             display_name=display,
             scope="external",
-            owner="filesystem",
+            owner=owner,
             node=node,
             inferred_type=FAMILY_FILE,
             confidence=confidence,
@@ -2010,15 +2071,20 @@ class DataAccessCollector(RegisteredStateLineageMixin, ast.NodeVisitor):
                 )
             if self._value_is_attrdict_constructor(value):
                 return ValueOrigin(FAMILY_DICT, "", "medium")
-            if call_name in {"dict", "builtins.dict"} or call_name.endswith(".dict"):
+            # Review 1.6. Two different tests, because these are two different
+            # kinds of name: a builtin is only the builtin when called
+            # unqualified (``ax.set(...)`` is matplotlib's bulk property setter,
+            # ``node.list()`` is anything at all), while a library function is
+            # normally reached through a module alias and so anchors on its last
+            # dotted segment -- which still declines a project's own
+            # ``loader.my_read_csv``.
+            if _builtin_call_matches(call_name, DICT_CONSTRUCTORS):
                 return ValueOrigin(FAMILY_DICT, "", "high")
-            if call_name in {"list", "builtins.list"} or call_name.endswith(".list"):
+            if _builtin_call_matches(call_name, LIST_CONSTRUCTORS):
                 return ValueOrigin(FAMILY_LIST, "", "high")
-            if call_name in {"set", "builtins.set"} or call_name.endswith(".set"):
+            if _builtin_call_matches(call_name, SET_CONSTRUCTORS):
                 return ValueOrigin(FAMILY_SET, "", "high")
-            if call_name.endswith("DataFrame") or call_name.endswith("read_csv"):
-                return ValueOrigin(FAMILY_DATAFRAME, "", "high")
-            if call_name.endswith(tuple(FILE_READ_FUNCS)):
+            if _call_name_matches(call_name, DATAFRAME_CONSTRUCTORS | FILE_READ_FUNCS):
                 return ValueOrigin(FAMILY_DATAFRAME, "", "high")
             if _call_name_matches(call_name, XARRAY_OPEN_FUNCS):
                 return ValueOrigin(FAMILY_XARRAY, "", "high")
@@ -2093,6 +2159,13 @@ class DataAccessCollector(RegisteredStateLineageMixin, ast.NodeVisitor):
 
     def _callable_id_for_node(self, name: str) -> str:
         prev_callable = self.current_callable
+        # A ``def`` or ``class`` written directly in a class body is a member of
+        # that class, not a closure over it -- CPython spells it
+        # ``Outer.name``, not ``Outer.<locals>.name``. Checked before the
+        # ``<locals>`` branch, which would otherwise claim every method now that
+        # a class body is itself a callable (review 1.8).
+        if prev_callable is not None and prev_callable == self.current_class_body:
+            return f"{prev_callable}.{name}"
         if prev_callable is not None and prev_callable != self.module_callable:
             return f"{prev_callable}.<locals>.{name}"
         if self.current_class:
@@ -2117,7 +2190,11 @@ class DataAccessCollector(RegisteredStateLineageMixin, ast.NodeVisitor):
         if self.project_index is None:
             return None
         canonical = self.project_index.canonical_callable_id(candidate)
-        if canonical != candidate and canonical in self.callable_map:
+        if (
+            canonical != candidate
+            and canonical in self.callable_map
+            and canonical not in self.class_body_ids
+        ):
             return canonical
         return None
 
@@ -2147,6 +2224,8 @@ class DataAccessCollector(RegisteredStateLineageMixin, ast.NodeVisitor):
         the live dicts is equivalent by definition and cannot go stale, which is
         why this and not the frozen index the review proposed.
         """
+        if candidate in self.class_body_ids:
+            return False
         return (
             candidate in self.callable_map
             or candidate in self.callable_params
@@ -2161,7 +2240,7 @@ class DataAccessCollector(RegisteredStateLineageMixin, ast.NodeVisitor):
             | set(self.callable_params)
             | set(self.return_summaries)
             | set(self.return_tuple_summaries)
-        )
+        ) - self.class_body_ids
 
     def _candidate_callable_ids_for_call(self, node: ast.Call) -> List[str]:
         dynamic_candidates = self._dynamic_getattr_callable_ids(node.func)
@@ -2194,7 +2273,19 @@ class DataAccessCollector(RegisteredStateLineageMixin, ast.NodeVisitor):
             candidates.append(f"{self.module}.{call_name}")
         expanded: List[str] = []
         for candidate in candidates:
-            expanded.append(candidate)
+            # Review 5.4: a class body is never a call target. ``SlabOcean(...)``
+            # means ``SlabOcean.__init__``; Python offers no way to invoke a
+            # class body. It is dropped *here*, on the assembled list, rather
+            # than at each of the seven places a candidate is appended above --
+            # a bare ``SlabOcean()`` reaches this list through
+            # ``f"{module}.{call_name}"``, not through the ``callable_map``
+            # branch, so guarding only that branch would have missed the common
+            # case. Mirrors ``call_graph.models.resolvable_callable_ids``, which
+            # likewise filters the universe rather than each lookup.
+            # Only the body itself is dropped -- its ``__init__`` is still
+            # appended below, because that is what the call actually reaches.
+            if candidate not in self.class_body_ids:
+                expanded.append(candidate)
             init_candidate = f"{candidate}.__init__"
             if self._is_known_callable_id(init_candidate):
                 expanded.append(init_candidate)
@@ -2231,11 +2322,20 @@ class DataAccessCollector(RegisteredStateLineageMixin, ast.NodeVisitor):
         # attribute name. Built here rather than above so the common path never
         # pays for it.
         prefix = f"{imported_base}."
-        return sorted(
+        matches = sorted(
             callable_id
             for callable_id in self._all_known_callable_ids()
             if callable_id.startswith(prefix)
         )
+        # Review 1.11: one ``getattr(mod, name)(x)`` against a large module used
+        # to emit a lineage edge per callable per argument. Beyond the cap,
+        # record nothing -- an over-approximation that *deletes* information
+        # elsewhere is worse than a missing edge, and these edges feed
+        # ``_apply_lineage_aliases``, where extra roots erase an alias that a
+        # single root would have kept.
+        if len(matches) > MAX_DYNAMIC_GETATTR_TARGETS:
+            return []
+        return matches
 
     def _bind_call_args_to_params(
         self,
@@ -2265,6 +2365,16 @@ class DataAccessCollector(RegisteredStateLineageMixin, ast.NodeVisitor):
         is_dynamic_getattr = bool(self._dynamic_getattr_callable_ids(node.func))
         if not candidates or (len(candidates) != 1 and not is_dynamic_getattr):
             return
+        # A dispatch through ``getattr`` names several possible callees and
+        # cannot say which one ran, so the argument does not *become* any one of
+        # those parameters. Recording it as ``derived_from`` keeps the flow
+        # visible while withholding the identity claim -- the "distinct relation
+        # so consumers can discount them" review 1.11 asks for, using the
+        # vocabulary Step 4a already wired through ``IDENTITY_RELATIONS``, the
+        # alias rule, the shared-container inference and the weight profile.
+        # It also keeps these out of ``param_bindings``, which mints ``alias_of``
+        # directly.
+        speculative = is_dynamic_getattr and len(candidates) > 1
 
         for callee_id in candidates:
             param_names = self.callable_params.get(callee_id, ())
@@ -2280,6 +2390,7 @@ class DataAccessCollector(RegisteredStateLineageMixin, ast.NodeVisitor):
                 if arg_ref is not None and arg_ref.access_path:
                     self.param_access_paths.setdefault(param_id, set()).add(arg_ref.access_path)
                 for source_id, identity in dict.fromkeys(sources):
+                    identity = identity and not speculative
                     if identity:
                         # ``param_bindings`` feeds ``_apply_confirmed_param_aliases``,
                         # which mints ``alias_of`` from it directly. A derived
@@ -2422,6 +2533,18 @@ class DataAccessCollector(RegisteredStateLineageMixin, ast.NodeVisitor):
 
     def _enter_callable(self, node: ast.AST, name: str) -> None:
         callable_id = self._callable_id_for_node(name)
+
+        # Defaults do read outer-scope data, but the reader is whoever runs the
+        # ``def`` statement -- Python evaluates them once, in the enclosing
+        # scope, at definition time -- never the function being defined. Visit
+        # them before ``current_callable`` moves. Step 1a's oracle found this
+        # (review 1.14): ``RRTMG_SW.__init__`` claimed a read of ``nbndsw``
+        # that appears nowhere in its bytecode.
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for default in list(node.args.defaults) + list(node.args.kw_defaults):
+                if default is not None:
+                    self.visit(default)
+
         prev_callable = self.current_callable
         self.current_callable = callable_id
         self.callable_stack.append(callable_id)
@@ -2440,11 +2563,6 @@ class DataAccessCollector(RegisteredStateLineageMixin, ast.NodeVisitor):
             params = tuple(arg.arg for arg in all_args if arg.arg not in {"self", "cls"})
             self.callable_params[callable_id] = params
             self.callable_return_identity[callable_id] = _returns_one_source(node)
-
-            # Defaults can read module globals or outer-scope data.
-            for default in list(node.args.defaults) + list(node.args.kw_defaults):
-                if default is not None:
-                    self.visit(default)
 
         self.scopes.append(Scope(callable_id=callable_id, params=set(params)))
         for stmt in getattr(node, "body", []):
@@ -2466,11 +2584,41 @@ class DataAccessCollector(RegisteredStateLineageMixin, ast.NodeVisitor):
         self.current_callable = prev_callable
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
-        prev = self.current_class
+        """Walk a class body as its own scope and its own callable.
+
+        A class body is a code object that runs once, when the ``class``
+        statement executes, and CPython names it after the class. Walking it
+        with no scope of its own put class-level assignments into the enclosing
+        scope's ``locals``, where they outlived the class body, resolved against
+        module-level code that could not reach them at runtime, and let two
+        classes in one file overwrite each other's attribute names (review 1.8).
+        Attributing its accesses to the enclosing module was the other half:
+        1,196 accesses the runtime observed in climlab class bodies had no row
+        under the class at all.
+        """
+        prev_class = self.current_class
+        prev_callable = self.current_callable
+        prev_class_body = self.current_class_body
+        class_id = self._callable_id_for_node(node.name)
+
+        # Bases and decorators are deliberately still not visited. They are
+        # evaluated by whoever runs the ``class`` statement, so they would
+        # belong to the enclosing scope -- but this walk has never visited them
+        # at all, and adding them mints access edges that nothing in this step
+        # measures. Left with the rest of ``class_body_expressions``.
         self.current_class = node.name
+        self.current_callable = class_id
+        self.current_class_body = class_id
+        self.callable_stack.append(class_id)
+        self.scopes.append(Scope(callable_id=class_id, params=set()))
         for stmt in node.body:
             self.visit(stmt)
-        self.current_class = prev
+        self.scopes.pop()
+        self.callable_stack.pop()
+
+        self.current_class_body = prev_class_body
+        self.current_callable = prev_callable
+        self.current_class = prev_class
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         self._enter_callable(node, node.name)
@@ -2478,10 +2626,65 @@ class DataAccessCollector(RegisteredStateLineageMixin, ast.NodeVisitor):
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
         self._enter_callable(node, node.name)
 
+    def _lambda_id(self) -> str:
+        """CPython's own name for a lambda's code object.
+
+        Spelled ``<enclosing>.<locals>.<lambda>`` to match ``co_qualname``, and
+        identical to ``call_graph.collector.scopes._lambda_id`` so the two
+        stages agree on which callable touched the data. CPython does not
+        disambiguate sibling lambdas in one scope and neither does this:
+        inventing a disambiguator would buy precision at the cost of that
+        agreement.
+        """
+        if self.current_class_body is not None and self.current_callable == self.current_class_body:
+            return f"{self.current_class_body}.<locals>.<lambda>"
+        if self.current_callable is not None and self.current_callable != self.module_callable:
+            return f"{self.current_callable}.<locals>.<lambda>"
+        return f"{self.module}.<lambda>"
+
     def visit_Lambda(self, node: ast.Lambda) -> None:
-        # Lambdas do not have call-graph nodes in the existing extractor.
-        for child in ast.iter_child_nodes(node):
-            self.visit(child)
+        """Enter a lambda body as its own callable and its own scope.
+
+        Two review findings meet here. 5.5: the call graph indexes every lambda
+        as a callable node, so leaving data access with none meant the
+        structural graph had a node carrying call edges and zero access edges,
+        while the enclosing function carried accesses that belonged to the
+        lambda. 1.9: without a scope of its own, the lambda's *parameters*
+        resolved to the enclosing function's locals -- ``lambda data:
+        data['a']`` invented a key access on an outer ``data`` the lambda never
+        touches. A fresh scope fixes the second by construction, because
+        ``_resolve_name`` consults only the innermost scope.
+        """
+        # Evaluated where the lambda is written, not inside it -- the same rule
+        # as a ``def``'s defaults, review 1.14.
+        for default in list(node.args.defaults) + list(node.args.kw_defaults):
+            if default is not None:
+                self.visit(default)
+
+        lambda_id = self._lambda_id()
+        all_args = (
+            list(node.args.posonlyargs) + list(node.args.args) + list(node.args.kwonlyargs)
+        )
+        if node.args.vararg:
+            all_args.append(node.args.vararg)
+        if node.args.kwarg:
+            all_args.append(node.args.kwarg)
+        params = tuple(arg.arg for arg in all_args)
+
+        prev_callable = self.current_callable
+        prev_class_body = self.current_class_body
+        self.current_callable = lambda_id
+        # A lambda in a class body is a closure over it, not a member of it, so
+        # a ``def`` nested inside the lambda must take the ``<locals>`` branch.
+        self.current_class_body = None
+        self.callable_stack.append(lambda_id)
+        self.callable_params[lambda_id] = params
+        self.scopes.append(Scope(callable_id=lambda_id, params=set(params)))
+        self.visit(node.body)
+        self.scopes.pop()
+        self.callable_stack.pop()
+        self.current_class_body = prev_class_body
+        self.current_callable = prev_callable
 
     def visit_Return(self, node: ast.Return) -> None:
         if node.value is not None:
@@ -2674,25 +2877,48 @@ class DataAccessCollector(RegisteredStateLineageMixin, ast.NodeVisitor):
     def visit_Name(self, node: ast.Name) -> None:
         if not isinstance(node.ctx, ast.Load) or self.current_callable is None:
             return
+        if id(node) in self.receiver_read_nodes:
+            return
         if self.scope and node.id in self.scope.locals and not self.scope.locals[node.id].exposed:
             return
         ref = self._resolve_name(node.id, node)
         if ref:
             self._record_access(ref.object_id, "read", "load", node, ref.confidence)
 
+    def _receiver_is_tabular(self, receiver: ast.AST) -> bool:
+        """Whether an expression is a table, for the ``index``/``columns`` gate.
+
+        Resolution only -- no access is recorded here; ``visit_Attribute``
+        records or suppresses on the answer. An unresolved receiver is *not*
+        treated as tabular, so the suppression now has to be earned.
+        """
+        ref = self._resolve_expr(receiver)
+        return ref is not None and ref.inferred_type in {FAMILY_DATAFRAME, FAMILY_XARRAY}
+
     def visit_Attribute(self, node: ast.Attribute) -> None:
         if not isinstance(node.ctx, ast.Load) or self.current_callable is None:
             return
-        if node.attr in PANDAS_INDEXER_ATTRS | {"index", "columns"}:
+        if node.attr in PANDAS_INDEXER_ATTRS:
+            # ``df.loc`` is an indexer, not data. These four names are specific
+            # enough to pandas and xarray to suppress on any receiver.
+            self.visit(node.value)
+            return
+        if node.attr in DATAFRAME_STRUCTURE_ATTRS and self._receiver_is_tabular(node.value):
+            # ``df.index`` and ``df.columns`` describe a table's shape. On
+            # anything else they are ordinary attributes, and suppressing them
+            # regardless of receiver made them unobservable project-wide --
+            # review 1.10, whose transcript is a ``Grid`` class whose
+            # ``self.index`` produced no edge while ``self.spacing`` did.
             self.visit(node.value)
             return
         if isinstance(getattr(node, "parent", None), ast.Attribute):
             parent = getattr(node, "parent")
             if getattr(parent, "value", None) is node:
                 return
-        ref = self._resolve_attribute(node)
-        if ref:
-            self._record_access(ref.object_id, "read", "attribute_load", node, ref.confidence)
+        if id(node) not in self.receiver_read_nodes:
+            ref = self._resolve_attribute(node)
+            if ref:
+                self._record_access(ref.object_id, "read", "attribute_load", node, ref.confidence)
         self.generic_visit(node)
 
     def visit_Subscript(self, node: ast.Subscript) -> None:
@@ -2712,12 +2938,19 @@ class DataAccessCollector(RegisteredStateLineageMixin, ast.NodeVisitor):
         self._handle_method_receiver_read(node, suppress_receiver_read=labeled_access_recorded)
         self._record_confirmed_param_lineage(node)
         self._record_registered_state_lineage(node)
+        # Deliberately not ``_is_known_callable_id``: that also consults
+        # ``return_tuple_summaries``, which this test has never included.
+        # Widening it here would mint ``passed_arg`` exposures that no
+        # measurement in this step covers, so it is left alone.
         known_callees = [
             callable_id
             for callable_id in self._candidate_callable_ids_for_call(node)
-            if callable_id in self.callable_map
-            or callable_id in self.callable_params
-            or callable_id in self.return_summaries
+            if callable_id not in self.class_body_ids
+            and (
+                callable_id in self.callable_map
+                or callable_id in self.callable_params
+                or callable_id in self.return_summaries
+            )
         ]
         for arg in node.args:
             if known_callees:
@@ -2787,6 +3020,16 @@ class DataAccessCollector(RegisteredStateLineageMixin, ast.NodeVisitor):
                 node,
                 receiver.confidence,
             )
+            # ``visit_Call`` walks the receiver expression afterwards, which
+            # would record the same read a second time under ``load`` /
+            # ``attribute_load``. The two differ in ``operation``, so they do
+            # not collapse into one edge with a higher evidence count -- they
+            # become two separately weighted edges in the structural graph for
+            # one syntactic fact (review 1.13). The receiver-read edge is the
+            # informative one, so the plain re-read is suppressed; only the
+            # *top* of the expression, so accesses nested inside a receiver such
+            # as ``self.data['x'].append(v)`` are still recorded.
+            self.receiver_read_nodes.add(id(node.func.value))
 
     def _handle_xarray_labeled_call(self, node: ast.Call) -> bool:
         if not isinstance(node.func, ast.Attribute):
@@ -2993,6 +3236,48 @@ class DataAccessCollector(RegisteredStateLineageMixin, ast.NodeVisitor):
                 origin.alias_of,
                 origin.confidence,
             )
+            if inferred_type not in CONTAINER_TYPES and not origin.source_id:
+                # Review 1.16. Whether a local is modelled at all was decided
+                # only by ``_infer_type_from_value`` recognising the right-hand
+                # side by *name* -- it has rules for ``dict(...)`` and the
+                # xarray *open* functions, but none for "a call to a class the
+                # type checker already knows is a container". So ``ds =
+                # Dataset()`` produced nothing, while the probe had already
+                # answered ``xarray.Dataset``. This is the constructive half of
+                # 1.6: that finding is about the name matching being too loose,
+                # this one about it being the only mechanism.
+                probe_family = self._family_for_object_id(
+                    f"local_exposed:{self.current_callable or ''}:{target.id}"
+                )
+                if probe_family in CONTAINER_TYPES:
+                    inferred_type = probe_family
+            if (
+                self.current_class_body is not None
+                and self.current_callable == self.current_class_body
+                and inferred_type in CONTAINER_TYPES
+            ):
+                # A container bound directly in a class body is class-level
+                # data, not a local of the body: it outlives the body, and the
+                # methods reach it as ``self.<name>``. Filing it as class state
+                # gives it the same object ID those methods resolve to, so the
+                # one place a class attribute is unambiguously class-level data
+                # stops being filed under the module (review 1.8).
+                ref = self._class_attr_ref(target.id, target, confidence=confidence)
+                if origin.source_id:
+                    self._record_lineage(
+                        origin.source_id,
+                        ref.object_id,
+                        RELATION_STATE_ASSIGN if origin.identity else RELATION_DERIVED_FROM,
+                        target,
+                    )
+                self._record_access(
+                    ref.object_id,
+                    self._store_access_for_object(ref.object_id, access),
+                    operation,
+                    target,
+                    ref.confidence,
+                )
+                return
             if inferred_type in CONTAINER_TYPES or origin.source_id:
                 # Deliberately ``source_id`` rather than ``alias_of``: a derived
                 # value is still a real object worth materialising, with real
@@ -3188,7 +3473,7 @@ class DataAccessCollector(RegisteredStateLineageMixin, ast.NodeVisitor):
                 self._record_access(file_ref.object_id, edge_access, "open", node, file_ref.confidence)
             return
 
-        if call_name.endswith(tuple(FILE_READ_FUNCS)) and node.args:
+        if _call_name_matches(call_name, FILE_READ_FUNCS) and node.args:
             file_ref = self._file_ref(node.args[0], node)
             self._record_access(file_ref.object_id, "read", call_name, node, file_ref.confidence)
             return
@@ -3228,7 +3513,10 @@ class DataAccessCollector(RegisteredStateLineageMixin, ast.NodeVisitor):
 
     def _is_open_call(self, node: ast.Call) -> bool:
         call_name = _attribute_path(node.func) or ""
-        return call_name in {"open", "builtins.open"} or call_name.endswith(".open")
+        # Anchored: ``self.db.open(conn)`` is not a file open, and this was the
+        # worst instance of review 1.6 -- it minted a ``file:`` object, which is
+        # the node kind 1.7 shows fusing unrelated callables.
+        return _builtin_call_matches(call_name, OPEN_FUNCS)
 
     def _file_from_open_call(self, node: ast.Call) -> Tuple[Optional[ExprRef], str]:
         if not node.args:
@@ -3440,6 +3728,19 @@ def collect_data_access_from_analysis_files(
     # ``attach_parents`` applied -- but a local one still collapses the four to
     # ten parses per file this stage used to perform down to one.
     resolved_cache = cache if cache is not None else ParsedFileCache()
+    # Review 1.12: one unparseable file used to end the whole run. A vendored or
+    # generated file with a syntax error, or a source this build cannot decode,
+    # raised out through every caller here and none of the four caught it.
+    #
+    # The partition happens *once*, before any pass, rather than being caught at
+    # each of the parse sites. Every later pass -- attrdict classes, split
+    # owners, the pyright targets, the return fixpoint and the final walk -- then
+    # sees the same file set by construction. Catching per site would let a file
+    # be present for one pass and absent from another, which is the shape of the
+    # defect Step 2 found in the return fixpoint.
+    analysis_files, parse_failures = partition_parseable(analysis_files, resolved_cache)
+    if not analysis_files:
+        return objects, edges, lineage_edges
     resolved_pyright_families = (
         pyright_families
         if pyright_families is not None
@@ -3551,6 +3852,17 @@ def collect_data_access_from_analysis_files(
                 kind_conflicts.add(object_id)
         edges.extend(module_edges)
         lineage_edges.extend(module_lineage_edges)
+
+    if parse_failures:
+        # Named, not counted: a silently skipped file is a hole in the artifact
+        # that nothing downstream can see, and review 1.12's complaint is as
+        # much about the absence of a report as about the traceback.
+        detail = "; ".join(f"{path}: {reason}" for path, reason in parse_failures[:3])
+        warnings.warn(
+            f"{len(parse_failures)} file(s) could not be parsed and were skipped: {detail}"
+            + (" ..." if len(parse_failures) > 3 else ""),
+            stacklevel=2,
+        )
 
     if kind_conflicts:
         # Two files described one ID with two different real kinds. The merge

@@ -85,7 +85,7 @@ import dis
 import opcode as _opcode
 import sys
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
@@ -196,6 +196,15 @@ DEREF_READ_OPS = _opcodes("LOAD_DEREF", "LOAD_FROM_DICT_OR_DEREF")
 DEREF_WRITE_OPS = _opcodes("STORE_DEREF", "DELETE_DEREF")
 
 LOAD_CONST_OPS = _opcodes("LOAD_CONST", "LOAD_SMALL_INT")
+
+# Pure stack shuffling, emitted between the key and the subscript that consumes
+# it by augmented assignment: ``d['k'] += 1`` compiles to ``LOAD_CONST 'k'``,
+# ``COPY``, ``COPY``, ``BINARY_OP []``. Reading only the immediately preceding
+# instruction therefore called the key computed, and a static claim naming the
+# literal was declared *falsified* -- the one verdict this module offers as
+# proof. Found by hand-checking two claims in Step 4b; see
+# ``decode_access_instructions``.
+STACK_SHUFFLE_OPS = _opcodes("COPY", "SWAP")
 
 # Executions recorded per identity site before the offset is retired.
 #
@@ -462,6 +471,11 @@ def decode_access_instructions(code: Any) -> List[DecodedAccess]:
         return decoded
 
     previous: Optional[Any] = None
+    # ``previous`` with pure stack shuffling stepped over, so a subscript sees
+    # the instruction that actually pushed its key. Kept beside ``previous``
+    # rather than replacing it: ``_receiver_name`` wants the literal preceding
+    # instruction.
+    previous_pushed: Optional[Any] = None
     for instruction in instructions:
         position = instruction.positions
         lineno = position.lineno if position and position.lineno is not None else 0
@@ -505,14 +519,21 @@ def decode_access_instructions(code: Any) -> List[DecodedAccess]:
             emit(TIER_KEY, COMPUTED_KEY, ACCESS_WRITE, ROLE_COMPUTED)
         elif _is_subscript_read(instruction) or op in KEY_WRITE_OPS:
             access = ACCESS_READ if _is_subscript_read(instruction) else ACCESS_WRITE
-            # The key is the last thing pushed before the subscript in every
-            # form, so a literal key is always the immediately preceding
-            # instruction. Verified: ``LOAD_CONST 'lit'`` at 42 -> ``BINARY_OP
-            # 26`` at 44, and ``LOAD_CONST 'gone'`` at 68 -> ``DELETE_SUBSCR``
-            # at 70.
+            # The key is the last thing *pushed* before the subscript, so a
+            # literal key is the preceding instruction once pure stack shuffling
+            # is stepped over. Verified: ``LOAD_CONST 'lit'`` at 42 ->
+            # ``BINARY_OP 26`` at 44, ``LOAD_CONST 'gone'`` at 68 ->
+            # ``DELETE_SUBSCR`` at 70, and ``LOAD_CONST 'k'`` -> ``COPY`` ->
+            # ``COPY`` -> ``BINARY_OP []`` for ``d['k'] += 1``.
+            #
+            # The *store* half of an augmented assignment is not reachable this
+            # way at all -- ``STORE_SUBSCR`` is preceded by ``SWAP`` over the
+            # computed value -- so it is left computed here and recovered by the
+            # same-position pass below.
             literals = (
-                _const_key_names(previous)
-                if previous is not None and previous.opcode in LOAD_CONST_OPS
+                _const_key_names(previous_pushed)
+                if previous_pushed is not None
+                and previous_pushed.opcode in LOAD_CONST_OPS
                 else []
             )
             if literals:
@@ -540,8 +561,46 @@ def decode_access_instructions(code: Any) -> List[DecodedAccess]:
                 emit(TIER_NAME, names[1], ACCESS_READ, _name_role(code, instruction, names[1]))
 
         previous = instruction
+        if instruction.opcode not in STACK_SHUFFLE_OPS:
+            previous_pushed = instruction
 
-    return decoded
+    return _recover_augmented_subscript_keys(decoded)
+
+
+def _recover_augmented_subscript_keys(decoded: List[DecodedAccess]) -> List[DecodedAccess]:
+    """Give the store half of ``d['k'] += 1`` the key its load half resolved.
+
+    An augmented subscript assignment compiles to one load and one store of the
+    *same* subscript expression, and only the load has its key literal within
+    reach -- the store is preceded by a ``SWAP`` over the computed value. Both
+    instructions carry the position of that one source expression, so a computed
+    key at a position where a literal was already resolved is the same key.
+
+    Without this, ``longorbit['long_peri'] += 180.`` put no ``(key, long_peri,
+    write)`` in the bytecode index, and the static claim naming it was reported
+    as **falsified** -- a verdict this module offers as proof rather than as a
+    lead. Two such claims on climlab were what found it.
+    """
+    literal_at: Dict[Tuple[int, int], str] = {}
+    for access in decoded:
+        if access.tier == TIER_KEY and access.role == ROLE_LITERAL:
+            literal_at.setdefault((access.lineno, access.col_offset), access.name)
+    if not literal_at:
+        return decoded
+
+    recovered: List[DecodedAccess] = []
+    for access in decoded:
+        if (
+            access.tier == TIER_KEY
+            and access.role == ROLE_COMPUTED
+            and (access.lineno, access.col_offset) in literal_at
+        ):
+            recovered.append(
+                replace(access, name=literal_at[(access.lineno, access.col_offset)], role=ROLE_LITERAL)
+            )
+            continue
+        recovered.append(access)
+    return recovered
 
 
 def _pair_names(instruction: Any) -> List[str]:

@@ -27,6 +27,16 @@ CONTAINER_TYPES = {
     FAMILY_FIELD,
     FAMILY_XARRAY,
 }
+# How many callables one ``getattr(module, computed_name)(...)`` may claim to
+# reach before the claim is dropped entirely (review 1.11).
+#
+# **Chosen, not derived**, and named here so it joins the list review 4.5 keeps
+# of thresholds that ought to be derived rather than picked. The argument for a
+# small number is directional rather than numeric: the bypass exists for
+# dispatch tables, where a module exposes a handful of handlers, and a claim
+# that one argument flows into every callable of a large module carries no
+# information while actively erasing aliases elsewhere.
+MAX_DYNAMIC_GETATTR_TARGETS = 8
 COORDINATOR_ATTR_THRESHOLD = 4
 COORDINATOR_METHOD_THRESHOLD = 3
 COORDINATOR_CONTAINER_THRESHOLD = 2
@@ -55,6 +65,15 @@ PANDAS_INPLACE_METHODS = {
 FILE_READ_FUNCS = {"read_csv", "read_json", "read_excel", "read_table", "read_parquet"}
 POOCH_READ_FUNCS = {"retrieve"}
 XARRAY_OPEN_FUNCS = {"open_dataset", "open_dataarray"}
+# Constructors that really do build a container, named so ``_call_name_matches``
+# can anchor on them. Previously these were bare ``endswith`` tests, which made
+# matplotlib's ``ax.set(...)`` a set, ``node.list()`` a list, and any project's
+# own ``my_read_csv`` a DataFrame at confidence ``high`` (review 1.6).
+DICT_CONSTRUCTORS = {"dict", "builtins.dict"}
+LIST_CONSTRUCTORS = {"list", "builtins.list"}
+SET_CONSTRUCTORS = {"set", "builtins.set"}
+DATAFRAME_CONSTRUCTORS = {"DataFrame"}
+OPEN_FUNCS = {"open", "builtins.open"}
 FILE_WRITE_METHODS = {
     "to_csv",
     "to_json",
@@ -63,6 +82,11 @@ FILE_WRITE_METHODS = {
     "to_pickle",
 }
 PANDAS_INDEXER_ATTRS = {"loc", "iloc", "at", "iat"}
+# Attributes that describe a table's shape rather than its data -- but only on a
+# table. Unlike ``loc``/``iloc``, these are ordinary attribute names on anything
+# else, so suppressing them everywhere made ``self.index`` and ``self.columns``
+# unobservable on every object in the project (review 1.10).
+DATAFRAME_STRUCTURE_ATTRS = {"index", "columns"}
 XARRAY_LABEL_METHODS = {"sel", "isel"}
 XARRAY_INDEXER_ATTRS = {"loc", "iloc"}
 MAX_RETURN_SUMMARY_PASSES = 8
@@ -133,7 +157,28 @@ def _keyword_truthy(call: ast.Call, keyword_name: str) -> bool:
 
 
 def _call_name_matches(call_name: str, names: Set[str]) -> bool:
+    """Match a *library* function, which is normally reached through an alias.
+
+    ``pd.read_csv`` and ``xr.open_dataset`` are the shape this is for: the
+    leading segments are a module path, so anchoring on the last dotted segment
+    is right, and it correctly declines ``loader.my_read_csv``.
+
+    It is the wrong test for a **builtin** -- see ``_builtin_call_matches``.
+    """
     return any(call_name == name or call_name.endswith(f".{name}") for name in names)
+
+
+def _builtin_call_matches(call_name: str, names: Set[str]) -> bool:
+    """Match a builtin constructor, which is only ever called unqualified.
+
+    ``set(...)`` and ``builtins.set(...)`` are the builtin; ``ax.set(...)`` is a
+    method that happens to share the name. Review 1.6 proposed routing these
+    through ``_call_name_matches`` too, but that would not have fixed anything:
+    ``ax.set`` really does end in ``.set``, so the suffix branch matches it just
+    as the old bare ``endswith`` did. A builtin has no module path in front of
+    it, so exact membership is the whole test.
+    """
+    return call_name in names
 
 
 def _literal_strings(node: ast.AST) -> List[str]:

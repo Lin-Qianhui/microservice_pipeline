@@ -391,7 +391,10 @@ class AccessComparisonReport:
     # quietly excluding, since excluding it would be tuning the denominator.
     missing_by_name: Counter = field(default_factory=Counter)
     # Accesses observed in a callable the static artifacts never mention at all.
-    # Lambdas and generator expressions land here by construction -- section 5.5.
+    # Which callables these are is a property of the analysed project, not a
+    # given: on climlab they are module and class bodies, and *none* is a
+    # lambda or a generator expression, because climlab contains no lambdas.
+    # An earlier version of this comment asserted the opposite.
     missing_in_unmodelled_callable: Counter = field(default_factory=Counter)
 
     # Literal and computed keys, never folded together. See the module docstring.
@@ -654,9 +657,10 @@ def render_markdown(report: AccessComparisonReport, *, top_n: int = 25) -> List[
             "### Missing in callables the extractor models no accesses for",
             "",
             "A callable that ran and touched data, for which `access_edges.csv`",
-            "has no row at all. Lambdas and generator expressions land here by",
-            "construction: they are separate code objects at runtime, and review",
-            "§5.5 records that `data_access` enters no callable for them.",
+            "has no row at all. Which callables these are is a property of",
+            "the analysed project: lambdas and generator expressions can land",
+            "here, but so can module and class bodies, and on climlab they are",
+            "entirely the latter. Read the owners below rather than assuming.",
             "",
             "| Owner | Missing |",
             "| --- | ---: |",
